@@ -1,0 +1,38 @@
+version: "3.9"
+
+# 本文件只用于本地开发：起 PostgreSQL + Redis。
+# 表结构由 db/migrations/*.sql 管理；本 compose 不做初始化。
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: pg-workbench
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: seo
+      POSTGRES_PASSWORD: seo_dev_local
+      POSTGRES_DB: seo_workbench
+    ports:
+      - "5433:5432"
+    volumes:
+      - pg-workbench-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U seo -d seo_workbench"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: redis-workbench
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  pg-workbench-data:

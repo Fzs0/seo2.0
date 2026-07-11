@@ -1,0 +1,34 @@
+# Local secrets — never commit
+config/*.local.json
+config/google-data-sources.local.json
+config/*.local.yaml
+config/*.local.yml
+config/*.local.env
+
+# Local credentials (keep working dirs out of source control)
+*.pem
+*.key
+.env
+.env.local
+.env.*.local
+
+# Build artifacts
+web/dist/
+web/node_modules/
+frontend/dist/
+frontend/node_modules/
+frontend/*.log
+frontend/*.tsbuildinfo
+app/__pycache__/
+**/__pycache__/
+.pytest_cache/
+.mypy_cache/
+*.log
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db

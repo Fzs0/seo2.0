@@ -1,0 +1,756 @@
+{
+  "version": "0.2.0",
+  "name": "Independent Site Google SEO Workflow Standard",
+  "positioning": {
+    "defaultProject": {
+      "domain": "",
+      "siteType": "2C鐢靛晢",
+      "market": "",
+      "conversion": "",
+      "coreProducts": "",
+      "mainPages": "",
+      "blogRoles": "鍗氬A锛氱煡璇嗙鏅?/ FAQ / 娉曡鎽樿 / 鏂版墜鍏ラ棬\n鍗氬B锛氬満鏅汉缇?/ 鍙ｅ懗鐏垫劅 / 閫夎喘寤鸿\n鍗氬C锛氬姣旇瘎娴?/ Best / VS / 鎺掕娓呭崟"
+    }
+  },
+  "localePolicy": {
+    "level": "P0",
+    "rules": [
+      "每次导入关键词前必须先选择目标市场；目标市场决定内容语言、Google SERP gl/hl 参数和 Semrush 数据库。",
+      "Semrush 导出的关键词数据库必须与目标市场匹配，例如 US / English 对应 us，DE / German 对应 de。",
+      "没有真实 SERP API 或人工 SERP 记录时，系统不能声称已经检查 Google 前 10，只能标记 needsSerpCheck。",
+      "EU / Multilingual 不是一个可直接执行的 Google SERP，需要拆成具体国家和语言后再做关键词分析与内容生成。",
+      "文章最终语言必须与目标市场语言一致，不允许默认英文覆盖所有市场。"
+    ]
+  },
+      "sites": [
+    "全部",
+    "主站-集合页",
+    "主站-博客",
+    "博客A-知识教程",
+    "博客B-场景人群",
+    "博客C-对比评测",
+    "暂不做"
+  ],,
+  "csvColumnAliases": {
+    "keyword": ["keyword", "关键词", "query", "search query"],
+    "database": ["database", "country database", "semrush database", "db", "国家库", "数据库"],
+    "volume": ["volume", "volume2", "search volume", "搜索量"],
+    "difficulty": ["difficulty", "keyword difficulty", "keyword difficulty2", "kd", "难度"],
+    "intent": ["intent", "意图", "search intent"],
+    "topic": ["topic", "topic cluster", "主题", "关键词主题"],
+    "seedKeyword": ["seed keyword", "seed", "种子词"],
+    "pageGroup": ["page", "页面", "page group", "cluster page"],
+    "sourcePageType": ["page type", "semrush page type", "source page type"],
+    "serpFeatures": ["serp features", "serp feature", "features", "search features", "google serp features"],
+    "url": ["url", "page url", "landing page", "target url", "ranking url", "existing url"]
+  },
+  "signals": {
+    "risk": ["thc", "cbd", "weed", "marijuana", "cannabis", "kid", "kids", "teen", "school", "underage", "near me"],
+    "coreProduct": ["vape", "vapes", "vaping", "e-cigarette", "ecig", "disposable", "pod", "e liquid", "e-liquid"],
+    "transaction": ["buy", "shop", "sale", "discount", "coupon", "online", "price", "cheap", "wholesale"],
+    "comparison": ["best", "top", "review", "reviews", "vs", "compare", "alternative"],
+    "scenario": ["flavour", "flavor", "beginner", "travel", "nicotine free", "rechargeable", "mint", "fruit", "choose", "for "],
+    "knowledge": ["what is", "what are", "how to", "guide", "properly", "meaning", "legal", "safe", "safety", "age", "dispose", "battery"],
+    "mainBlogExclusions": ["legal", "law", "age", "safe", "safety", "dispose", "battery"]
+  },
+  "scoring": {
+    "maxScore": 100,
+    "components": [
+      "demand",
+      "difficulty",
+      "commercial",
+      "content",
+      "siteFit",
+      "riskPenalty"
+    ],
+    "thresholds": {
+      "P0": 78,
+      "P1": 65,
+      "P2": 50
+    },
+    "notes": [
+      "先判断页面类型，再评分。",
+      "不是流量越大越优先；低难度、强意图、可承接转化的词优先。",
+      "主站可以写文章，尤其是商业前教育词。",
+      "博客站不抢主站集合页词，只承接知识、场景、对比等上游意图。"
+    ]
+  },
+  "excelSheets": {
+    "keywordAllocation": {
+      "sheetName": "01_keyword_allocation",
+      "purpose": "从 Semrush 导入关键词后，判断分站、页面类型、优先级和风险。",
+      "columns": [
+        "Keyword",
+        "Topic Cluster",
+        "Seed Keyword",
+        "Page Group",
+        "Volume",
+        "KD",
+        "Intent",
+        "Assigned Site",
+        "Page Type",
+        "Page Role",
+        "Target Asset",
+        "Asset Status",
+        "Content Action",
+        "Priority",
+        "Score",
+        "Reason",
+        "Parent Page",
+        "References Triggered"
+      ]
+    },
+    "articleBrief": {
+      "sheetName": "02_article_brief",
+      "purpose": "把单个关键词变成可交给 AI 或写手的文章/页面 Brief。",
+      "columns": [
+        "Keyword",
+        "Target Site",
+        "Page Type",
+        "Topic Cluster",
+        "Search Intent",
+        "Parent Page",
+        "Asset Status",
+        "Content Action",
+        "Recommended URL",
+        "Outline",
+        "Image Placement Map",
+        "Reference Rule",
+        "CTA",
+        "Writing Boundaries"
+      ]
+    },
+    "contentCalendar": {
+      "sheetName": "03_content_calendar",
+      "purpose": "把 P0/P1 关键词变成发布排期。",
+      "columns": [
+        "Week",
+        "Site",
+        "Keyword",
+        "Content Type",
+        "Priority",
+        "Main CTA",
+        "Image Count",
+        "Reference Rule"
+      ]
+    }
+  },
+  "contentPlan": {
+    "outlines": {
+      "mainCollection": [
+        "H1: {title}",
+        "H2: 快速筛选：口味、尼古丁、续航、价格带",
+        "H2: 推荐产品区块：畅销款、新手款、长续航款",
+        "H2: 购买前需要确认的 5 个问题",
+        "H2: FAQ：配送、退换、合规、使用注意事项"
+      ],
+      "mainBlog": [
+        "H1: {title}: Practical Guide Before You Buy",
+        "H2: 先给结论：谁适合、谁不适合",
+        "H2: 判断标准：需求、预算、使用场景、维护成本",
+        "H2: 推荐选择路径：从问题到主站集合页",
+        "H2: 常见误区与安全提醒",
+        "H2: FAQ"
+      ],
+      "blogC": [
+        "H1: {title}: Which Option Makes More Sense?",
+        "H2: 快速结论表",
+        "H2: 适合人群对比",
+        "H2: 成本、便携、维护、体验对比",
+        "H2: 什么时候应该选择 A / B",
+        "H2: FAQ"
+      ],
+      "blogB": [
+        "H1: {title}: How To Choose Without Overthinking",
+        "H2: 场景拆分：新手、通勤、旅行、口味探索",
+        "H2: 选择标准：强度、甜度、续航、便携",
+        "H2: 避坑清单",
+        "H2: 下一步阅读或导购入口",
+        "H2: FAQ"
+      ],
+      "knowledge": [
+        "H1: {title}: A Clear, Practical Guide",
+        "H2: 先解释用户真正想解决的问题",
+        "H2: 分步骤说明核心概念",
+        "H2: 常见错误与注意事项",
+        "H2: 什么时候需要进一步比较产品",
+        "H2: FAQ"
+      ]
+    },
+    "userQuestion": {
+      "mainCollection": "用户搜索 \"{keyword}\" 时已接近购买，需要快速看到合适的产品/分类、筛选标准和可信购买入口。",
+      "comparison": "用户搜索 \"{keyword}\" 时想比较不同选择，判断哪一种更适合自己，以及下一步应该看哪个承接页。",
+      "transaction": "用户搜索 \"{keyword}\" 时有明显购买前判断需求，需要确认规格、适用场景、价格/风险和购买路径。",
+      "scenario": "用户搜索 \"{keyword}\" 时想在场景或人群里快速筛选方案，而不是阅读泛泛概念。",
+      "knowledge": "用户搜索 \"{keyword}\" 时想先理解概念、方法或注意事项，再决定是否继续比较产品。",
+      "fallback": "用户搜索 \"{keyword}\" 时想获得清晰、可信的答案。"
+    },
+    "oneSentenceAnswer": {
+      "mainCollection": "{title} should be a commercial landing page with filters, product proof, FAQs, and clear purchase paths, not a generic blog article.",
+      "comparison": "The best answer for \"{keyword}\" is a practical comparison that explains the key differences, who each option fits, and the next page to visit.",
+      "transaction": "Help readers choose confidently first, then point them to the most relevant product or collection page only when that page is confirmed.",
+      "knowledge": "Answer the question behind \"{keyword}\" first, then explain what it means for safe use, product choice, or the next decision step.",
+      "fallback": "Start with a direct answer to \"{keyword}\", then organize the article around the reader's decision path instead of broad background."
+    },
+    "cta": {
+      "mainCollection": "强 CTA：集合页首屏、筛选区和 FAQ 后都需要清晰购买/比较入口 → {asset}。",
+      "knowledge": "轻 CTA：先帮读者完成理解，再自然引导到 {asset}。",
+      "default": "中强 CTA：在结论或 FAQ 后引导读者查看 {asset}。",
+      "fallback": "低门槛 CTA：给出下一步阅读或比较入口 → {asset}。"
+    },
+    "faqTemplate": [
+      "What does \"{keyword}\" mean for a shopper?",
+      "How should I choose the right option for \"{keyword}\"?",
+      "What should I compare before making a decision?",
+      "When should I visit the product or collection page instead of reading more guides?"
+    ],
+    "eeat": [
+      "写清楚判断依据，不只给抽象建议。",
+      "加入真实产品/场景/参数/对比维度，让读者能验证。",
+      "涉及健康、安全、法规、年龄、回收时只使用官方或高可信来源。"
+    ],
+    "reviewMetrics": [
+      "发布 30-60 天后看 GSC：Clicks、Impressions、Average Position、查询词覆盖。",
+      "有展现没点击：优先改标题、Meta、首屏一句话答案。",
+      "有排名苗头但不上升：补 FAQ、对比表、原创证据和内部链接。",
+      "有点击没转化：检查 CTA、承接页匹配度和内链锚文本。"
+    ],
+    "updateDecision": [
+      "有排名苗头就更新，不要只发不改。",
+      "优先补强：FAQ、对比表、图片/表格、内部链接、缺失的父级商业页入口。",
+      "如果 SERP 意图变化，重新判断页面类型，必要时合并、改写或转成商业页。"
+    ]
+  },
+  "articleBriefTemplate": {
+    "sourceSheet": "文章Brief模板",
+    "description": "每篇文章开写前先填这个 Brief，避免写成泛泛而谈的 AI 水文。",
+    "requiredBeforeWriting": true,
+    "columns": ["模块", "填写内容", "判断标准", "示例", "负责人/状态", "复盘"],
+    "modules": [
+      {
+        "key": "primaryKeyword",
+        "label": "主关键词",
+        "field": "从「文章关键词池」选择 P0/P1 词",
+        "standard": "一个主词，一个明确意图",
+        "example": "silk pillowcase vs satin",
+        "promptInstruction": "文章只能围绕一个主关键词展开；不要把多个不同意图的词硬塞进同一篇。"
+      },
+      {
+        "key": "parentCommercialPage",
+        "label": "父级商业页",
+        "field": "这篇文章最终要支撑哪个分类/商品页",
+        "standard": "必须能自然内链",
+        "example": "/collections/silk-pillowcases",
+        "promptInstruction": "先确认承接页是否真实存在；只有 existing 资产才能在正文放可点击内链。"
+      },
+      {
+        "key": "userQuestion",
+        "label": "用户问题",
+        "field": "用户搜索这个词真正想解决什么",
+        "standard": "用一句话说清楚",
+        "example": "不知道真丝和缎面哪个更适合头发/皮肤",
+        "promptInstruction": "开写前先用一句话定义用户问题，正文第一屏必须回应这个问题。"
+      },
+      {
+        "key": "searchIntent",
+        "label": "搜索意图",
+        "field": "Informational / Commercial / Mixed",
+        "standard": "以 SERP 为准，不只看工具标签",
+        "example": "Commercial Investigation",
+        "promptInstruction": "按 Google 前排获胜页面判断意图；工具标签只做参考。"
+      },
+      {
+        "key": "articleType",
+        "label": "文章类型",
+        "field": "对比文/榜单/教程/标准/场景方案",
+        "standard": "匹配 Google 前排获胜类型",
+        "example": "对比文",
+        "promptInstruction": "文章类型必须匹配 SERP 获胜类型；集合页词不要写成普通博客。"
+      },
+      {
+        "key": "oneSentenceAnswer",
+        "label": "一句话答案",
+        "field": "开头先给结论",
+        "standard": "不要绕半天才回答",
+        "example": "Silk is a natural fiber; satin is a weave, so they are not the same category.",
+        "promptInstruction": "正文开头先给清晰结论，再展开解释、对比和推荐路径。"
+      },
+      {
+        "key": "h2Structure",
+        "label": "H2结构",
+        "field": "按用户决策顺序排，不按自己想说的排",
+        "standard": "先结论，再差异，再适合谁，再选购",
+        "example": "What is silk? What is satin? Key differences table...",
+        "promptInstruction": "H2 按用户决策路径排列：结论、核心差异/步骤、适合谁、选购/下一步、FAQ。"
+      },
+      {
+        "key": "originalEvidence",
+        "label": "原创证据",
+        "field": "图片、表格、实测、商品经验、材质参数、FAQ",
+        "standard": "至少 2-3 个非泛泛模块",
+        "example": "momme 对比表、洗护图片、用户场景",
+        "promptInstruction": "至少规划 2-3 个能降低 AI 味的原创证据模块，例如对比表、产品参数、真实图片、实测或 FAQ。"
+      },
+      {
+        "key": "competitorGap",
+        "label": "竞品缺口",
+        "field": "前排文章缺什么",
+        "standard": "找到能超越的角度",
+        "example": "缺少尺码/护理/购买建议",
+        "promptInstruction": "写作前必须记录前排内容缺口，并在正文中补足至少 1-2 个可执行差异点。"
+      },
+      {
+        "key": "internalLinks",
+        "label": "内链",
+        "field": "文章正文中链接到哪些商业页/相关文章",
+        "standard": "上链商业页，下链相关博客",
+        "example": "/collections/silk-pillowcases; /blogs/how-to-wash-silk",
+        "promptInstruction": "内链要服务读者下一步：上链商业页，下链相关博客；同一 URL 不重复完全相同锚文本。"
+      },
+      {
+        "key": "cta",
+        "label": "CTA",
+        "field": "低门槛 CTA，不要太硬",
+        "standard": "教程文轻 CTA，购买指南强 CTA",
+        "example": "See our 22 momme mulberry silk pillowcases",
+        "promptInstruction": "CTA 强度要匹配文章类型；知识/教程轻 CTA，购买指南/对比文可以更明确。"
+      },
+      {
+        "key": "visualAssets",
+        "label": "图片/表格",
+        "field": "需要哪些视觉资产",
+        "standard": "表格比纯文字更容易留下来",
+        "example": "Silk vs Satin comparison table",
+        "promptInstruction": "必须规划图片或表格资产；优先用对比表、流程图、场景图、产品参数表解释复杂决策。"
+      },
+      {
+        "key": "imagePlacement",
+        "label": "图片插入位置",
+        "field": "如果需要图片，必须输出 Image Placement Map：图片用途、文件名、精确插入位置、目的、alt",
+        "standard": "不能只写“放正文中”；要写 H2/H3、段落后、表格前后或 CMS featured image",
+        "example": "Cover: CMS featured image; comparison image: before comparison table",
+        "promptInstruction": "每张图必须说明用途、建议文件名、精确插入位置、目的和 alt，不能只写“放正文中”。"
+      },
+      {
+        "key": "faq",
+        "label": "FAQ",
+        "field": "从 People Also Ask / Semrush / GSC 提取",
+        "standard": "每篇 3-6 个",
+        "example": "Is satin the same as silk?",
+        "promptInstruction": "FAQ 必须围绕真实搜索问题，优先来自 PAA、Semrush 或 GSC；每篇 3-6 个。"
+      },
+      {
+        "key": "referencesJudgment",
+        "label": "References触发判断",
+        "field": "判断本文是否需要外部引用：只有外部事实、官方定义、法律/年龄、健康、安全、电池/回收、行业标准、平台规则或研究数据才触发",
+        "standard": "不需要时写“0引用，不添加References”；需要时用描述性锚文本，不展示裸 URL",
+        "example": "触发：FDA ENDS definition; EPA battery disposal guidance / 不触发：口味经验文",
+        "promptInstruction": "References 是触发式模块；不需要时不要添加标题，需要时使用描述性锚文本和官方来源。"
+      },
+      {
+        "key": "eeat",
+        "label": "E-E-A-T",
+        "field": "作者经验、来源、证据、可验证事实",
+        "standard": "能降低 AI 味",
+        "example": "材质说明、护理测试、真实产品图",
+        "promptInstruction": "正文必须体现经验、证据、可验证事实或真实产品/场景细节，避免泛泛空话。"
+      },
+      {
+        "key": "postPublishReview",
+        "label": "发布后复盘",
+        "field": "30-60 天看 GSC",
+        "standard": "没展现看意图，没点击改标题，没排名补内容/内链",
+        "example": "Clicks, impressions, avg position",
+        "promptInstruction": "Brief 必须写清楚发布后 30-60 天复盘指标：展现、点击、平均排名、查询词和辅助转化。"
+      },
+      {
+        "key": "updateDecision",
+        "label": "是否更新",
+        "field": "有排名苗头就更新",
+        "standard": "不要只发不改",
+        "example": "补 FAQ、补对比表、补内部链接",
+        "promptInstruction": "如果有展现或排名苗头，优先更新补强 FAQ、对比表、内链和原创证据，而不是只发新文章。"
+      }
+    ],
+    "qualityGate": [
+      "没有明确用户问题，不进入写作。",
+      "没有确认文章类型和 SERP 获胜类型，不进入写作。",
+      "没有父级商业页或承接资产状态，不生成正文可点击内链。",
+      "没有原创证据和竞品缺口，文章只能作为草稿，不能直接发布。",
+      "没有 Image Placement Map，不算完整交付。",
+      "References 只在触发时出现；不触发时必须明确 0 引用。"
+    ]
+  },
+  "siteContentDiagnosis": {
+    "name": "Existing Site Content Diagnosis Standard",
+    "purpose": "Audit published and draft posts before creating more content, so the workflow knows which topics already exist, which keywords are covered, where content is thin, and what should be updated or internally linked.",
+    "source": "Derived from articleBriefTemplate modules: postPublishReview, updateDecision, internalLinks, parentCommercialPage, searchIntent, competitorGap, originalEvidence, referencesJudgment, and eeat.",
+    "requiredInputs": [
+      "Site positioning from Step 01",
+      "Existing post list from WordPress or self-built blog API",
+      "Imported Semrush keyword table when available",
+      "Known commercial pages and parent pages",
+      "Target market and content language"
+    ],
+    "auditDimensions": [
+      {
+        "key": "inventory",
+        "label": "Content inventory",
+        "standard": "Summarize every post by title, slug, status, likely primary keyword, topic cluster, page role, and update need."
+      },
+      {
+        "key": "keywordCoverage",
+        "label": "Keyword coverage",
+        "standard": "Map posts to imported keywords when available. Mark covered, partially covered, missing, and cannibalized keywords. Do not invent search volume or rankings."
+      },
+      {
+        "key": "intentFit",
+        "label": "Intent and page-type fit",
+        "standard": "Check whether each post matches the intended search intent and article type: guide, comparison, scenario, FAQ, buying guide, or commercial support."
+      },
+      {
+        "key": "thinContent",
+        "label": "Thin or generic content",
+        "standard": "Flag posts that lack one-sentence answer, original evidence, useful tables, image placement, FAQ, or clear next-step CTA."
+      },
+      {
+        "key": "internalLinks",
+        "label": "Internal-link opportunities",
+        "standard": "Recommend links upward to commercial pages and sideways/downward to related posts. Only recommend live links to confirmed existing URLs."
+      },
+      {
+        "key": "cannibalization",
+        "label": "Topic overlap and cannibalization",
+        "standard": "Find posts with the same likely primary keyword, same intent, or same SERP target. Recommend merge, redirect, update, or differentiate."
+      },
+      {
+        "key": "refreshPriority",
+        "label": "Refresh priority",
+        "standard": "Prioritize updates before creating new posts when existing content has topic fit but weak structure, outdated examples, missing FAQ, or missing internal links."
+      },
+      {
+        "key": "newContentGaps",
+        "label": "New content opportunities",
+        "standard": "Only suggest new articles for uncovered keyword clusters or clear supporting topics that do not compete with existing posts."
+      }
+    ],
+    "outputFormat": [
+      "## 站点内容诊断摘要",
+      "## 现有文章库存表",
+      "## 关键词覆盖地图",
+      "## 重复竞争 / 内容重叠风险",
+      "## 内链机会",
+      "## 旧文章更新优先级队列",
+      "## 新内容缺口机会",
+      "## 下一步执行清单"
+    ],
+    "rules": [
+      "Do not claim Google ranking, traffic, CTR, or impressions unless the data is supplied.",
+      "Do not recommend publishing new content before checking whether an existing post should be updated.",
+      "Use P0/P1/P2/P3 priority labels for actions.",
+      "Separate update actions from new article actions.",
+      "If Semrush keywords are available, connect each recommendation to keyword, intent, assigned site, and target asset.",
+      "If article content is only a preview, mark conclusions as provisional."
+    ]
+  },
+  "globalPlanning": {
+    "name": "Global SEO Brain Planning Standard",
+    "purpose": "把站点资产、关键词池、文章库存、GSC/GA4、SERP 和产品承接页统一成可执行任务队列，明确今天写哪几篇、更新哪几篇、哪些词先不做。",
+    "source": "Derived from 01_keyword_allocation, 02_article_brief, 03_content_calendar, siteContentDiagnosis, localePolicy, SerpApi validation, GSC/GA4 monthly review, and product asset extraction.",
+    "planningPrinciple": "先补齐数据，再判断动作；先更新已有机会，再生产新内容；先按市场/语种分桶，再分站点和文章类型；AI 只能解释和排序，不能绕过硬门槛。",
+    "requiredInputs": [
+      "Target market / language / Semrush database",
+      "Configured sites with market, language, and content role",
+      "Product or commercial page assets for main-site commercial support",
+      "Semrush keyword pool for the same market",
+      "Existing post inventory for matched sites",
+      "GSC / GA4 review data when deciding update priorities",
+      "SerpApi Google Top 10 result for final page-type validation"
+    ],
+    "hardGates": [
+      {
+        "key": "targetMarket",
+        "priority": "P0",
+        "label": "补齐项目目标市场",
+        "blocker": "没有目标市场时，语言、Semrush 数据库和 Google SERP gl/hl 都无法稳定。",
+        "blocks": ["new_article", "update_article", "publish"]
+      },
+      {
+        "key": "singleMarket",
+        "priority": "P0",
+        "label": "先切到单一市场再生产内容",
+        "blocker": "全部市场只适合看资产总览，不能直接进入关键词规划或文章生成。",
+        "blocks": ["new_article", "update_article", "publish"]
+      },
+      {
+        "key": "splitLocale",
+        "priority": "P0",
+        "label": "拆分多国家或多语种关键词池",
+        "blocker": "EU / Global 不是一个可执行 SERP 市场，需要按国家和语言拆开。",
+        "blocks": ["new_article", "update_article", "publish"]
+      },
+      {
+        "key": "siteProfiles",
+        "priority": "P1",
+        "label": "补齐站点档案",
+        "blocker": "每个站点需要市场、语言和内容角色，否则站群分词会混乱。",
+        "blocks": ["bulk_generation"]
+      },
+      {
+        "key": "productAssets",
+        "priority": "P0",
+        "label": "提取主站产品资产",
+        "blocker": "主站负责商业承接，产品/集合页资产缺失会让文章无法判断应该承接到哪里。",
+        "blocks": ["main_site_commercial_content", "commercial_cta"]
+      },
+      {
+        "key": "keywordPool",
+        "priority": "P0",
+        "label": "导入或切换到匹配当前市场的 Semrush 关键词池",
+        "blocker": "全局大脑需要同市场关键词池来判断新写、更新、合并或暂不做。",
+        "blocks": ["planning", "new_article"]
+      },
+      {
+        "key": "postInventory",
+        "priority": "P1",
+        "label": "刷新当前市场站点文章库存",
+        "blocker": "没有文章库存时，无法判断已覆盖、部分覆盖、重复竞争或应更新旧文。",
+        "blocks": ["update_decision", "cannibalization_check"]
+      },
+      {
+        "key": "reviewData",
+        "priority": "P1",
+        "label": "拉取 GSC / GA4 复盘数据",
+        "blocker": "没有真实表现数据时，只能规划新内容，不能可靠判断旧文更新优先级。",
+        "blocks": ["update_priority"]
+      },
+      {
+        "key": "serpData",
+        "priority": "P0",
+        "label": "拉取真实 SERP Top 10",
+        "blocker": "最终判断写文章、做集合页、产品页或暂不做，需要真实 SERP 前 10。",
+        "blocks": ["final_page_type_decision", "article_generation"]
+      }
+    ],
+    "decisionTypes": {
+      "new_article": {
+        "label": "新写文章",
+        "when": [
+          "关键词与当前市场、站点角色、语言匹配。",
+          "关键词 P0/P1 或经 AI 复核后分数达到新写阈值。",
+          "文章库存中没有同意图、同主关键词或可更新的旧文。",
+          "SERP 前排主要是文章、指南、对比、FAQ、榜单或商业前教育内容。",
+          "能规划出明确父级承接页、内链路径、原创证据和 Image Placement Map。"
+        ]
+      },
+      "update_article": {
+        "label": "更新旧文",
+        "when": [
+          "已有文章覆盖同关键词或同意图，但结构薄、缺 FAQ、缺对比表、缺内链或缺原创证据。",
+          "GSC 有曝光但点击低，或平均排名卡在 4-20 名。",
+          "已有文章与 SERP 获胜类型一致，只需要补强标题、段落、FAQ、证据或内链。",
+          "内容重叠风险高，不宜再开新 URL。"
+        ]
+      },
+      "merge_or_redirect": {
+        "label": "合并 / 重定向",
+        "when": [
+          "两个以上 URL 针对同一个主关键词或同一搜索意图。",
+          "旧文都偏薄，分散内链和主题权重。",
+          "SERP 只需要一个强页面承接，而不是多个相似文章。"
+        ]
+      },
+      "commercial_page": {
+        "label": "做集合页 / 产品页",
+        "when": [
+          "SERP 前排主要是分类页、产品页、电商列表页或品牌页。",
+          "关键词明显交易型或商品集合型。",
+          "主站存在或可创建真实承接资产。"
+        ]
+      },
+      "hold": {
+        "label": "暂不做",
+        "when": [
+          "市场或语种不匹配。",
+          "关键词与核心产品或站点定位弱相关。",
+          "风险词、合规敏感词、未成年人、本地 near me、非法或站点不适合承接。",
+          "KD 过高且商业价值、站点权重、内容差异化不足。",
+          "SERP 被大品牌、平台页或本地结果完全占据，短期没有可执行突破点。"
+        ]
+      }
+    },
+    "scoring": {
+      "maxScore": 100,
+      "weights": {
+        "keywordPriority": 18,
+        "commercialFit": 16,
+        "siteRoleFit": 14,
+        "coverageGap": 14,
+        "serpPageTypeFit": 14,
+        "reviewOpportunity": 10,
+        "productAssetFit": 8,
+        "difficultyPenalty": -10,
+        "riskPenalty": -20
+      },
+      "thresholds": {
+        "writeNow": 78,
+        "updateNow": 72,
+        "needsSerpBeforeDecision": 60,
+        "holdBelow": 50
+      },
+      "tieBreakers": [
+        "先 P0 后 P1。",
+        "先能承接产品/集合页的商业前教育词。",
+        "先有 SERP 数据且页面类型明确的词。",
+        "先能补现有站点主题缺口的词。",
+        "同分时优先低 KD、高相关、可自然内链的词。"
+      ]
+    },
+    "capacityRules": {
+      "dailyNewArticlesDefault": 3,
+      "dailyUpdatesDefault": 3,
+      "maxNewArticlesPerSitePerDay": 1,
+      "maxSameTopicClusterPerDay": 1,
+      "minimumUpdateRatioWhenReviewDataExists": 0.4,
+      "notes": [
+        "如果 GSC/GA4 已有数据，不能只安排新文章；至少 40% 任务应考虑旧文更新。",
+        "同一天不要在多个站点写同一主题或同一主关键词，避免站群内耗。",
+        "非主站博客站早期只做本站内链，不给主站或产品页外链。"
+      ]
+    },
+    "siteConstraints": [
+      "主站集合页承接交易型、分类型、产品集合型关键词。",
+      "主站博客可写商业前教育、选购指南、对比前置内容，但必须服务主站承接页。",
+      "博客A 优先知识教程、FAQ、合规科普、定义解释。",
+      "博客B 优先场景人群、需求解决、口味灵感、新手选择。",
+      "博客C 优先对比评测、Best、VS、替代方案。",
+      "非主站文章默认禁止给主站或产品页外链，除非人工改站点策略。"
+    ],
+    "outputFormat": [
+      "## 全局规划摘要",
+      "## 数据缺口 / 硬门槛",
+      "## 今天新写队列",
+      "## 今天更新队列",
+      "## 合并 / 重定向建议",
+      "## 暂不做关键词",
+      "## SERP 待校验关键词",
+      "## 站点分配与产能",
+      "## 下一步执行清单"
+    ],
+    "aiRules": [
+      "AI 只能按照 globalPlanning 标准解释、排序和生成任务，不允许绕过 hardGates。",
+      "没有真实 SERP 数据时，不能输出最终页面类型，只能标记 needsSerpCheck。",
+      "没有文章库存时，不能判断某词未覆盖，只能标记 inventoryMissing。",
+      "没有 GSC/GA4 时，不能声称旧文表现差，只能根据内容库存做结构性更新建议。",
+      "每条任务必须输出 decision、priority、score、targetSite、keyword、reason、requiredData、nextAction。",
+      "暂不做也必须说明原因和重新评估条件。"
+    ]
+  },
+  "articleOutputFormat": {
+    "name": "WordPress Import Markdown",
+    "purpose": "文章必须按可脚本化导入 WordPress 的 Markdown 块格式输出；顶部 SEO 字段用于回填 Rank Math，正文用于转换 Gutenberg 区块，不能把正文、SEO 字段、图片位置和内链建议混在一起。",
+    "sourceExample": "How to Vape Properly.md",
+    "forbidYamlFrontmatter": true,
+    "requiredOrder": [
+      "## Title",
+      "## Meta Title",
+      "## Meta Description",
+      "## URL Slug",
+      "## Primary Keyword: {primaryKeyword}",
+      "## Secondary Keywords: {secondaryKeywords}",
+      "## Last Updated",
+      "# {H1}",
+      "正文",
+      "## References（仅触发时输出）",
+      "## Image Placement Map",
+      "## Internal Link Suggestions（需要时输出）",
+      "## Evidence Needed（缺少真实证据时输出）",
+      "## Content QA Checklist"
+    ],
+    "rules": [
+      "不要输出 YAML frontmatter，不要用 --- 包裹元数据。",
+      "正文前必须先输出 Title、Meta Title、Meta Description、URL Slug、Primary Keyword、Secondary Keywords、Last Updated；这些字段会被上传脚本映射到 WP 标题、Slug、Excerpt 和 Rank Math 的 title、description、focus keyword。",
+      "正文从 H1 开始，H1 前不放解释性废话。",
+      "Meta Description 建议 140-160 个英文字符，直接可放入 WP SEO 插件。",
+      "URL Slug 使用英文小写短横线格式。",
+      "References 是触发式模块，不触发时不要输出 References 标题。",
+      "Image Placement Map 必须独立成块，写清楚用途、文件名、插入位置、目的和 alt。",
+      "Internal Link Suggestions 必须独立成块；只有 existing 资产才能在正文内生成可点击链接。",
+      "Content QA Checklist 必须独立成块，用来给上传前脚本或人工检查。"
+    ]
+  },
+  "references": {
+    "policy": "triggered_only",
+    "rule": "References 不是每篇文章固定模块。普通经验、口味、场景、产品灵感文可以 0 引用；只有使用外部官方资料，或涉及健康、安全、法规、年龄、电子烟定义、电池回收等内容时才触发。",
+    "triggers": {
+      "FDA": {
+        "terms": ["safe", "safety", "nicotine", "e-cigarette", "vaping", "health", "age", "legal"],
+        "label": "E-cigarettes, Vapes, and other Electronic Nicotine Delivery Systems",
+        "url": "https://www.fda.gov/tobacco-products/products-ingredients-components/e-cigarettes-vapes-and-other-electronic-nicotine-delivery-systems-ends"
+      },
+      "EPA": {
+        "terms": ["battery", "batteries", "dispose", "disposal", "recycle"],
+        "label": "Used Lithium-Ion Batteries",
+        "url": "https://www.epa.gov/recycle/used-lithium-ion-batteries"
+      }
+    }
+  },
+  "anchorTextRules": {
+    "policy": "natural_contextual_variation",
+    "purpose": "让内部链接服务读者下一步，而不是机械堆关键词或重复同一个锚文本。",
+    "internalLinks": [
+      "同一篇文章里，同一个目标 URL 不要重复使用完全相同的锚文本；精准匹配关键词最多使用 1 次。",
+      "锚文本必须描述目标页面能解决什么问题，优先使用自然短语，而不是为了换表达而硬改同义词。",
+      "如果上下文不适合第二次链接，宁愿少放一个链接，也不要为了变化而写生硬锚文本。",
+      "避免 click here、read more、this page、官网、点击这里 这类泛锚文本，除非是按钮文案。",
+      "内部链接锚文本建议 2-8 个英文词，覆盖：类目名、问题场景、选择标准、下一步动作等不同表达角度。",
+      "博客站导向主站时要软连接，优先用问题解决型锚文本；主站博客可以使用更明确的集合页或购买前比较型锚文本。"
+    ],
+    "externalReferences": [
+      "官方 References 的锚文本不需要刻意变化，优先使用官方页面主题或具体资料名称，保证可信和准确。",
+      "如果正文中引用官方资料，正文最后 References 使用固定格式：- 来源名: [具体锚文本](URL)。"
+    ],
+    "badExamples": [
+      "[click here](URL)",
+      "[best disposable vapes](URL) 在同一篇文章里重复 3 次",
+      "为了换锚文本而写与上下文不相关的描述"
+    ],
+    "goodExamples": [
+      "[compare disposable vape options](URL)",
+      "[choose a nicotine-free vape](URL)",
+      "[browse rechargeable disposable vapes](URL)",
+      "[see the full flavor collection](URL)"
+    ]
+  },
+  "imagePlacements": [
+    {
+      "name": "封面图",
+      "position": "文章标题下方 / 集合页首屏右侧",
+      "altTemplate": "{keyword} visual guide for independent shoppers"
+    },
+    {
+      "name": "流程图",
+      "position": "第一个 H2 之后，用来解释选择或使用路径",
+      "altTemplate": "{keyword} step by step decision flow"
+    },
+    {
+      "name": "对比表图",
+      "position": "核心判断标准段落之后",
+      "altTemplate": "{keyword} comparison checklist"
+    },
+    {
+      "name": "CTA 场景图",
+      "position": "正文最后 CTA 前，用自然方式连接主站页面",
+      "altTemplate": "{keyword} next step product selection"
+    }
+  ],
+  "articleRules": [
+    "先满足搜索意图，再考虑转化。",
+    "集合页词不要硬写成博客文章。",
+    "主站博客可以承接商业前教育词。",
+    "博客站文章只做自然上下文内链，不硬塞购买按钮。",
+    "同一目标 URL 在同一篇文章里不要重复使用完全相同的内部链接锚文本；如果不能自然变化，就减少链接次数。",
+    "不编造医学、法规、官方数据。",
+    "不是每篇文章都需要 References。"
+  ]
+}
