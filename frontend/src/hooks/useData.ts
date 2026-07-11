@@ -238,6 +238,19 @@ export function analyzeKeywordStrategy(keywordIds: string[], limit?: number, opp
   })
 }
 
+export interface SerpSearchResult {
+  configured: boolean
+  keyword: string
+  status?: string
+  organic_results: Array<{ position?: number; title?: string; link?: string; snippet?: string; displayed_link?: string }>
+  related_questions: Array<{ question?: string; title?: string; snippet?: string; link?: string }>
+  related_searches: Array<{ query?: string; title?: string }>
+}
+
+export function searchSerp(keyword: string, gl = 'us', hl = 'en') {
+  return postJson<SerpSearchResult>('/api/v1/serpapi', { keyword, gl, hl })
+}
+
 export function syncAllPosts(limit = 100) {
   return postJson<{ ok: boolean; saved: number; results: Array<{ ok: boolean; site_id: string; saved: number; error?: string }> }>(
     '/api/v1/posts/sync-all',
