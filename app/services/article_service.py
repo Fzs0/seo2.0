@@ -117,30 +117,33 @@ async def list_articles(
     where = "WHERE 1=1"
     params: dict[str, Any] = {"limit": max(1, min(limit, 200)), "offset": max(0, offset)}
     if site_id:
-        where += " AND site_id = :site_id"
+        where += " AND a.site_id = :site_id"
         params["site_id"] = site_id
     if keyword_id:
-        where += " AND keyword_id = :keyword_id"
+        where += " AND a.keyword_id = :keyword_id"
         params["keyword_id"] = keyword_id
     if status:
-        where += " AND status = :status"
+        where += " AND a.status = :status"
         params["status"] = status
     total = (
         await session.execute(
-            text(f"SELECT count(*) AS n FROM seo_agent.articles {where}"),
+            text(f"SELECT count(*) AS n FROM seo_agent.articles a {where}"),
             params,
         )
     ).scalar_one()
     result = await session.execute(
         text(
             f"""
-            SELECT id, task_id, site_id, keyword_id, title, slug, target_url, status,
-                   language_code, market, meta_title, meta_description,
-                   primary_keyword, generation_provider, generation_model,
-                   created_at, updated_at, published_at, published_url
-              FROM seo_agent.articles
+            SELECT a.id, a.task_id, a.site_id, s.name AS site_label,
+                   a.keyword_id, k.keyword, a.title, a.slug, a.target_url, a.status,
+                   a.language_code, a.market, a.meta_title, a.meta_description,
+                   a.primary_keyword, a.generation_provider, a.generation_model,
+                   a.created_at, a.updated_at, a.published_at, a.published_url
+              FROM seo_agent.articles a
+              LEFT JOIN seo_agent.sites s ON s.id = a.site_id
+              LEFT JOIN seo_agent.keywords k ON k.id = a.keyword_id
               {where}
-             ORDER BY created_at DESC
+             ORDER BY a.created_at DESC
              LIMIT :limit OFFSET :offset
             """
         ),

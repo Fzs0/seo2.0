@@ -54,6 +54,43 @@ async def get_site(session: AsyncSession, site_id: str) -> dict[str, Any] | None
     return _attach_publish_state(dict(row)) if row else None
 
 
+async def resolve_site_id(
+    session: AsyncSession,
+    *,
+    site_id: str | None = None,
+    label: str | None = None,
+    market: str | None = None,
+    language_code: str | None = None,
+) -> str | None:
+    if site_id:
+        return str(site_id)
+    if not label:
+        return None
+    exact = await session.execute(
+        text("SELECT id FROM seo_agent.sites WHERE site_key = :label OR name = :label LIMIT 1"),
+        {"label": label},
+    )
+    exact_id = exact.scalar_one_or_none()
+    if exact_id:
+        return str(exact_id)
+    result = await session.execute(
+        text(
+            """
+            SELECT id, count(*) OVER () AS match_count
+              FROM seo_agent.sites
+             WHERE content_role = :label
+               AND (CAST(:market AS text) IS NULL OR market = CAST(:market AS text))
+               AND (CAST(:language_code AS text) IS NULL OR lower(language_code) = lower(CAST(:language_code AS text)))
+             ORDER BY name
+             LIMIT 1
+            """
+        ),
+        {"label": label, "market": market, "language_code": language_code},
+    )
+    row = result.mappings().first()
+    return str(row["id"]) if row and int(row["match_count"]) == 1 else None
+
+
 async def upsert_site(session: AsyncSession, payload: dict[str, Any]) -> dict[str, Any]:
     """????????site_key ??????"""
     site_type = payload.get("site_type") or payload.get("siteType") or "other"

@@ -52,12 +52,13 @@ function formatConfidence(value: number | string | null | undefined) {
   return n <= 1 ? `${Math.round(n * 100)}%` : `${Math.round(n)}%`
 }
 
-export function KeywordsPage({ onNotify }: { onNotify?: (title: string, detail?: string) => void }) {
+export function KeywordsPage({ onNotify, onOpenContent }: { onNotify?: (title: string, detail?: string) => void; onOpenContent?: () => void }) {
   const [refreshKey, setRefreshKey] = useState(0)
   const [importing, setImporting] = useState(false)
   const [analyzing, setAnalyzing] = useState(false)
   const [analyzeLimit, setAnalyzeLimit] = useState(10)
   const [opportunityType, setOpportunityType] = useState('long_tail')
+  const [analysisComplete, setAnalysisComplete] = useState(false)
   const [message, setMessage] = useState<string>()
   const kw = useKeywords(refreshKey, 50)
 
@@ -79,9 +80,11 @@ export function KeywordsPage({ onNotify }: { onNotify?: (title: string, detail?:
   async function handleAiAnalyze() {
     if (analyzing) return
     setAnalyzing(true)
+    setAnalysisComplete(false)
     setMessage('正在用 AI 分析前 10 个关键词策略…')
     try {
       const result = await analyzeKeywordStrategy([], analyzeLimit, opportunityType)
+      setAnalysisComplete(result.updated > 0)
       setMessage(result.error ? `AI 分析未完成：${result.error}` : `AI 分析完成：更新 ${formatNumber(result.updated)} 条策略。`)
       onNotify?.('AI 关键词分析完成', result.error ? result.error : `更新 ${formatNumber(result.updated)} 条策略`)
       setRefreshKey((key) => key + 1)
@@ -100,6 +103,12 @@ export function KeywordsPage({ onNotify }: { onNotify?: (title: string, detail?:
           关键词来源：Semrush / 手工 / GSC。导入 Semrush 文件后会自动分析并写入关键词库。
         </p>
         {message && <p>{message}</p>}
+        {analysisComplete && onOpenContent && (
+          <button className="btn btn--primary" type="button" onClick={onOpenContent}>
+            <span className="msr">arrow_forward</span>
+            进入内容策略，生成 Brief
+          </button>
+        )}
       </div>
 
       <div className="filter-row">

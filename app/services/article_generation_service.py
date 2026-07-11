@@ -13,6 +13,7 @@ from app.engine.content_plan import image_plan_for, reference_plan
 from app.services.article_service import save_article
 from app.services.brief_service import build_brief_with_optional_ai
 from app.services.keyword_query_service import get_keyword
+from app.services.site_service import resolve_site_id
 
 
 async def generate_article_from_keyword(session: AsyncSession, keyword_id: str) -> dict[str, Any]:
@@ -42,6 +43,18 @@ async def generate_article_pipeline(session: AsyncSession, keyword_id: str) -> d
 
     item = _compat_keyword(keyword)
     project = _project_for(keyword)
+    assigned_site_id = await resolve_site_id(
+        session,
+        site_id=keyword.get("assigned_site_id"),
+        label=keyword.get("assigned_site_label"),
+        market=keyword.get("market"),
+        language_code=keyword.get("language_code"),
+    )
+    if assigned_site_id:
+        await session.execute(
+            text("UPDATE seo_agent.keywords SET assigned_site_id = :site_id, updated_at = now() WHERE id = CAST(:id AS uuid)"),
+            {"site_id": assigned_site_id, "id": keyword_id},
+        )
 
     strategy = (keyword.get("ai_review") or {}).get("strategy") if isinstance(keyword.get("ai_review"), dict) else None
     ok("strategy", "读取 AI 策略", (strategy or {}).get("briefDirection") or (strategy or {}).get("strategyReason") or "未发现策略，使用关键词基础信息")
@@ -59,7 +72,7 @@ async def generate_article_pipeline(session: AsyncSession, keyword_id: str) -> d
     ok(
         "brief",
         "生成 Brief",
-        brief.get("briefSource") or "brief-ready",
+        "AI-enhanced brief" if brief.get("aiEnhanced") else "local brief",
         {
             "aiEnhanced": bool(brief.get("aiEnhanced")),
             "reason": (brief.get("aiMeta") or {}).get("reason"),
@@ -85,7 +98,7 @@ async def generate_article_pipeline(session: AsyncSession, keyword_id: str) -> d
     saved = await save_article(
         session,
         {
-            "site_id": keyword.get("assigned_site_id"),
+            "site_id": assigned_site_id,
             "keyword_id": keyword["id"],
             "serp_snapshot_id": serp.get("id"),
             "title": title,
@@ -121,8 +134,14 @@ async def generate_article_pipeline(session: AsyncSession, keyword_id: str) -> d
         "status": "done",
         "steps": steps,
         "article": saved,
-        "brief": {"source": brief.get("briefSource"), "text": brief_text},
+        "brief": {
+            "source": brief.get("briefSource"),
+            "aiEnhanced": bool(brief.get("aiEnhanced")),
+            "aiMeta": brief.get("aiMeta") or {},
+            "text": brief_text,
+        },
         "outline": outline.get("content") or "",
+        "content": content,
         "contentPreview": content[:3000],
         "savedTo": {"table": "seo_agent.articles", "articleId": str(saved.get("id") or "")},
         "serp": serp,

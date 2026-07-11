@@ -67,7 +67,7 @@ export default function App() {
       case 'serp':
         return <SerpPage />
       case 'keywords':
-        return <KeywordsPage onNotify={notify} />
+        return <KeywordsPage onNotify={notify} onOpenContent={() => setPage('content')} />
       case 'brief':
         return <BriefPage />
       case 'content':

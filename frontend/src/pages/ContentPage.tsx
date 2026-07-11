@@ -36,6 +36,7 @@ function statusMeta(k: Keyword) {
 }
 
 export function ContentPage({ onNotify }: { onNotify?: (title: string, detail?: string) => void }) {
+  const [refreshKey, setRefreshKey] = useState(0)
   const [generating, setGenerating] = useState(false)
   const [message, setMessage] = useState<string>()
   const [steps, setSteps] = useState<PipelineStep[]>([])
@@ -43,7 +44,7 @@ export function ContentPage({ onNotify }: { onNotify?: (title: string, detail?: 
   const [selectedSiteId, setSelectedSiteId] = useState('')
   const [publishing, setPublishing] = useState(false)
   const [publishMessage, setPublishMessage] = useState<string>()
-  const keywords = useKeywords()
+  const keywords = useKeywords(refreshKey)
   const posts = usePosts()
   const sites = useSites()
   const loading = keywords.loading || posts.loading
@@ -91,6 +92,7 @@ export function ContentPage({ onNotify }: { onNotify?: (title: string, detail?: 
       const passed = (saved.qa || []).filter((item) => item.ok).length
       setMessage(`已生成：${saved.article?.title || keyword.keyword}｜SERP：${saved.serp?.source || saved.serp?.status || '未使用'}｜QA：${passed}/${saved.qa?.length || 0}`)
       onNotify?.('文章生成完成', `${saved.article?.title || keyword.keyword}｜QA ${passed}/${saved.qa?.length || 0}`)
+      setRefreshKey((key) => key + 1)
     } catch (error) {
       setMessage(error instanceof Error ? error.message : '生成失败')
     } finally {
@@ -239,9 +241,9 @@ export function ContentPage({ onNotify }: { onNotify?: (title: string, detail?: 
                   </div>
                 </div>
               </div>
-              <PreviewBlock title={`Brief：${lastResult.brief?.source || 'unknown'}`} text={lastResult.brief?.text} />
+              <PreviewBlock title={`Brief：${lastResult.brief?.aiEnhanced ? 'AI 增强' : '本地生成'}`} text={lastResult.brief?.text} />
               <PreviewBlock title="文章大纲" text={lastResult.outline} />
-              <PreviewBlock title="正文预览" text={lastResult.contentPreview} />
+              <PreviewBlock title="文章正文" text={lastResult.content || lastResult.contentPreview} />
               <select className="chip" value={targetSiteId} onChange={(event) => setSelectedSiteId(event.target.value)}>
                 {publishSites.map((site) => (
                   <option key={site.id} value={site.id}>

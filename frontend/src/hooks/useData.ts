@@ -295,8 +295,9 @@ export async function runArticlePipeline(keyword: Keyword) {
     status: 'done' | 'failed'
     steps: PipelineStep[]
     article?: { id: string; title: string; status: string }
-    brief?: { source?: string; text?: string }
+    brief?: { source?: string; aiEnhanced?: boolean; aiMeta?: Record<string, unknown>; text?: string }
     outline?: string
+    content?: string
     contentPreview?: string
     savedTo?: { table?: string; articleId?: string }
     serp?: { id?: string | null; source?: string; status?: string }

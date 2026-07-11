@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.clients.ai_provider import generate_ai_content
 from app.engine.loader import get_store
+from app.services.site_service import resolve_site_id
 
 
 async def analyze_keyword_strategy(
@@ -61,7 +62,7 @@ async def _load_keywords(
         text(
             f"""
             SELECT id, keyword, volume, kd, cpc, intent, topic_cluster, page_group,
-                   assigned_site_label, page_type, page_role, target_asset_url,
+                   assigned_site_id, assigned_site_label, page_type, page_role, target_asset_url,
                    asset_status, content_action, priority, score, status, reason, ai_review
               FROM seo_agent.keywords
               {where}
@@ -108,12 +109,21 @@ def _parse_json(content: str) -> list[dict[str, Any]]:
 
 
 async def _save_strategy(session: AsyncSession, keyword: dict[str, Any], strategy: dict[str, Any], ai: dict[str, Any]) -> None:
+    assigned_site_label = strategy.get("assignedSiteLabel") or keyword.get("assigned_site_label")
+    assigned_site_id = await resolve_site_id(
+        session,
+        site_id=keyword.get("assigned_site_id"),
+        label=assigned_site_label,
+        market=keyword.get("market"),
+        language_code=keyword.get("language_code"),
+    )
     await session.execute(
         text(
             """
             UPDATE seo_agent.keywords
                SET intent = COALESCE(:intent, intent),
                    topic_cluster = COALESCE(:topic_cluster, topic_cluster),
+                   assigned_site_id = COALESCE(:assigned_site_id, assigned_site_id),
                    assigned_site_label = COALESCE(:assigned_site_label, assigned_site_label),
                    page_type = COALESCE(:page_type, page_type),
                    page_role = COALESCE(:page_role, page_role),
@@ -131,7 +141,8 @@ async def _save_strategy(session: AsyncSession, keyword: dict[str, Any], strateg
             "id": str(keyword["id"]),
             "intent": strategy.get("intent"),
             "topic_cluster": strategy.get("topicCluster"),
-            "assigned_site_label": strategy.get("assignedSiteLabel"),
+            "assigned_site_id": assigned_site_id,
+            "assigned_site_label": assigned_site_label,
             "page_type": strategy.get("pageType"),
             "page_role": strategy.get("pageRole"),
             "target_asset_url": strategy.get("targetAssetUrl"),
