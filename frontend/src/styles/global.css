@@ -2709,3 +2709,79 @@ input[type='range']::-moz-range-thumb {
   white-space: nowrap;
   border: 0;
 }
+
+/* ============================
+ * SEO Agent workbench
+ * ============================ */
+.agent-page { gap: 14px; }
+.agent-heading { margin-bottom: 2px; }
+.agent-eyebrow { color: var(--ink-400); font-size: 11px; letter-spacing: .55px; font-weight: 700; }
+.agent-heading-actions { display: flex; align-items: flex-end; gap: 9px; }
+.agent-heading-actions .select-control { min-width: 170px; }
+.agent-kpi-row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; }
+.agent-metric { min-height: 122px; padding: 16px 18px; border-radius: 16px; position: relative; overflow: hidden; }
+.agent-metric--gold { background: var(--brand-soft); }
+.agent-metric--pink { background: var(--pink-200); }
+.agent-metric--green { background: var(--green-200); }
+.agent-metric--blue { background: var(--blue-200); }
+.agent-metric--purple { background: var(--violet-200); }
+.agent-metric-head { display: flex; justify-content: space-between; color: var(--ink-500); font-size: 12px; }
+.agent-metric-head .msr { font-size: 18px; }
+.agent-metric strong { display: block; margin-top: 11px; font-size: 30px; line-height: 1.1; }
+.agent-metric small { display: block; margin-top: 5px; color: var(--ink-500); font-size: 11px; }
+.agent-main-grid { display: grid; grid-template-columns: minmax(0, 1.75fr) minmax(280px, .75fr); gap: 14px; }
+.agent-rail { display: flex; flex-direction: column; gap: 14px; }
+.agent-table-wrap { overflow-x: auto; }
+.agent-table { width: 100%; min-width: 720px; border-collapse: collapse; font-size: 12px; }
+.agent-table th { padding: 10px 11px; background: var(--bg-page); text-align: left; color: var(--ink-400); font-size: 11px; white-space: nowrap; }
+.agent-table td { padding: 12px 11px; border-bottom: 1px solid var(--ink-100); color: var(--ink-500); vertical-align: middle; }
+.agent-table tbody tr { cursor: pointer; }
+.agent-table tbody tr:hover td { background: rgba(232, 185, 79, .06); }
+.agent-table td:first-child { color: var(--ink-900); }
+.agent-table td:first-child b { display: block; margin-top: 7px; font-size: 13px; }
+.agent-strong { color: var(--ink-900) !important; font-weight: 750; white-space: nowrap; }
+.agent-block-btn { width: 100%; margin-top: 14px; }
+.agent-loop { display: flex; flex-direction: column; }
+.agent-loop-step { display: flex; gap: 10px; position: relative; padding-bottom: 16px; }
+.agent-loop-step:last-child { padding-bottom: 0; }
+.agent-loop-step:not(:last-child)::after { content: ''; position: absolute; left: 12px; top: 25px; bottom: 0; border-left: 1px dashed var(--ink-200); }
+.agent-loop-dot { width: 25px; height: 25px; flex: none; z-index: 1; display: grid; place-items: center; border-radius: 50%; background: var(--bg-page); color: var(--ink-500); font-size: 11px; }
+.agent-loop-dot.done { background: var(--green-200); color: var(--green-700); }
+.agent-loop-dot.current { background: var(--brand); color: var(--brand-ink-deep); }
+.agent-loop-step b { display: block; margin-top: 2px; font-size: 12.5px; }
+.agent-loop-step p { margin: 3px 0 0; color: var(--ink-500); font-size: 11px; }
+.agent-risk-list { display: flex; flex-direction: column; gap: 10px; }
+.agent-risk-item { display: flex; gap: 9px; align-items: flex-start; }
+.agent-risk-dot { width: 8px; height: 8px; flex: none; margin-top: 5px; border-radius: 50%; background: var(--danger); }
+.agent-risk-item b { font-size: 12px; }
+.agent-risk-item p { margin: 2px 0 0; color: var(--ink-500); font-size: 11px; }
+.agent-section-grid { display: grid; grid-template-columns: 1.2fr .8fr; gap: 14px; }
+.agent-asset-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+.agent-asset-card { padding: 14px; border: 1px solid var(--border-soft); border-radius: 13px; background: var(--bg-elev); }
+.agent-asset-card b { display: block; margin: 8px 0 3px; font-size: 13px; }
+.agent-asset-card small { color: var(--ink-500); font-size: 11px; }
+.agent-asset-card > div { display: flex; justify-content: space-between; gap: 8px; margin-top: 13px; color: var(--ink-500); font-size: 11px; }
+.agent-asset-card strong { color: var(--ink-900); }
+.agent-queue { display: flex; flex-direction: column; gap: 9px; }
+.agent-queue-row { display: flex; align-items: center; gap: 12px; padding: 12px; border: 1px solid var(--border-soft); border-radius: 12px; background: var(--bg-elev); }
+.agent-queue-row > div { flex: 1; min-width: 0; }
+.agent-queue-row b { display: block; font-size: 12.5px; }
+.agent-queue-row small { display: block; margin-top: 3px; color: var(--ink-500); font-size: 11px; }
+.agent-queue-row > strong { white-space: nowrap; font-size: 12px; }
+.agent-copy { margin: 0; color: var(--ink-700); font-size: 12px; line-height: 1.7; }
+.agent-progress-row { margin-top: 16px; }
+.agent-progress-row > div:first-child { display: flex; justify-content: space-between; color: var(--ink-500); font-size: 11px; }
+.agent-progress-row b { color: var(--ink-900); }
+.agent-progress { height: 7px; margin-top: 7px; overflow: hidden; border-radius: 99px; background: var(--ink-100); }
+.agent-progress i { display: block; height: 100%; border-radius: 99px; background: var(--brand-deep); }
+.agent-empty { padding: 28px 12px; text-align: center; color: var(--ink-400); font-size: 12px; }
+.agent-drawer { position: fixed; inset: 0; z-index: 30; display: flex; justify-content: flex-end; background: rgba(23, 22, 20, .18); }
+.agent-drawer-panel { width: min(500px, 92vw); height: 100%; overflow-y: auto; padding: 24px; background: var(--bg-card); box-shadow: -14px 0 40px rgba(23, 22, 20, .12); }
+.agent-drawer-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.agent-drawer-head h2 { margin: 5px 0 8px; font-size: 22px; }
+.agent-drawer-section { padding: 16px 0; border-top: 1px solid var(--ink-100); }
+.agent-drawer-section h3 { margin: 0 0 7px; font-size: 12px; }
+.agent-drawer-section p { margin: 0; color: var(--ink-500); font-size: 12px; line-height: 1.7; }
+.agent-drawer-actions { display: flex; gap: 8px; margin-top: 18px; }
+@media (max-width: 1100px) { .agent-kpi-row { grid-template-columns: repeat(2, 1fr); } .agent-main-grid, .agent-section-grid { grid-template-columns: 1fr; } .agent-asset-grid { grid-template-columns: repeat(2, 1fr); } }
+@media (max-width: 700px) { .agent-heading-actions { width: 100%; align-items: stretch; } .agent-heading-actions .select-control { flex: 1; } .agent-asset-grid { grid-template-columns: 1fr; } }

@@ -12,6 +12,7 @@ import { SitesPage } from '@/pages/SitesPage'
 import { AnalyticsPage } from '@/pages/AnalyticsPage'
 import { RulesPage } from '@/pages/RulesPage'
 import { SyncPage } from '@/pages/SyncPage'
+import { AgentWorkbenchPage, type AgentView } from '@/pages/AgentWorkbenchPage'
 
 type PageId =
   | 'dashboard'
@@ -29,12 +30,13 @@ type PageId =
 /** The top tab set is the same for every page — it scopes the current
  *  project / market / dataset. Field naming matches the backend's
  *  `positioning.defaultProject` & `market` query params. */
-const PROJECT_TABS = [
-  { id: 'default', label: '默认项目' },
-  { id: 'blog-a', label: '博客 A · 知识教程' },
-  { id: 'blog-b', label: '博客 B · 场景方案' },
-  { id: 'blog-c', label: '博客 C · 对比评测' },
-  { id: 'main-shop', label: '主站 · 商业页' },
+const WORK_VIEWS = [
+  { id: 'command', label: '总控' },
+  { id: 'assets', label: '资产集群' },
+  { id: 'opportunities', label: '机会队列' },
+  { id: 'execution', label: '执行队列' },
+  { id: 'risk', label: '风险治理' },
+  { id: 'review', label: '数据复盘' },
 ]
 
 function todayLabel() {
@@ -48,7 +50,7 @@ function todayLabel() {
 
 export default function App() {
   const [page, setPage] = useState<PageId>('dashboard')
-  const [projectTab, setProjectTab] = useState('default')
+  const [workView, setWorkView] = useState<AgentView>('command')
   const [notifications, setNotifications] = useState<Array<{ id: string; title: string; detail?: string; time: string }>>([])
 
   function notify(title: string, detail?: string) {
@@ -59,7 +61,7 @@ export default function App() {
   const pageNode = useMemo(() => {
     switch (page) {
       case 'dashboard':
-        return <DashboardPage project={projectTab} />
+        return <AgentWorkbenchPage view={workView} onNotify={notify} />
       case 'opportunities':
         return <OpportunitiesPage />
       case 'serp':
@@ -83,16 +85,19 @@ export default function App() {
       default:
         return null
     }
-  }, [page, projectTab])
+  }, [page, workView])
 
   return (
     <div className="app-shell">
       <Sidebar currentPage={page} onNavigate={(id) => setPage(id as PageId)} />
       <div className="app-main">
         <Topbar
-          tabs={PROJECT_TABS}
-          currentTab={projectTab}
-          onTabChange={setProjectTab}
+          tabs={WORK_VIEWS}
+          currentTab={workView}
+          onTabChange={(id) => {
+            setWorkView(id as AgentView)
+            setPage('dashboard')
+          }}
           dateLabel={todayLabel()}
           notifications={notifications}
         />
