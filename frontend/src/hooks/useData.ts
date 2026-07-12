@@ -148,13 +148,14 @@ export function useArticles(refreshKey = 0): AsyncState<Article[]> {
   return state
 }
 
-export function usePosts(refreshKey = 0): AsyncState<Post[]> {
+export function usePosts(refreshKey = 0, siteId?: string): AsyncState<Post[]> {
   const [state, setState] = useState<AsyncState<Post[]>>({ data: null, loading: true, error: null })
 
   useEffect(() => {
     const controller = new AbortController()
     setState({ data: null, loading: true, error: null })
-    void getJson<{ items: Post[] }>('/api/v1/posts?limit=200', controller.signal)
+    const query = siteId ? `&site_id=${encodeURIComponent(siteId)}` : ''
+    void getJson<{ items: Post[] }>(`/api/v1/posts?limit=200${query}`, controller.signal)
       .then((result) => {
         if (!controller.signal.aborted) setState({ data: result.items, loading: false, error: null })
       })
@@ -164,7 +165,7 @@ export function usePosts(refreshKey = 0): AsyncState<Post[]> {
         }
       })
     return () => controller.abort()
-  }, [refreshKey])
+  }, [refreshKey, siteId])
 
   return state
 }
@@ -254,6 +255,13 @@ export function searchSerp(keyword: string, gl = 'us', hl = 'en') {
 export function syncAllPosts(limit = 100) {
   return postJson<{ ok: boolean; saved: number; results: Array<{ ok: boolean; site_id: string; saved: number; error?: string }> }>(
     '/api/v1/posts/sync-all',
+    { limit },
+  )
+}
+
+export function syncSitePosts(siteId: string, limit = 100) {
+  return postJson<{ ok: boolean; site_id: string; fetched: number; saved: number; error?: string }>(
+    `/api/v1/sites/${encodeURIComponent(siteId)}/posts/sync`,
     { limit },
   )
 }

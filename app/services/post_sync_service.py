@@ -93,7 +93,9 @@ async def _load_site(session: AsyncSession, site_id: str) -> dict[str, Any] | No
 
 
 async def _fetch_wp_posts(site: dict[str, Any], *, limit: int) -> list[dict[str, Any]]:
-    base = (site.get("domain") or site.get("base_url") or "").rstrip("/")
+    base = (site.get("base_url") or site.get("domain") or "").rstrip("/")
+    if base and not base.startswith(("http://", "https://")):
+        base = f"https://{base}"
     cfg = site.get("api_config") or {}
     headers = {}
     if cfg.get("username") and cfg.get("applicationPassword"):

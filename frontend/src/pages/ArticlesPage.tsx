@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { DataGuard } from '@/components/StateBlock'
-import { syncAllPosts, useArticles, usePosts } from '@/hooks/useData'
+import { syncAllPosts, syncSitePosts, useArticles, usePosts, useSites } from '@/hooks/useData'
 
 function formatDate(iso?: string | null) {
   if (!iso) return '—'
@@ -12,9 +12,27 @@ function formatDate(iso?: string | null) {
 export function ArticlesPage() {
   const [refreshKey, setRefreshKey] = useState(0)
   const [syncing, setSyncing] = useState(false)
+  const [selectedSiteId, setSelectedSiteId] = useState('')
   const [message, setMessage] = useState<string>()
   const articles = useArticles(refreshKey)
-  const posts = usePosts(refreshKey)
+  const sites = useSites()
+  const posts = usePosts(refreshKey, selectedSiteId || undefined)
+
+  async function handleSyncSelected() {
+    if (!selectedSiteId || syncing) return
+    const site = sites.data?.find((item) => item.id === selectedSiteId)
+    setSyncing(true)
+    setMessage(`正在读取 ${site?.name || '目标站点'} 的已有文章…`)
+    try {
+      const result = await syncSitePosts(selectedSiteId, 100)
+      setMessage(result.ok ? `${site?.name || '目标站点'} 读取完成：获取 ${result.fetched} 篇，写入 ${result.saved} 篇。` : `${site?.name || '目标站点'} 读取失败：${result.error || '未知错误'}`)
+      if (result.ok) setRefreshKey((key) => key + 1)
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : '站点文章读取失败')
+    } finally {
+      setSyncing(false)
+    }
+  }
 
   async function handleSync() {
     if (syncing) return
@@ -41,6 +59,14 @@ export function ArticlesPage() {
       </div>
 
       <div className="filter-row">
+        <select className="chip" value={selectedSiteId} onChange={(event) => setSelectedSiteId(event.target.value)} disabled={sites.loading}>
+          <option value="">全部站点</option>
+          {sites.data?.map((site) => <option value={site.id} key={site.id}>{site.name}</option>)}
+        </select>
+        <button className="btn btn--primary" type="button" onClick={() => void handleSyncSelected()} disabled={syncing || !selectedSiteId}>
+          <span className="msr">{syncing ? 'progress_activity' : 'download'}</span>
+          {syncing ? '读取中…' : '读取当前站点文章'}
+        </button>
         <button className="btn btn--primary" type="button" onClick={handleSync} disabled={syncing}>
           <span className="msr">{syncing ? 'progress_activity' : 'sync'}</span>
           {syncing ? '同步中' : '同步所有站点文章'}
