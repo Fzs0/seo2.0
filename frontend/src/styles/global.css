@@ -2812,7 +2812,26 @@ input[type='range']::-moz-range-thumb {
 .article-dialog__tabs button { padding: 8px 12px; border: 0; border-radius: 9px; background: transparent; color: var(--ink-500); cursor: pointer; white-space: nowrap; }
 .article-dialog__tabs button.is-active { background: var(--ink-900); color: #fff; }
 .article-dialog__body { flex: 1; overflow: auto; padding: 24px; }
-.article-dialog__content { margin: 0; color: var(--ink-800); white-space: pre-wrap; word-break: break-word; font: inherit; line-height: 1.75; }
+.article-dialog__markdown { color: var(--ink-800); word-break: break-word; line-height: 1.75; }
+.article-dialog__markdown h1, .article-dialog__markdown h2, .article-dialog__markdown h3, .article-dialog__markdown h4 { margin: 0 0 16px; color: var(--ink-900); line-height: 1.35; }
+.article-dialog__markdown h1 { font-size: 27px; }
+.article-dialog__markdown h2 { padding-top: 8px; font-size: 21px; }
+.article-dialog__markdown h3 { font-size: 17px; }
+.article-dialog__markdown h4 { font-size: 15px; }
+.article-dialog__markdown p { margin: 0 0 16px; white-space: pre-wrap; }
+.article-dialog__markdown ul, .article-dialog__markdown ol { margin: 0 0 16px; padding-left: 24px; }
+.article-dialog__markdown li { margin: 5px 0; }
+.article-dialog__markdown blockquote { margin: 0 0 16px; padding: 10px 14px; border-left: 3px solid var(--brand-deep); background: var(--bg-page); color: var(--ink-500); }
+.article-dialog__markdown hr { margin: 24px 0; border: 0; border-top: 1px solid var(--border-soft); }
+.article-dialog__markdown a { color: var(--blue-700); text-decoration: underline; text-underline-offset: 2px; }
+.article-dialog__markdown code { padding: 2px 5px; border-radius: 5px; background: var(--bg-page); font-size: .92em; }
+.article-dialog__markdown-code { margin: 0 0 16px; padding: 14px; overflow: auto; border-radius: 10px; background: var(--ink-900); color: #f7f3eb; line-height: 1.6; }
+.article-dialog__markdown-code code { padding: 0; background: transparent; color: inherit; }
+.article-dialog__markdown img { max-width: 100%; height: auto; border-radius: 10px; }
+.article-dialog__markdown-table { margin: 0 0 16px; overflow-x: auto; }
+.article-dialog__markdown-table table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.article-dialog__markdown-table th, .article-dialog__markdown-table td { padding: 9px 11px; border: 1px solid var(--border-soft); text-align: left; vertical-align: top; }
+.article-dialog__markdown-table th { background: var(--bg-page); color: var(--ink-900); }
 .article-dialog__steps { display: grid; gap: 12px; }
 .article-dialog__step { display: flex; gap: 12px; padding: 14px; border: 1px solid var(--border-soft); border-radius: 12px; }
 .article-dialog__step > div { display: grid; gap: 4px; }
