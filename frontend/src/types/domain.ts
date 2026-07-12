@@ -188,8 +188,32 @@ export interface Ga4Channel {
   users: number
   pageviews: number
   engagement_rate: number
+  avg_session_duration?: number
+  bounce_rate?: number
   conversions: number
   revenue: number
+}
+
+export interface GscBreakdown {
+  dimension: string
+  clicks: number
+  impressions: number
+  ctr: number
+  avg_position: number
+  last_seen: string | null
+}
+
+export interface Ga4LandingPage {
+  landing_page: string
+  sessions: number
+  users: number
+  pageviews: number
+  engagement_rate: number
+  bounce_rate: number
+  avg_session_duration: number
+  conversions: number
+  revenue: number
+  last_seen: string | null
 }
 
 export interface DashboardSummary {

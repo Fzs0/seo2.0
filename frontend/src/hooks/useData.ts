@@ -28,6 +28,8 @@ import type {
   Brief,
   GscQuery,
   Ga4Channel,
+  Ga4LandingPage,
+  GscBreakdown,
   DashboardSummary,
   SyncLogEntry,
 } from '@/types/domain'
@@ -65,6 +67,9 @@ export interface AnalyticsOverviewData {
   opportunities: GscQuery[]
   pages: GscPage[]
   channels: Ga4Channel[]
+  gscCountries: GscBreakdown[]
+  gscDevices: GscBreakdown[]
+  landingPages: Ga4LandingPage[]
   syncLog: SyncLogEntry[]
 }
 
@@ -472,6 +477,9 @@ export function useAnalyticsOverview(siteId?: string, refreshKey = 0): AsyncStat
               opportunities: [],
               pages: [],
               channels: [],
+              gscCountries: [],
+              gscDevices: [],
+              landingPages: [],
               syncLog: [],
             },
             loading: false,
@@ -481,11 +489,14 @@ export function useAnalyticsOverview(siteId?: string, refreshKey = 0): AsyncStat
         }
 
         const query = `site_id=${encodeURIComponent(selectedSiteId)}`
-        const [dashboard, opportunities, pages, channels, syncLog] = await Promise.all([
+        const [dashboard, opportunities, pages, channels, gscCountries, gscDevices, landingPages, syncLog] = await Promise.all([
           getJson<DashboardSummary>(`/api/v1/analytics/dashboard/${encodeURIComponent(selectedSiteId)}`, controller.signal),
           getJson<{ items: GscQuery[] }>(`/api/v1/analytics/gsc/opportunities?${query}&limit=20`, controller.signal),
           getJson<{ items: GscPage[] }>(`/api/v1/analytics/gsc/pages?${query}&limit=20`, controller.signal),
           getJson<{ items: Ga4Channel[] }>(`/api/v1/analytics/ga4/channels?${query}&days=28`, controller.signal),
+          getJson<{ items: GscBreakdown[] }>(`/api/v1/analytics/gsc/breakdown?${query}&dimension=country&days=28&limit=10`, controller.signal),
+          getJson<{ items: GscBreakdown[] }>(`/api/v1/analytics/gsc/breakdown?${query}&dimension=device&days=28&limit=10`, controller.signal),
+          getJson<{ items: Ga4LandingPage[] }>(`/api/v1/analytics/ga4/landing-pages?${query}&days=28&limit=20`, controller.signal),
           getJson<{ items: SyncLogEntry[] }>(`/api/v1/analytics/sync-log?${query}&limit=8`, controller.signal),
         ])
 
@@ -498,6 +509,9 @@ export function useAnalyticsOverview(siteId?: string, refreshKey = 0): AsyncStat
               opportunities: opportunities.items,
               pages: pages.items,
               channels: channels.items,
+              gscCountries: gscCountries.items,
+              gscDevices: gscDevices.items,
+              landingPages: landingPages.items,
               syncLog: syncLog.items,
             },
             loading: false,

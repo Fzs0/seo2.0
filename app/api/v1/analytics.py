@@ -405,6 +405,44 @@ async def get_gsc_pages(
     return {"items": items, "total": len(items)}
 
 
+@router.get("/analytics/gsc/breakdown")
+async def get_gsc_breakdown(
+    site_id: str,
+    dimension: str = Query("device"),
+    days: int = Query(28, ge=1, le=90),
+    limit: int = Query(20, ge=1, le=100),
+    session: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """GSC 按国家或设备聚合，供复盘和 Agent 判断市场/设备机会。"""
+    column = {"country": "country", "device": "device"}.get(dimension)
+    if not column:
+        raise HTTPException(400, "dimension must be country or device")
+    rows = await session.execute(
+        text(
+            f"""
+            SELECT {column} AS dimension,
+                   sum(clicks) AS clicks,
+                   sum(impressions) AS impressions,
+                   CASE WHEN sum(impressions) > 0
+                        THEN round(sum(clicks)::numeric / sum(impressions), 4) ELSE 0 END AS ctr,
+                   CASE WHEN sum(impressions) > 0
+                        THEN round(sum(position * impressions) / sum(impressions), 2) ELSE 0 END AS avg_position,
+                   max(date) AS last_seen
+              FROM seo_agent.gsc_query_daily
+             WHERE site_id = :site_id
+               AND date >= current_date - (:days * INTERVAL '1 day')
+               AND {column} <> ''
+             GROUP BY {column}
+             ORDER BY impressions DESC
+             LIMIT :limit
+            """
+        ),
+        {"site_id": site_id, "days": days, "limit": limit},
+    )
+    items = [dict(row) for row in rows.mappings().all()]
+    return {"items": items, "total": len(items), "dimension": dimension, "days": days}
+
+
 # ---------- 5. GA4 站点 / 渠道 ----------
 
 @router.get("/analytics/ga4/overview")
@@ -461,6 +499,10 @@ async def get_ga4_channels(
                    sum(pageviews) AS pageviews,
                    round(sum(engaged_sessions)::numeric
                          / NULLIF(sum(sessions), 0), 4) AS engagement_rate,
+                   round(sum(avg_session_duration * sessions)::numeric
+                         / NULLIF(sum(sessions), 0), 2) AS avg_session_duration,
+                   CASE WHEN sum(sessions) > 0
+                        THEN round(sum(bounce_rate * sessions) / sum(sessions), 4) ELSE 0 END AS bounce_rate,
                    sum(conversions) AS conversions,
                    sum(revenue) AS revenue
               FROM seo_agent.ga4_session_daily
@@ -475,6 +517,44 @@ async def get_ga4_channels(
     )
     items = [dict(r) for r in rows.mappings().all()]
     return {"items": items, "total": len(items), "days": 28}
+
+
+@router.get("/analytics/ga4/landing-pages")
+async def get_ga4_landing_pages(
+    site_id: str,
+    days: int = Query(28, ge=1, le=90),
+    limit: int = Query(50, ge=1, le=500),
+    session: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """GA4 落地页聚合：入口页、会话、停留时间、参与率、跳出率和转化。"""
+    rows = await session.execute(
+        text(
+            """
+            SELECT landing_page,
+                   sum(sessions) AS sessions,
+                   sum(total_users) AS users,
+                   sum(pageviews) AS pageviews,
+                   CASE WHEN sum(sessions) > 0
+                        THEN round(sum(engaged_sessions)::numeric / sum(sessions), 4) ELSE 0 END AS engagement_rate,
+                   CASE WHEN sum(sessions) > 0
+                        THEN round(sum(bounce_rate * sessions) / sum(sessions), 4) ELSE 0 END AS bounce_rate,
+                   round(sum(avg_session_duration * sessions)::numeric
+                         / NULLIF(sum(sessions), 0), 2) AS avg_session_duration,
+                   sum(conversions) AS conversions,
+                   sum(revenue) AS revenue,
+                   max(date) AS last_seen
+              FROM seo_agent.ga4_landing_page_daily
+             WHERE site_id = :site_id
+               AND date >= current_date - (:days * INTERVAL '1 day')
+             GROUP BY landing_page
+             ORDER BY sessions DESC
+             LIMIT :limit
+            """
+        ),
+        {"site_id": site_id, "days": days, "limit": limit},
+    )
+    items = [dict(row) for row in rows.mappings().all()]
+    return {"items": items, "total": len(items), "days": days}
 
 
 # ---------- 6. Ping（健康检查） ----------

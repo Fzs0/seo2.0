@@ -62,7 +62,7 @@ export default function App() {
       case 'agent-execution':
         return <AgentWorkbenchPage view="execution" onNotify={notify} />
       case 'agent-review':
-        return <AgentWorkbenchPage view="review" onNotify={notify} />
+        return <AnalyticsPage />
       case 'agent-risk':
         return <AgentWorkbenchPage view="risk" onNotify={notify} />
       case 'dashboard':

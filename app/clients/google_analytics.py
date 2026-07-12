@@ -136,16 +136,19 @@ class GA4Client:
         end_date: str,
         *,
         channel_breakdown: bool = False,
+        landing_page_breakdown: bool = False,
     ) -> list[dict[str, Any]]:
-        """GA4 runReport → 返回每行一个 dict（date/channel + 6 个指标）。
+        """GA4 runReport → 返回日维度指标，可按渠道或落地页拆分。
 
         channel_breakdown=True 时按 sessionDefaultChannelGroup 拆；
-        否则 channel='all'。
+        landing_page_breakdown=True 时按 landingPagePlusQueryString 拆。
         """
         token = await self.get_access_token()
         dimensions = ["date"]
         if channel_breakdown:
             dimensions.append("sessionDefaultChannelGroup")
+        if landing_page_breakdown:
+            dimensions.append("landingPagePlusQueryString")
 
         body: dict[str, Any] = {
             "dateRanges": [{"startDate": start_date, "endDate": end_date}],
@@ -200,11 +203,18 @@ class GA4Client:
                 for r in rows:
                     dim_vals = [dv.get("value", "") for dv in r.get("dimensionValues", [])]
                     met_vals = [mv.get("value", "0") for mv in r.get("metricValues", [])]
+                    dimension_index = 1
+                    channel = "all"
+                    landing_page = ""
+                    if channel_breakdown and len(dim_vals) > dimension_index:
+                        channel = dim_vals[dimension_index]
+                        dimension_index += 1
+                    if landing_page_breakdown and len(dim_vals) > dimension_index:
+                        landing_page = dim_vals[dimension_index]
                     row: dict[str, Any] = {
                         "date": dim_vals[0] if len(dim_vals) >= 1 else "",
-                        "channel": (
-                            dim_vals[1] if len(dim_vals) >= 2 else "all"
-                        ),
+                        "channel": channel,
+                        "landing_page": landing_page,
                         "sessions": int(met_vals[0]) if len(met_vals) >= 1 else 0,
                         "total_users": int(met_vals[1]) if len(met_vals) >= 2 else 0,
                         "new_users": int(met_vals[2]) if len(met_vals) >= 3 else 0,

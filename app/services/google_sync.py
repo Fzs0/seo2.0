@@ -277,6 +277,17 @@ async def _sync_ga4(
             end_date=end_date,
             channel_breakdown=True,
         )
+        landing_rows: list[dict[str, Any]] = []
+        landing_warning: str | None = None
+        try:
+            landing_rows = await client.run_report(
+                start_date=start_date,
+                end_date=end_date,
+                landing_page_breakdown=True,
+            )
+        except GA4ClientError as error:
+            landing_warning = str(error)[:500]
+            logger.warning("ga4_landing_pages_unavailable", source_id=source.id, error=landing_warning)
         written = 0
         for r in rows:
             d_raw = r.get("date", "")
@@ -328,19 +339,73 @@ async def _sync_ga4(
                 },
             )
             written += 1
+        landing_written = 0
+        for r in landing_rows:
+            landing_page = str(r.get("landing_page", "") or "").strip()
+            if not landing_page:
+                continue
+            d_raw = r.get("date", "")
+            d_parsed = _date.fromisoformat(d_raw) if isinstance(d_raw, str) and len(d_raw) == 10 else (
+                _date.fromisoformat(d_raw) if isinstance(d_raw, str) else d_raw
+            )
+            await session.execute(
+                text(
+                    """
+                    INSERT INTO seo_agent.ga4_landing_page_daily
+                      (site_id, date, landing_page, sessions, total_users, pageviews,
+                       engaged_sessions, engagement_rate, avg_session_duration, bounce_rate,
+                       conversions, revenue, synced_at)
+                    VALUES
+                      (:site_id, :date, :landing_page, :sessions, :total_users, :pageviews,
+                       :engaged_sessions, :engagement_rate, :avg_session_duration, :bounce_rate,
+                       :conversions, :revenue, now())
+                    ON CONFLICT (site_id, date, landing_page)
+                    DO UPDATE SET
+                      sessions = EXCLUDED.sessions,
+                      total_users = EXCLUDED.total_users,
+                      pageviews = EXCLUDED.pageviews,
+                      engaged_sessions = EXCLUDED.engaged_sessions,
+                      engagement_rate = EXCLUDED.engagement_rate,
+                      avg_session_duration = EXCLUDED.avg_session_duration,
+                      bounce_rate = EXCLUDED.bounce_rate,
+                      conversions = EXCLUDED.conversions,
+                      revenue = EXCLUDED.revenue,
+                      synced_at = now()
+                    """
+                ),
+                {
+                    "site_id": site_id,
+                    "date": d_parsed,
+                    "landing_page": landing_page,
+                    "sessions": int(r.get("sessions", 0) or 0),
+                    "total_users": int(r.get("total_users", 0) or 0),
+                    "pageviews": int(r.get("pageviews", 0) or 0),
+                    "engaged_sessions": int(r.get("engaged_sessions", 0) or 0),
+                    "engagement_rate": float(r.get("engagement_rate", 0) or 0),
+                    "avg_session_duration": float(r.get("avg_session_duration", 0) or 0),
+                    "bounce_rate": float(r.get("bounce_rate", 0) or 0),
+                    "conversions": float(r.get("conversions", 0) or 0),
+                    "revenue": float(r.get("revenue", 0) or 0),
+                },
+            )
+            landing_written += 1
         await session.commit()
+        total_fetched = len(rows) + len(landing_rows)
+        total_written = written + landing_written
         await _log_done(
             session,
             log_id,
-            rows_fetched=len(rows),
-            rows_written=written,
+            rows_fetched=total_fetched,
+            rows_written=total_written,
             duration_ms=int((time.perf_counter() - t0) * 1000),
         )
         return {
             "ok": True,
             "type": "ga4",
-            "rows_fetched": len(rows),
-            "rows_written": written,
+            "rows_fetched": total_fetched,
+            "rows_written": total_written,
+            "landing_pages_written": landing_written,
+            "warnings": [landing_warning] if landing_warning else [],
             "duration_ms": int((time.perf_counter() - t0) * 1000),
         }
     except (GA4ClientError, Exception) as e:  # noqa: BLE001

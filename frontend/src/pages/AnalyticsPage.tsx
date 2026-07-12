@@ -21,6 +21,12 @@ function formatDate(value?: string | null) {
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString('zh-CN', { hour12: false })
 }
 
+function formatDuration(value: number | string | null | undefined) {
+  const seconds = Math.round(asNumber(value))
+  if (!seconds) return '—'
+  return `${Math.floor(seconds / 60)}分 ${seconds % 60}秒`
+}
+
 export function AnalyticsPage() {
   const [siteId, setSiteId] = useState<string>()
   const [refreshKey, setRefreshKey] = useState(0)
@@ -100,6 +106,60 @@ export function AnalyticsPage() {
               <Kpi icon="shopping_bag" tone="green" label="GA4 转化 28 天" value={formatNumber(dashboard?.ga428d?.conversions)} sub={`收益 ${formatNumber(Math.round(asNumber(dashboard?.ga428d?.revenue)))}`} />
             </div>
 
+            <div className="content-grid-5">
+              <ReviewStat label="GA4 用户" value={formatNumber(dashboard?.ga428d?.users)} sub="总用户" />
+              <ReviewStat label="GA4 新用户" value={formatNumber(dashboard?.ga428d?.new_users)} sub="新用户" />
+              <ReviewStat label="页面浏览" value={formatNumber(dashboard?.ga428d?.pageviews)} sub="screen page views" />
+              <ReviewStat label="平均停留" value={formatDuration(dashboard?.ga428d?.avg_session_duration)} sub="平均会话时长" />
+              <ReviewStat label="跳出率" value={formatPct(dashboard?.ga428d?.bounce_rate)} sub="低越好" />
+            </div>
+
+            <div className="card">
+              <CardTitle icon="login" tone="green" title="GA4 落地页表现" tag="入口页 · 最近 28 天" />
+              {data.landingPages.length ? (
+                <table className="tbl">
+                  <thead>
+                    <tr>
+                      <th>落地页</th>
+                      <th className="tbl-num">会话</th>
+                      <th className="tbl-num">用户</th>
+                      <th className="tbl-num">浏览量</th>
+                      <th className="tbl-num">停留</th>
+                      <th className="tbl-num">参与率</th>
+                      <th className="tbl-num">跳出率</th>
+                      <th className="tbl-num">转化</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {data.landingPages.map((page) => (
+                      <tr key={page.landing_page}>
+                        <td className="tbl-strong" style={{ maxWidth: 280, wordBreak: 'break-all' }}>{page.landing_page}</td>
+                        <td className="tbl-num">{formatNumber(page.sessions)}</td>
+                        <td className="tbl-num">{formatNumber(page.users)}</td>
+                        <td className="tbl-num">{formatNumber(page.pageviews)}</td>
+                        <td className="tbl-num">{formatDuration(page.avg_session_duration)}</td>
+                        <td className="tbl-num">{formatPct(page.engagement_rate)}</td>
+                        <td className="tbl-num">{formatPct(page.bounce_rate)}</td>
+                        <td className="tbl-num">{formatNumber(page.conversions)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              ) : (
+                <StateBlock icon="login" title="暂无落地页数据" hint="完成一次包含 GA4 落地页维度的同步后会展示" />
+              )}
+            </div>
+
+            <div className="serp-grid">
+              <BreakdownCard title="GSC 国家分布" icon="public" rows={data.gscCountries} emptyHint="GSC 同步后按国家聚合展示" />
+              <BreakdownCard title="GSC 设备分布" icon="devices" rows={data.gscDevices} emptyHint="GSC 同步后按设备聚合展示" />
+            </div>
+
+            <div className="card">
+              <CardTitle icon="auto_awesome" tone="gold" title="AI 引用可见性" tag="尚未接入真实采集源" />
+              <StateBlock icon="auto_awesome" title="暂无 AI 搜索引用数据" hint="GSC 和 GA4 不提供 AI 引用指标；后续需要独立的 AI 搜索结果采集与历史记录接口，当前不展示假数据。" />
+            </div>
+
             <div className="serp-grid">
               <div className="card">
                 <CardTitle icon="query_stats" tone="gold" title="GSC 7 天趋势" tag="点击 / 展示" />
@@ -132,7 +192,10 @@ export function AnalyticsPage() {
                       <th className="tbl-num">用户</th>
                       <th className="tbl-num">浏览量</th>
                       <th className="tbl-num">参与率</th>
+                      <th className="tbl-num">停留</th>
+                      <th className="tbl-num">跳出率</th>
                       <th className="tbl-num">转化</th>
+                      <th className="tbl-num">收益</th>
                       <th>占比</th>
                     </tr>
                   </thead>
@@ -146,7 +209,10 @@ export function AnalyticsPage() {
                           <td className="tbl-num">{formatNumber(channel.users)}</td>
                           <td className="tbl-num">{formatNumber(channel.pageviews)}</td>
                           <td className="tbl-num">{formatPct(channel.engagement_rate)}</td>
+                          <td className="tbl-num">{formatDuration(channel.avg_session_duration)}</td>
+                          <td className="tbl-num">{formatPct(channel.bounce_rate)}</td>
                           <td className="tbl-num">{formatNumber(channel.conversions)}</td>
+                          <td className="tbl-num">{formatNumber(Math.round(asNumber(channel.revenue)))}</td>
                           <td style={{ minWidth: 150 }}>
                             <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                               <div className="bar" style={{ flex: 1 }}>
@@ -251,6 +317,60 @@ export function AnalyticsPage() {
         )}
       </DataGuard>
     </section>
+  )
+}
+
+function ReviewStat({ label, value, sub }: { label: string; value: string; sub: string }) {
+  return (
+    <div className="card" style={{ padding: 14 }}>
+      <div className="eyebrow">{label}</div>
+      <div style={{ fontSize: 21, fontWeight: 750, marginTop: 6 }}>{value}</div>
+      <div className="muted" style={{ marginTop: 3 }}>{sub}</div>
+    </div>
+  )
+}
+
+function BreakdownCard({
+  title,
+  icon,
+  rows,
+  emptyHint,
+}: {
+  title: string
+  icon: string
+  rows: Array<{ dimension: string; clicks: number; impressions: number; ctr: number; avg_position: number }>
+  emptyHint: string
+}) {
+  return (
+    <div className="card">
+      <CardTitle icon={icon} tone="blue" title={title} tag="最近 28 天" />
+      {rows.length ? (
+        <table className="tbl">
+          <thead>
+            <tr>
+              <th>维度</th>
+              <th className="tbl-num">点击</th>
+              <th className="tbl-num">展示</th>
+              <th className="tbl-num">CTR</th>
+              <th className="tbl-num">平均排名</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((row) => (
+              <tr key={row.dimension}>
+                <td className="tbl-strong">{row.dimension}</td>
+                <td className="tbl-num">{formatNumber(row.clicks)}</td>
+                <td className="tbl-num">{formatNumber(row.impressions)}</td>
+                <td className="tbl-num">{formatPct(row.ctr, 2)}</td>
+                <td className="tbl-num">{asNumber(row.avg_position).toFixed(1)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      ) : (
+        <StateBlock icon={icon} title="暂无分布数据" hint={emptyHint} />
+      )}
+    </div>
   )
 }
 
