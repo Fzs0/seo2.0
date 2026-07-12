@@ -230,9 +230,13 @@ export interface DashboardSummary {
 
 export interface SyncLogEntry {
   id: string
+  source_id?: string | null
+  site_id?: string | null
   source_type: 'gsc' | 'ga4'
   status: 'success' | 'failed' | 'running'
-  trigger: 'manual' | 'schedule'
+  trigger: 'manual' | 'schedule' | 'scheduled' | string
+  range_start?: string | null
+  range_end?: string | null
   rows_fetched: number
   rows_written: number
   duration_ms: number

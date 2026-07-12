@@ -17,8 +17,6 @@ import {
   mockBrief,
   mockGscOpportunities,
   mockGa4Channels,
-  mockDashboard,
-  mockSyncLog,
   mockStandard,
   mockPipelineStages,
 } from '@/mock/data'
@@ -183,13 +181,72 @@ export function useGa4Channels(): AsyncState<Ga4Channel[]> {
   return mockAsync(mockGa4Channels)
 }
 
-export function useDashboard(siteId?: string): AsyncState<DashboardSummary> {
-  if (!siteId) return emptyAsync<DashboardSummary>('No site selected')
-  return mockAsync(mockDashboard)
+export function useDashboard(siteId?: string, refreshKey = 0): AsyncState<DashboardSummary> {
+  const [state, setState] = useState<AsyncState<DashboardSummary>>({ data: null, loading: Boolean(siteId), error: null })
+
+  useEffect(() => {
+    if (!siteId) {
+      setState({ data: null, loading: false, error: null })
+      return
+    }
+    const controller = new AbortController()
+    setState({ data: null, loading: true, error: null })
+    void getJson<DashboardSummary>(`/api/v1/analytics/dashboard/${encodeURIComponent(siteId)}`, controller.signal)
+      .then((result) => {
+        if (!controller.signal.aborted) setState({ data: result, loading: false, error: null })
+      })
+      .catch((error) => {
+        if (!controller.signal.aborted) {
+          setState({ data: null, loading: false, error: error instanceof Error ? error.message : '无法加载同步概览' })
+        }
+      })
+    return () => controller.abort()
+  }, [siteId, refreshKey])
+
+  return state
 }
 
-export function useSyncLog(): AsyncState<SyncLogEntry[]> {
-  return mockAsync(mockSyncLog)
+export function useAnalyticsSources(refreshKey = 0): AsyncState<SourceSummary[]> {
+  const [state, setState] = useState<AsyncState<SourceSummary[]>>({ data: null, loading: true, error: null })
+
+  useEffect(() => {
+    const controller = new AbortController()
+    setState({ data: null, loading: true, error: null })
+    void getJson<{ items: SourceSummary[] }>('/api/v1/analytics/sources', controller.signal)
+      .then((result) => {
+        if (!controller.signal.aborted) setState({ data: result.items, loading: false, error: null })
+      })
+      .catch((error) => {
+        if (!controller.signal.aborted) {
+          setState({ data: null, loading: false, error: error instanceof Error ? error.message : '无法加载数据源' })
+        }
+      })
+    return () => controller.abort()
+  }, [refreshKey])
+
+  return state
+}
+
+export function useSyncLog(siteId?: string, refreshKey = 0): AsyncState<SyncLogEntry[]> {
+  const [state, setState] = useState<AsyncState<SyncLogEntry[]>>({ data: null, loading: true, error: null })
+
+  useEffect(() => {
+    const controller = new AbortController()
+    setState({ data: null, loading: true, error: null })
+    const query = siteId ? `&site_id=${encodeURIComponent(siteId)}` : ''
+    void getJson<{ items: SyncLogEntry[] }>(`/api/v1/analytics/sync-log?limit=50${query}`, controller.signal)
+      .then((result) => {
+        if (!controller.signal.aborted) setState({ data: result.items, loading: false, error: null })
+      })
+      .catch((error) => {
+        if (!controller.signal.aborted) {
+          setState({ data: null, loading: false, error: error instanceof Error ? error.message : '无法加载同步日志' })
+        }
+      })
+    return () => controller.abort()
+  }, [siteId, refreshKey])
+
+  return state
 }
 
 export function useStandardRules() {

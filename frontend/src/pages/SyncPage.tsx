@@ -1,6 +1,7 @@
+import { useEffect, useState } from 'react'
 import { Bars, Sparkline } from '@/components/Charts'
 import { DataGuard } from '@/components/StateBlock'
-import { useDashboard, usePipelineStages, useSyncLog } from '@/hooks/useData'
+import { useAnalyticsSources, useDashboard, useSites, useSyncLog } from '@/hooks/useData'
 import type { SyncLogEntry } from '@/types/domain'
 
 const SOURCE_LABEL: Record<SyncLogEntry['source_type'], string> = {
@@ -34,12 +35,22 @@ function formatDuration(ms: number) {
 }
 
 export function SyncPage() {
-  const logs = useSyncLog()
-  const dashboard = useDashboard('site-main-shop')
-  const pipeline = usePipelineStages()
+  const [siteId, setSiteId] = useState<string>()
+  const [refreshKey, setRefreshKey] = useState(0)
+  const sites = useSites(refreshKey)
+  const logs = useSyncLog(siteId, refreshKey)
+  const sources = useAnalyticsSources(refreshKey)
+  const dashboard = useDashboard(siteId, refreshKey)
+  useEffect(() => {
+    if (!siteId && sites.data?.[0]?.id) setSiteId(sites.data[0].id)
+  }, [siteId, sites.data])
+
+  const selectedSite = sites.data?.find((site) => site.id === siteId)
   const totalRows = logs.data?.reduce((sum, log) => sum + log.rows_written, 0) ?? 0
   const failedCount = logs.data?.filter((log) => log.status === 'failed').length ?? 0
   const lastLog = logs.data?.[0]
+  const latestBySource = new Map((logs.data ?? []).map((log) => [log.source_type, log]))
+  const successCount = logs.data?.filter((log) => log.status === 'success').length ?? 0
 
   return (
     <>
@@ -47,8 +58,20 @@ export function SyncPage() {
         <div>
           <h1>同步状态</h1>
           <p>
-            展示 GSC / GA4 同步记录与数据链路健康度；页面仅作只读监控，后续写入能力由接口联调接入。
+            展示真实 GSC / GA4 同步记录与数据链路健康度。
           </p>
+        </div>
+        <div className="page-heading-actions">
+          <label className="select-control">
+            <span>当前站点</span>
+            <select value={siteId || ''} onChange={(event) => setSiteId(event.target.value || undefined)} disabled={!sites.data?.length}>
+              {!sites.data?.length && <option value="">暂无站点</option>}
+              {sites.data?.map((site) => <option value={site.id} key={site.id}>{site.name}</option>)}
+            </select>
+          </label>
+          <button type="button" className="btn btn--ghost" onClick={() => setRefreshKey((key) => key + 1)}>
+            <span className="msr">refresh</span>刷新日志
+          </button>
         </div>
 
         <div className="kpi-row">
@@ -79,8 +102,8 @@ export function SyncPage() {
               <span className="kpi__label">数据源</span>
               <span className="msr kpi__icon kpi__icon--gold">hub</span>
             </div>
-            <div className="kpi__value">2</div>
-            <div className="kpi__delta">GSC + GA4</div>
+            <div className="kpi__value">{sources.data?.length ?? 0}</div>
+            <div className="kpi__delta">来自真实数据源配置</div>
           </div>
           <div className="kpi kpi--pink">
             <div className="kpi__head">
@@ -94,7 +117,7 @@ export function SyncPage() {
 
         <DataGuard
           loading={logs.loading}
-          error={logs.error}
+          error={logs.error || sites.error || sources.error}
           empty={!logs.data || logs.data.length === 0}
           emptyTitle="暂无同步记录"
           emptyHint="后端同步任务写入日志后会展示在此"
@@ -118,7 +141,7 @@ export function SyncPage() {
                     </div>
                     <div className="link-row__name">
                       <h4>{SOURCE_LABEL[log.source_type]}</h4>
-                      <p>{log.trigger === 'schedule' ? '计划任务' : '人工触发记录'}</p>
+                      <p>{log.trigger === 'schedule' || log.trigger === 'scheduled' ? '计划任务' : '人工触发记录'}</p>
                     </div>
                     <span className={`link-row__status link-row__status--${status.tone === 'green' ? 'ok' : status.tone === 'gold' ? 'gold' : 'warn'}`}>
                       {status.label}
@@ -150,7 +173,9 @@ export function SyncPage() {
                         {formatNumber(log.rows_written)} · {formatDuration(log.duration_ms)}
                       </div>
                     </div>
-                    <span className="tag tag--gray">{log.error_message ?? log.id}</span>
+                    <span className="tag tag--gray">
+                      {log.error_message || (log.range_start && log.range_end ? `${log.range_start} ~ ${log.range_end}` : '无错误')}
+                    </span>
                   </div>
                 )
               })}
@@ -160,7 +185,7 @@ export function SyncPage() {
 
         <DataGuard
           loading={dashboard.loading}
-          error={dashboard.error}
+          error={dashboard.error || sites.error}
           empty={!dashboard.data}
           emptyTitle="暂无数据链路信息"
         >
@@ -214,28 +239,14 @@ export function SyncPage() {
           )}
         </DataGuard>
 
-        <DataGuard
-          loading={pipeline.loading}
-          error={pipeline.error}
-          empty={!pipeline.data || pipeline.data.length === 0}
-          emptyTitle="暂无流程数据"
-        >
-          <div className="footer-pipeline">
-            {(pipeline.data ?? []).slice(0, 3).map((stage, index) => (
-              <div key={stage.key} style={{ display: 'contents' }}>
-                <div className={`pipeline__item pipeline__item--${stage.status === 'done' ? 'green' : 'gold'}`}>
-                  <span className="msr">{stage.status === 'done' ? 'check_circle' : 'progress_activity'}</span>
-                  <div>
-                    <div className="pipeline__label">{stage.label}</div>
-                    <div className="pipeline__sub">{stage.status === 'done' ? '已完成' : '进行中'}</div>
-                  </div>
-                </div>
-                {index < 2 && <div className="pipeline__divider" />}
-              </div>
-            ))}
-            <div className="footer-pipeline__time">页面展示 mock 数据，后续由 API hooks 替换。</div>
-          </div>
-        </DataGuard>
+        <div className="footer-pipeline">
+          <PipelineItem tone="gold" icon="hub" label="已配置数据源" value={`${sources.data?.length ?? 0} 个`} />
+          <div className="pipeline__divider" />
+          <PipelineItem tone="blue" icon="database" label="当前站点日志" value={`${logs.data?.length ?? 0} 条`} />
+          <div className="pipeline__divider" />
+          <PipelineItem tone="green" icon="verified" label="成功批次" value={`${successCount} 条`} />
+          <div className="footer-pipeline__time">{selectedSite ? `当前站点：${selectedSite.name}` : '尚未选择站点'}</div>
+        </div>
       </section>
 
       <aside className="rail">
@@ -245,10 +256,20 @@ export function SyncPage() {
             今日同步时间线
           </div>
           <div className="timeline">
-            <TimelineItem time="03:00" icon="search" color="blue" title="GSC 计划同步" desc="写入搜索查询、点击、展示与平均排名数据。" />
-            <TimelineItem time="03:04" icon="analytics" color="gold" title="GA4 计划同步" desc="写入渠道、会话、参与率与转化数据。" />
-            <TimelineItem time="13:50" icon="sync" color="green" title="最近批次完成" desc="两类数据源均已完成写入，供前端只读展示。" />
-            <TimelineItem time="待处理" icon="warning" color="pink" title="异常批次保留" desc="GA4 quota exceeded 仅作为日志展示，不在前端重试。" last />
+            {(['gsc', 'ga4'] as const).map((sourceType, index) => {
+              const log = latestBySource.get(sourceType)
+              return (
+                <TimelineItem
+                  key={sourceType}
+                  time={log ? formatTime(log.started_at) : '暂无'}
+                  icon={sourceType === 'gsc' ? 'search' : 'analytics'}
+                  color={log?.status === 'failed' ? 'pink' : index === 0 ? 'blue' : 'gold'}
+                  title={`${sourceType.toUpperCase()} 最近同步`}
+                  desc={log ? `${STATUS_META[log.status].label}，写入 ${formatNumber(log.rows_written)} 行` : '暂无同步记录'}
+                  last={index === 1}
+                />
+              )
+            })}
           </div>
         </div>
 
@@ -256,7 +277,7 @@ export function SyncPage() {
           <span className="msr suggest__icon">info</span>
           <div className="suggest__body">
             <div className="suggest__title">接口联调提示</div>
-            <div className="suggest__desc">页面通过 useSyncLog / useDashboard 获取数据，替换 hook 即可接入真实接口。</div>
+            <div className="suggest__desc">数据来自同步日志、站点 Dashboard 与数据源配置接口；失败原因直接展示后端返回信息。</div>
           </div>
         </div>
       </aside>
@@ -292,8 +313,32 @@ function SourceCard({
           {formatTime(started)} → {formatTime(finished)}
         </div>
       </div>
-      <span className="tag tag--green">{status}</span>
+      <span className={`tag tag--${status === 'failed' ? 'pink' : status === 'running' ? 'gold' : 'green'}`}>
+        {STATUS_META[status as SyncLogEntry['status']]?.label || status}
+      </span>
       <span className="tbl-strong">{formatNumber(rows)} 行</span>
+    </div>
+  )
+}
+
+function PipelineItem({
+  tone,
+  icon,
+  label,
+  value,
+}: {
+  tone: 'blue' | 'gold' | 'green'
+  icon: string
+  label: string
+  value: string
+}) {
+  return (
+    <div className={`pipeline__item pipeline__item--${tone}`}>
+      <span className="msr">{icon}</span>
+      <div>
+        <div className="pipeline__label">{label}</div>
+        <div className="pipeline__sub">{value}</div>
+      </div>
     </div>
   )
 }
