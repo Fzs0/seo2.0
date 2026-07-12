@@ -184,16 +184,27 @@ class OpenAPIPublisher(PublisherBase):
         headers = self._auth_headers()
         if not api_base or not headers:
             raise ExternalCallError("site post connector missing api_base_url or auth")
-        data = await request_json(
-            "GET",
-            _join_endpoint(api_base, (self.site.get("api_config") or {}).get("articlesPath") or "/articles"),
-            client_label="connector_openapi_articles",
-            params={"limit": min(max(limit, 1), 100)},
-            headers=headers,
-            timeout=60,
-        )
-        items = data if isinstance(data, list) else data.get("items") or data.get("articles") or data.get("data") or []
-        return [item for item in items if isinstance(item, dict)][:limit]
+        endpoint = _join_endpoint(api_base, (self.site.get("api_config") or {}).get("articlesPath") or "/articles")
+        wanted = min(max(limit, 1), 200)
+        collected: list[dict[str, Any]] = []
+        page = 1
+        while len(collected) < wanted:
+            data = await request_json(
+                "GET",
+                endpoint,
+                client_label="connector_openapi_articles",
+                params={"page": page, "pageSize": min(wanted, 100)},
+                headers=headers,
+                timeout=60,
+            )
+            items, pagination = _openapi_page(data)
+            collected.extend(item for item in items if isinstance(item, dict))
+            total_pages = int(pagination.get("pageTotal") or pagination.get("totalPages") or 0) if pagination else 0
+            next_page = int(pagination.get("next") or 0) if pagination else 0
+            if not items or (total_pages and page >= total_pages) or (not total_pages and not next_page):
+                break
+            page = next_page or page + 1
+        return collected[:wanted]
 
     def _auth_headers(self) -> dict[str, str]:
         cfg = self.site.get("api_config") or {}
@@ -369,6 +380,24 @@ def _join_endpoint(base_url: str, path: str) -> str:
 def _display_url(url: str) -> str:
     parts = urlsplit(str(url))
     return urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
+
+
+def _openapi_page(data: Any) -> tuple[list[Any], dict[str, Any]]:
+    if isinstance(data, list):
+        return data, {}
+    if not isinstance(data, dict):
+        return [], {}
+    if data.get("code") not in (None, 0, "0"):
+        raise ExternalCallError(str(data.get("msg") or data.get("message") or f"remote API returned code {data.get('code')}"))
+    payload = data.get("data")
+    if isinstance(payload, list):
+        return payload, data.get("paginate") or data.get("pagination") or {}
+    if isinstance(payload, dict):
+        items = payload.get("list") or payload.get("items") or payload.get("articles") or payload.get("data") or []
+        pagination = payload.get("paginate") or payload.get("pagination") or data.get("paginate") or data.get("pagination") or {}
+        return items if isinstance(items, list) else [], pagination if isinstance(pagination, dict) else {}
+    items = data.get("list") or data.get("items") or data.get("articles") or []
+    return items if isinstance(items, list) else [], data.get("paginate") or data.get("pagination") or {}
 
 
 def publisher_for_site(site: dict[str, Any], dry_run: bool = True) -> PublisherBase:

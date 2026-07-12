@@ -111,13 +111,13 @@ def _normalize_wp(p: dict[str, Any]) -> dict[str, Any]:
 
 
 def _normalize_openapi(p: dict[str, Any]) -> dict[str, Any]:
-    url = p.get("url") or p.get("link")
+    url = p.get("url") or p.get("link") or p.get("src") or None
     return {
         "external_id": str(p.get("id") or p.get("articleId") or p.get("external_id") or url or ""),
         "title": p.get("title") or "untitled",
         "slug": p.get("slug") or p.get("handle"),
         "url": url,
-        "status": p.get("status"),
+        "status": _openapi_status(p.get("status")),
         "content_md": p.get("content_md") or p.get("contentMd"),
         "content_html": p.get("content_html") or p.get("contentHtml") or p.get("content"),
         "excerpt": p.get("excerpt") or p.get("description"),
@@ -128,6 +128,14 @@ def _normalize_openapi(p: dict[str, Any]) -> dict[str, Any]:
         "source": "openapi",
         "raw": p,
     }
+
+
+def _openapi_status(value: Any) -> str | None:
+    if value in (1, "1", "published", "publish"):
+        return "published"
+    if value in (0, "0", "draft"):
+        return "draft"
+    return str(value) if value is not None else None
 
 
 async def _upsert_post(session: AsyncSession, site: dict[str, Any], post: dict[str, Any]) -> None:
