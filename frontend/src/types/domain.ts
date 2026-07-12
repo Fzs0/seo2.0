@@ -35,6 +35,7 @@ export interface Site {
   site_key: string
   name: string
   site_type: 'main' | 'blog' | 'wp' | string
+  connector_type?: string
   domain: string
   api_base_url?: string | null
   base_url: string
@@ -49,6 +50,7 @@ export interface Site {
   allow_external_links: boolean
   publish_config: Record<string, unknown>
   api_config: Record<string, unknown>
+  api_config_summary?: { configured_keys: string[]; articles_path?: string; publish_path?: string }
   status: 'active' | 'paused' | 'review'
   notes: string | null
   publish_ready?: boolean

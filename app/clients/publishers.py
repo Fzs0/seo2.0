@@ -13,8 +13,10 @@
 from __future__ import annotations
 
 import base64
+import time
 from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 import structlog
 
@@ -66,21 +68,77 @@ class PublisherBase:
         raise ExternalCallError(f"connector {self.connector_type} does not support read_articles")
 
     async def check_connection(self) -> dict[str, Any]:
+        started = time.perf_counter()
+        info = self.connection_info()
+        checks = info.pop("checks")
+        if not self.capabilities:
+            checks.append({"key": "connector", "label": "连接器注册", "status": "failed", "detail": f"未注册 {self.connector_type} 连接器"})
+            return {
+                **info,
+                "ok": False,
+                "capabilities": list(self.capabilities),
+                "checks": checks,
+                "duration_ms": round((time.perf_counter() - started) * 1000),
+                "error": f"no connector registered for site type: {self.connector_type}",
+            }
+        if any(check["status"] == "failed" for check in checks):
+            error = next(check["detail"] for check in checks if check["status"] == "failed")
+            checks.append({"key": "read_articles", "label": "读取文章", "status": "skipped", "detail": "基础配置未通过，未发起外部请求"})
+            return {
+                **info,
+                "ok": False,
+                "capabilities": list(self.capabilities),
+                "checks": checks,
+                "duration_ms": round((time.perf_counter() - started) * 1000),
+                "error": error,
+            }
         try:
             items = await self.read_articles(limit=1)
+            checks.append({"key": "read_articles", "label": "读取文章", "status": "ok", "detail": f"成功读取 {len(items)} 篇样本"})
             return {
+                **info,
                 "ok": True,
-                "connector_type": self.connector_type,
                 "capabilities": list(self.capabilities),
                 "sample_count": len(items),
+                "checks": checks,
+                "duration_ms": round((time.perf_counter() - started) * 1000),
             }
         except Exception as error:  # noqa: BLE001
+            checks.append({"key": "read_articles", "label": "读取文章", "status": "failed", "detail": str(error)})
             return {
+                **info,
                 "ok": False,
-                "connector_type": self.connector_type,
                 "capabilities": list(self.capabilities),
+                "checks": checks,
+                "duration_ms": round((time.perf_counter() - started) * 1000),
                 "error": str(error),
             }
+
+    def connection_info(self) -> dict[str, Any]:
+        cfg = self.site.get("api_config") or {}
+        is_wordpress = self.connector_type == "wordpress"
+        base_url = ((self.site.get("domain") or self.site.get("base_url")) if is_wordpress else (self.site.get("api_base_url") or self.site.get("base_url") or ""))
+        if is_wordpress and base_url and not str(base_url).startswith(("http://", "https://")):
+            base_url = f"https://{base_url}"
+        base_url = str(base_url).rstrip("/")
+        article_path = cfg.get("articlesPath") or ("/wp-json/wp/v2/posts" if is_wordpress else "/articles")
+        publish_path = cfg.get("publishPath") or ("/wp-json/wp/v2/posts" if is_wordpress else "/articles/save")
+        endpoint = _join_endpoint(base_url, article_path)
+        publish_endpoint = _join_endpoint(base_url, publish_path)
+        auth_keys = ["username", "applicationPassword"] if is_wordpress else ["openApiKey", "tokenA", "tokenB"]
+        configured_keys = [key for key in auth_keys if cfg.get(key)]
+        missing_keys = [key for key in auth_keys if not cfg.get(key)]
+        auth_label = "WordPress Basic Auth" if is_wordpress else "openApiKey / token"
+        checks = [
+            {"key": "endpoint", "label": "接口地址", "status": "ok" if base_url else "failed", "detail": _display_url(endpoint) if base_url else "未配置 API 地址"},
+            {"key": "auth", "label": "鉴权配置", "status": "ok" if (is_wordpress and not missing_keys) or (not is_wordpress and bool(configured_keys)) else "failed", "detail": f"已配置：{', '.join(configured_keys) or '无'}" + (f"；缺失：{', '.join(missing_keys)}" if missing_keys else "")},
+        ]
+        return {
+            "connector_type": self.connector_type,
+            "request": {"method": "GET", "url": _display_url(endpoint), "auth": auth_label},
+            "config": {"base_url": _display_url(base_url), "article_endpoint": _display_url(endpoint), "publish_endpoint": _display_url(publish_endpoint), "articles_path": article_path, "publish_path": publish_path, "configured_keys": configured_keys, "missing_keys": missing_keys},
+            "checks": checks,
+        }
 
     def _dry_response(self, req: PublishRequest) -> PublishResult:
         """不真发，返回"如果真发会是什么样"——便于前端/审计预览。"""
@@ -128,7 +186,7 @@ class OpenAPIPublisher(PublisherBase):
             raise ExternalCallError("site post connector missing api_base_url or auth")
         data = await request_json(
             "GET",
-            f"{api_base}/articles",
+            _join_endpoint(api_base, (self.site.get("api_config") or {}).get("articlesPath") or "/articles"),
             client_label="connector_openapi_articles",
             params={"limit": min(max(limit, 1), 100)},
             headers=headers,
@@ -161,6 +219,7 @@ class OpenAPIPublisher(PublisherBase):
         if not headers:
             return PublishResult(ok=False, dry_run=False, error="no auth token in site.api_config")
 
+        cfg = self.site.get("api_config") or {}
         # 真实协议字段不确定（每个 OpenAPI 实现不同），这里按最常见的字段名
         body = {
             "title": req.title,
@@ -177,7 +236,7 @@ class OpenAPIPublisher(PublisherBase):
         }
 
         try:
-            data = await post_json(f"{api_base.rstrip('/')}/articles/save", headers, body)
+            data = await post_json(_join_endpoint(api_base.rstrip('/'), cfg.get("publishPath") or "/articles/save"), headers, body)
         except ExternalCallError as e:
             return PublishResult(ok=False, dry_run=False, error=str(e), raw={"body_sent": body})
 
@@ -227,7 +286,7 @@ class WordPressPublisher(PublisherBase):
             raise ExternalCallError("wordpress connector missing site URL or credentials")
         data = await request_json(
             "GET",
-            f"{site_url}/wp-json/wp/v2/posts",
+            _join_endpoint(site_url, (self.site.get("api_config") or {}).get("articlesPath") or "/wp-json/wp/v2/posts"),
             client_label="connector_wordpress_articles",
             params={"per_page": min(max(limit, 1), 100), "page": 1, "status": "publish,draft", "_embed": 1},
             headers=headers,
@@ -273,7 +332,7 @@ class WordPressPublisher(PublisherBase):
 
         try:
             data = await post_json(
-                f"{site_url}/wp-json/wp/v2/posts",
+                _join_endpoint(site_url, cfg.get("publishPath") or "/wp-json/wp/v2/posts"),
                 headers,
                 body,
             )
@@ -299,6 +358,17 @@ async def post_json(url: str, headers: dict[str, str], body: dict[str, Any]) -> 
         json=body,
         timeout=60,
     )
+
+
+def _join_endpoint(base_url: str, path: str) -> str:
+    if str(path).startswith(("http://", "https://")):
+        return str(path)
+    return f"{str(base_url).rstrip('/')}/{str(path).lstrip('/')}"
+
+
+def _display_url(url: str) -> str:
+    parts = urlsplit(str(url))
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
 
 
 def publisher_for_site(site: dict[str, Any], dry_run: bool = True) -> PublisherBase:

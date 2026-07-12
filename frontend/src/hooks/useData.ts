@@ -351,7 +351,11 @@ export function testSiteConnector(siteId: string) {
     ok: boolean
     connector_type: string
     capabilities: string[]
+    request?: { method: string; url: string; auth: string }
+    config?: { base_url?: string; article_endpoint?: string; publish_endpoint?: string; articles_path?: string; publish_path?: string; configured_keys: string[]; missing_keys: string[] }
+    checks?: Array<{ key: string; label: string; status: 'ok' | 'failed' | 'skipped'; detail: string }>
     sample_count?: number
+    duration_ms?: number
     error?: string
   }>(`/api/v1/sites/${encodeURIComponent(siteId)}/connector`, new AbortController().signal)
 }

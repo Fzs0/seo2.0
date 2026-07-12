@@ -2852,3 +2852,23 @@ input[type='range']::-moz-range-thumb {
   .article-dialog__info-grid { grid-template-columns: 1fr; }
   .article-dialog__head, .article-dialog__body, .article-dialog__tabs, .article-dialog__foot { padding-right: 16px; padding-left: 16px; }
 }
+
+/* connector diagnostics */
+.site-diagnostics { margin: 0 0 10px; padding: 12px; border: 1px solid var(--border-soft); border-radius: 12px; background: var(--bg-page); font-size: 12px; }
+.site-diagnostics--ok { border-color: rgba(147, 169, 108, .45); }
+.site-diagnostics--failed { border-color: rgba(215, 126, 108, .5); }
+.site-diagnostics__head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 10px; }
+.site-diagnostics__grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.site-diagnostics__item { min-width: 0; display: grid; gap: 3px; padding: 8px; border-radius: 8px; background: var(--bg-card); }
+.site-diagnostics__item span { color: var(--ink-400); font-size: 11px; }
+.site-diagnostics__item strong { overflow: hidden; color: var(--ink-700); font-size: 11px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+.site-diagnostics__checks { display: grid; gap: 7px; margin-top: 10px; }
+.site-diagnostics__check { display: grid; grid-template-columns: 8px max-content minmax(0, 1fr); align-items: baseline; gap: 7px; color: var(--ink-500); font-size: 11px; }
+.site-diagnostics__check strong { color: var(--ink-700); }
+.site-diagnostics__check span:last-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.site-diagnostics__check-dot { width: 7px; height: 7px; display: inline-block; border-radius: 50%; background: var(--ink-300); }
+.site-diagnostics__check-dot--ok { background: var(--green-700); }
+.site-diagnostics__check-dot--failed { background: var(--danger); }
+.site-diagnostics__check-dot--skipped { background: var(--ink-400); }
+.site-diagnostics__error { margin-top: 10px; padding: 8px; border-radius: 8px; background: var(--pink-100); color: var(--pink-700); line-height: 1.5; word-break: break-word; }
+@media (max-width: 700px) { .site-diagnostics__grid { grid-template-columns: 1fr; } .site-diagnostics__check { grid-template-columns: 8px max-content; } .site-diagnostics__check span:last-child { grid-column: 2; white-space: normal; } }

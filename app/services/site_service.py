@@ -190,8 +190,15 @@ async def delete_site(session: AsyncSession, site_id: str) -> bool:
 def _attach_publish_state(site: dict[str, Any]) -> dict[str, Any]:
     api_config = site.pop("api_config", None) or {}
     site_type = (site.get("site_type") or "").lower()
+    connector_type = str(api_config.get("connector_type") or ("wordpress" if site_type == "wp" else "custom_openapi"))
+    site["connector_type"] = connector_type
+    site["api_config_summary"] = {
+        "configured_keys": [key for key, value in api_config.items() if value and key not in {"connector_type"}],
+        "articles_path": api_config.get("articlesPath"),
+        "publish_path": api_config.get("publishPath"),
+    }
 
-    if site_type == "wp":
+    if connector_type in {"wp", "wordpress"}:
         ready = bool(
             (site.get("domain") or site.get("base_url"))
             and api_config.get("username")

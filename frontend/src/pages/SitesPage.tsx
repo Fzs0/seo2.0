@@ -78,16 +78,61 @@ type SiteForm = {
   site_key: string
   name: string
   site_type: string
+  connector_type: string
+  domain: string
   base_url: string
   api_base_url: string
+  articlesPath: string
+  publishPath: string
   market: string
   language_code: string
+  google_gl: string
+  google_hl: string
+  semrush_database: string
   content_role: string
+  notes: string
   openApiKey: string
   tokenA: string
   tokenB: string
   username: string
   applicationPassword: string
+}
+
+type ConnectorResult = Awaited<ReturnType<typeof testSiteConnector>>
+
+function formFromSite(site: Site): SiteForm {
+  return {
+    site_key: site.site_key,
+    name: site.name,
+    site_type: site.site_type,
+    connector_type: site.connector_type || (site.site_type === 'wp' ? 'wordpress' : 'custom_openapi'),
+    domain: site.domain || '',
+    base_url: site.base_url || '',
+    api_base_url: site.api_base_url || '',
+    articlesPath: site.api_config_summary?.articles_path || (site.connector_type === 'wordpress' ? '/wp-json/wp/v2/posts' : '/articles'),
+    publishPath: site.api_config_summary?.publish_path || (site.connector_type === 'wordpress' ? '/wp-json/wp/v2/posts' : '/articles/save'),
+    market: site.market || '',
+    language_code: site.language_code || '',
+    google_gl: site.google_gl || '',
+    google_hl: site.google_hl || '',
+    semrush_database: site.semrush_database || '',
+    content_role: site.content_role || '',
+    notes: site.notes || '',
+    openApiKey: '',
+    tokenA: '',
+    tokenB: '',
+    username: '',
+    applicationPassword: '',
+  }
+}
+
+function blankSite(): Site {
+  return {
+    id: '', site_key: '', name: '', site_type: 'blog', domain: '', base_url: '', api_base_url: '',
+    market: '', language_code: '', google_gl: '', google_hl: '', semrush_database: '', content_role: '',
+    content_scope: '', is_main: false, allow_external_links: false, publish_config: {}, api_config: {},
+    status: 'active', notes: '',
+  }
 }
 
 export function SitesPage() {
@@ -98,38 +143,30 @@ export function SitesPage() {
   const [testing, setTesting] = useState<string | null>(null)
   const [connectorTesting, setConnectorTesting] = useState<string | null>(null)
   const [testResults, setTestResults] = useState<Record<string, { ok: boolean; fetched: number; error?: string }>>({})
-  const [connectorResults, setConnectorResults] = useState<Record<string, { ok: boolean; connector_type: string; capabilities: string[]; sample_count?: number; error?: string }>>({})
+  const [connectorResults, setConnectorResults] = useState<Record<string, ConnectorResult>>({})
   const sites = useSites(refreshKey)
   const tested = Object.values(testResults)
   const healthy = tested.filter((item) => item.ok).length
 
   function openEditor(site: Site) {
     setEditing(site)
-    setForm({
-      site_key: site.site_key,
-      name: site.name,
-      site_type: site.site_type,
-      base_url: site.base_url || '',
-      api_base_url: site.api_base_url || '',
-      market: site.market || '',
-      language_code: site.language_code || '',
-      content_role: site.content_role || '',
-      openApiKey: '',
-      tokenA: '',
-      tokenB: '',
-      username: '',
-      applicationPassword: '',
-    })
+    setForm(formFromSite(site))
+  }
+
+  function openNewSite() {
+    const site = blankSite()
+    setEditing(site)
+    setForm(formFromSite(site))
   }
 
   async function saveEditor() {
     if (!form || saving) return
     setSaving(true)
     try {
-      const credentials = form.site_type === 'wp'
-        ? { username: form.username, applicationPassword: form.applicationPassword }
-        : { openApiKey: form.openApiKey, tokenA: form.tokenA, tokenB: form.tokenB }
-      const api_config = Object.fromEntries(Object.entries(credentials).filter(([, value]) => value))
+      const credentials = form.connector_type === 'wordpress'
+        ? { connector_type: form.connector_type, username: form.username, applicationPassword: form.applicationPassword }
+        : { connector_type: form.connector_type, openApiKey: form.openApiKey, tokenA: form.tokenA, tokenB: form.tokenB }
+      const api_config = Object.fromEntries(Object.entries({ ...credentials, articlesPath: form.articlesPath, publishPath: form.publishPath }).filter(([, value]) => value))
       await upsertSite({ ...form, api_config })
       setEditing(null)
       setForm(null)
@@ -164,6 +201,8 @@ export function SitesPage() {
       setConnectorResults((items) => ({
         ...items,
         [site.id]: {
+          site_id: site.id,
+          site_name: site.name,
           ok: false,
           connector_type: site.site_type,
           capabilities: [],
@@ -223,6 +262,10 @@ export function SitesPage() {
           <div className="card__title">
             <span>站点列表</span>
             <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <button className="btn btn--primary btn--xs" type="button" onClick={openNewSite}>
+                <span className="msr">add</span>
+                新增站点
+              </button>
               <span className="chip">
                 <span className="msr">expand_more</span>
                 全部状态
@@ -314,10 +357,30 @@ export function SitesPage() {
                       </div>
                     )}
                     {connectorResults[s.id] && (
-                      <div style={{ color: connectorResults[s.id].ok ? '#5c6e33' : '#a14a3c', fontSize: 12, marginBottom: 8 }}>
-                        {connectorResults[s.id].ok
-                          ? `连接器 ${connectorResults[s.id].connector_type} 正常 · ${connectorResults[s.id].capabilities.join('、') || '暂无能力'} · 样本 ${connectorResults[s.id].sample_count ?? 0}`
-                          : `连接器 ${connectorResults[s.id].connector_type} 失败：${connectorResults[s.id].error || '未知错误'}`}
+                      <div className={`site-diagnostics ${connectorResults[s.id].ok ? 'site-diagnostics--ok' : 'site-diagnostics--failed'}`}>
+                        <div className="site-diagnostics__head">
+                          <strong>连接器诊断</strong>
+                          <span className={`tag tag--${connectorResults[s.id].ok ? 'green' : 'pink'}`}>{connectorResults[s.id].ok ? '通过' : '失败'}</span>
+                        </div>
+                        <div className="site-diagnostics__grid">
+                          <DiagnosticItem label="连接器" value={connectorResults[s.id].connector_type} />
+                          <DiagnosticItem label="请求" value={`${connectorResults[s.id].request?.method || 'GET'} ${connectorResults[s.id].request?.url || '未生成'}`} />
+                          <DiagnosticItem label="发布接口" value={connectorResults[s.id].config?.publish_endpoint || '未生成'} />
+                          <DiagnosticItem label="鉴权方式" value={connectorResults[s.id].request?.auth || '未识别'} />
+                          <DiagnosticItem label="耗时 / 样本" value={`${connectorResults[s.id].duration_ms ?? '—'} ms · ${connectorResults[s.id].sample_count ?? 0} 篇`} />
+                          <DiagnosticItem label="已配置参数" value={connectorResults[s.id].config?.configured_keys.join('、') || '无'} />
+                          <DiagnosticItem label="缺失参数" value={connectorResults[s.id].config?.missing_keys.join('、') || '无'} />
+                        </div>
+                        <div className="site-diagnostics__checks">
+                          {(connectorResults[s.id].checks || []).map((check) => (
+                            <div className="site-diagnostics__check" key={check.key}>
+                              <span className={`site-diagnostics__check-dot site-diagnostics__check-dot--${check.status}`} />
+                              <strong>{check.label}</strong>
+                              <span>{check.detail}</span>
+                            </div>
+                          ))}
+                        </div>
+                        {connectorResults[s.id].error && <div className="site-diagnostics__error">错误：{connectorResults[s.id].error}</div>}
                       </div>
                     )}
                     <div className="site-card__meta">
@@ -370,9 +433,9 @@ export function SitesPage() {
                 )
               })}
               <div className="site-card site-card--placeholder">
-                <span className="msr">add_circle</span>
+                <button className="btn btn--ghost btn--xs" type="button" onClick={openNewSite}><span className="msr">add_circle</span>新增站点</button>
                 <span className="site-add__title">站点接入占位</span>
-                <span className="site-add__hint">POST /api/v1/sites 接入后展示</span>
+                <span className="site-add__hint">配置 API、鉴权和文章路径后即可检测</span>
               </div>
             </div>
           </DataGuard>
@@ -478,6 +541,7 @@ export function SitesPage() {
       {editing && form && (
         <SiteEditor
           form={form}
+          configuredKeys={editing.api_config_summary?.configured_keys || []}
           saving={saving}
           onChange={(key, value) => setForm((current) => current ? { ...current, [key]: value } : current)}
           onSave={() => void saveEditor()}
@@ -490,12 +554,14 @@ export function SitesPage() {
 
 function SiteEditor({
   form,
+  configuredKeys,
   saving,
   onChange,
   onSave,
   onClose,
 }: {
   form: SiteForm
+  configuredKeys: string[]
   saving: boolean
   onChange: (key: keyof SiteForm, value: string) => void
   onSave: () => void
@@ -515,15 +581,25 @@ function SiteEditor({
           {field('name', '站点名称')}
           {field('site_key', '站点 Key')}
           <label style={{ display: 'grid', gap: 5, fontSize: 12 }}><span>站点类型</span><select className="input" value={form.site_type} onChange={(event) => onChange('site_type', event.target.value)}><option value="main">主站</option><option value="blog">博客</option><option value="wp">WordPress</option><option value="other">其他</option></select></label>
+          <label style={{ display: 'grid', gap: 5, fontSize: 12 }}><span>连接器类型</span><select className="input" value={form.connector_type} onChange={(event) => onChange('connector_type', event.target.value)}><option value="custom_openapi">Custom OpenAPI</option><option value="wordpress">WordPress REST</option></select></label>
+          {field('domain', '域名，例如 https://example.com')}
+          {field('base_url', '站点基础 URL')}
+          {field('api_base_url', '文章 API 基础地址')}
+          {field('articlesPath', '读取文章路径，例如 /articles')}
+          {field('publishPath', '发布文章路径，例如 /articles/save')}
           {field('market', '市场，例如 US / DE')}
-          {field('language_code', '语言，例如 en / German')}
+          {field('language_code', '语言，例如 en / de')}
+          {field('google_gl', 'Google 国家参数，例如 us')}
+          {field('google_hl', 'Google 语言参数，例如 en')}
+          {field('semrush_database', 'Semrush 数据库，例如 us')}
           {field('content_role', '内容角色')}
-          {field('base_url', '站点 URL')}
-          {field('api_base_url', '文章 API 地址')}
+          {field('notes', '备注')}
         </div>
-        <div style={{ marginTop: 18, fontWeight: 700, fontSize: 13 }}>鉴权配置（留空表示保留原配置）</div>
+        <div style={{ marginTop: 18, fontWeight: 700, fontSize: 13 }}>鉴权配置</div>
+        <div style={{ marginTop: 6, color: 'var(--ink-500)', fontSize: 12 }}>当前已保存字段：{configuredKeys.length ? configuredKeys.join('、') : '未检测或未配置'}</div>
+        <div style={{ marginTop: 6, color: 'var(--ink-500)', fontSize: 12 }}>已保存的密钥不会回显；留空表示保留原配置，填写新值后替换。</div>
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginTop: 10 }}>
-          {form.site_type === 'wp' ? <>{field('username', 'WordPress 用户名')}{field('applicationPassword', 'Application Password', 'password')}</> : <>{field('openApiKey', 'OpenAPI Key', 'password')}{field('tokenA', 'Token A', 'password')}{field('tokenB', 'Token B', 'password')}</>}
+          {form.connector_type === 'wordpress' ? <>{field('username', 'WordPress 用户名')}{field('applicationPassword', 'Application Password', 'password')}</> : <>{field('openApiKey', 'OpenAPI Key', 'password')}{field('tokenA', 'Token A', 'password')}{field('tokenB', 'Token B', 'password')}</>}
         </div>
         <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 20 }}><button className="btn btn--ghost" type="button" onClick={onClose}>取消</button><button className="btn btn--primary" type="button" onClick={onSave} disabled={saving}>{saving ? '保存中…' : '保存配置'}</button></div>
       </div>
@@ -576,6 +652,15 @@ function RouteSuggest({
       >
         {desc}
       </div>
+    </div>
+  )
+}
+
+function DiagnosticItem({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="site-diagnostics__item">
+      <span>{label}</span>
+      <strong title={value}>{value}</strong>
     </div>
   )
 }
