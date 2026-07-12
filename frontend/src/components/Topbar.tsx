@@ -1,32 +1,14 @@
-interface Tab {
-  id: string
-  label: string
-}
-
 interface TopbarProps {
-  tabs: Tab[]
-  currentTab: string
-  onTabChange: (id: string) => void
   dateLabel: string
   notifications?: Array<{ id: string; title: string; detail?: string; time: string }>
 }
 
-export function Topbar({ tabs, currentTab, onTabChange, dateLabel, notifications = [] }: TopbarProps) {
+export function Topbar({ dateLabel, notifications = [] }: TopbarProps) {
   return (
     <header className="topbar">
-      <div className="tabs" role="tablist">
-        {tabs.map((t) => (
-          <button
-            key={t.id}
-            type="button"
-            role="tab"
-            aria-selected={currentTab === t.id}
-            className={'tabs__btn' + (currentTab === t.id ? ' is-active' : '')}
-            onClick={() => onTabChange(t.id)}
-          >
-            {t.label}
-          </button>
-        ))}
+      <div className="topbar__context">
+        <span className="topbar__context-title">SEO Agent Workbench</span>
+        <span className="topbar__context-hint">策略操作系统</span>
       </div>
       <div className="topbar__spacer" />
       <details className="topbar__notify">

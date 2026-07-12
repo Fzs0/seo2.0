@@ -12,9 +12,15 @@ import { SitesPage } from '@/pages/SitesPage'
 import { AnalyticsPage } from '@/pages/AnalyticsPage'
 import { RulesPage } from '@/pages/RulesPage'
 import { SyncPage } from '@/pages/SyncPage'
-import { AgentWorkbenchPage, type AgentView } from '@/pages/AgentWorkbenchPage'
+import { AgentWorkbenchPage } from '@/pages/AgentWorkbenchPage'
 
 type PageId =
+  | 'agent-command'
+  | 'agent-assets'
+  | 'agent-opportunities'
+  | 'agent-execution'
+  | 'agent-review'
+  | 'agent-risk'
   | 'dashboard'
   | 'opportunities'
   | 'serp'
@@ -27,18 +33,6 @@ type PageId =
   | 'rules'
   | 'sync'
 
-/** The top tab set is the same for every page — it scopes the current
- *  project / market / dataset. Field naming matches the backend's
- *  `positioning.defaultProject` & `market` query params. */
-const WORK_VIEWS = [
-  { id: 'command', label: '总控' },
-  { id: 'assets', label: '资产集群' },
-  { id: 'opportunities', label: '机会队列' },
-  { id: 'execution', label: '执行队列' },
-  { id: 'risk', label: '风险治理' },
-  { id: 'review', label: '数据复盘' },
-]
-
 function todayLabel() {
   return new Intl.DateTimeFormat('zh-CN', {
     year: 'numeric',
@@ -49,8 +43,7 @@ function todayLabel() {
 }
 
 export default function App() {
-  const [page, setPage] = useState<PageId>('dashboard')
-  const [workView, setWorkView] = useState<AgentView>('command')
+  const [page, setPage] = useState<PageId>('agent-command')
   const [notifications, setNotifications] = useState<Array<{ id: string; title: string; detail?: string; time: string }>>([])
 
   function notify(title: string, detail?: string) {
@@ -60,8 +53,20 @@ export default function App() {
 
   const pageNode = useMemo(() => {
     switch (page) {
+      case 'agent-command':
+        return <AgentWorkbenchPage view="command" onNotify={notify} />
+      case 'agent-assets':
+        return <AgentWorkbenchPage view="assets" onNotify={notify} />
+      case 'agent-opportunities':
+        return <AgentWorkbenchPage view="opportunities" onNotify={notify} />
+      case 'agent-execution':
+        return <AgentWorkbenchPage view="execution" onNotify={notify} />
+      case 'agent-review':
+        return <AgentWorkbenchPage view="review" onNotify={notify} />
+      case 'agent-risk':
+        return <AgentWorkbenchPage view="risk" onNotify={notify} />
       case 'dashboard':
-        return <AgentWorkbenchPage view={workView} onNotify={notify} />
+        return <AgentWorkbenchPage view="command" onNotify={notify} />
       case 'opportunities':
         return <OpportunitiesPage />
       case 'serp':
@@ -85,22 +90,13 @@ export default function App() {
       default:
         return null
     }
-  }, [page, workView])
+  }, [page])
 
   return (
     <div className="app-shell">
       <Sidebar currentPage={page} onNavigate={(id) => setPage(id as PageId)} />
       <div className="app-main">
-        <Topbar
-          tabs={WORK_VIEWS}
-          currentTab={workView}
-          onTabChange={(id) => {
-            setWorkView(id as AgentView)
-            setPage('dashboard')
-          }}
-          dateLabel={todayLabel()}
-          notifications={notifications}
-        />
+        <Topbar dateLabel={todayLabel()} notifications={notifications} />
         <main className="app-content">{pageNode}</main>
       </div>
     </div>

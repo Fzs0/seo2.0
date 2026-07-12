@@ -351,6 +351,22 @@ input[type='range']::-moz-range-thumb {
   flex-wrap: wrap;
 }
 
+.topbar__context {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 0 4px;
+}
+.topbar__context-title {
+  color: var(--ink-900);
+  font-size: 14px;
+  font-weight: 700;
+}
+.topbar__context-hint {
+  color: var(--ink-400);
+  font-size: 12px;
+}
+
 .tabs {
   display: flex;
   background: var(--bg-card);
