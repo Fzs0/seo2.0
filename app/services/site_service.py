@@ -100,6 +100,19 @@ async def upsert_site(session: AsyncSession, payload: dict[str, Any]) -> dict[st
     if not site_key:
         raise ValueError("site_key / siteKey / name ??????")
 
+    existing = (
+        await session.execute(
+            text("SELECT api_config, publish_config FROM seo_agent.sites WHERE site_key = :site_key"),
+            {"site_key": site_key},
+        )
+    ).mappings().first()
+    input_api_config = payload.get("api_config") if "api_config" in payload else payload.get("apiConfig")
+    input_publish_config = payload.get("publish_config") if "publish_config" in payload else payload.get("publishConfig")
+    existing_api_config = (existing or {}).get("api_config") or {}
+    existing_publish_config = (existing or {}).get("publish_config") or {}
+    api_config = {**existing_api_config, **(input_api_config or {})}
+    publish_config = {**existing_publish_config, **(input_publish_config or {})}
+
     sql = text(
         """
         INSERT INTO seo_agent.sites
@@ -152,8 +165,8 @@ async def upsert_site(session: AsyncSession, payload: dict[str, Any]) -> dict[st
         "content_scope": payload.get("content_scope") or payload.get("contentScope"),
         "is_main": bool(payload.get("is_main", payload.get("isMain", False))),
         "allow_external_links": bool(payload.get("allow_external_links", payload.get("allowExternalLinks", False))),
-        "publish_config": _to_json(payload.get("publish_config") or payload.get("publishConfig") or {}),
-        "api_config": _to_json(payload.get("api_config") or payload.get("apiConfig") or {}),
+        "publish_config": _to_json(publish_config),
+        "api_config": _to_json(api_config),
         "status": payload.get("status") or "active",
         "notes": payload.get("notes"),
         "raw": _to_json(payload.get("raw") or payload),

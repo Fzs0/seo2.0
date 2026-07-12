@@ -86,7 +86,7 @@ function emptyAsync<T>(errorMsg = 'No data available'): AsyncState<T> {
   return { data: null, loading: false, error: errorMsg }
 }
 
-export function useSites(): AsyncState<Site[]> {
+export function useSites(refreshKey = 0): AsyncState<Site[]> {
   const [state, setState] = useState<AsyncState<Site[]>>({ data: null, loading: true, error: null })
 
   useEffect(() => {
@@ -101,7 +101,7 @@ export function useSites(): AsyncState<Site[]> {
         }
       })
     return () => controller.abort()
-  }, [])
+  }, [refreshKey])
 
   return state
 }
@@ -264,6 +264,10 @@ export function syncSitePosts(siteId: string, limit = 100) {
     `/api/v1/sites/${encodeURIComponent(siteId)}/posts/sync`,
     { limit },
   )
+}
+
+export function upsertSite(payload: Record<string, unknown>) {
+  return postJson<Site>('/api/v1/sites', payload)
 }
 
 export function publishArticle(articleId: string, siteId: string, dryRun: boolean) {

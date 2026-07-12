@@ -1,5 +1,6 @@
+import { useState } from 'react'
 import { DataGuard } from '@/components/StateBlock'
-import { useSites } from '@/hooks/useData'
+import { syncSitePosts, upsertSite, useSites } from '@/hooks/useData'
 import type { Site } from '@/types/domain'
 
 const TYPE_LABEL: Record<string, string> = {
@@ -73,8 +74,83 @@ function iconColor(role: string) {
   }
 }
 
+type SiteForm = {
+  site_key: string
+  name: string
+  site_type: string
+  base_url: string
+  api_base_url: string
+  market: string
+  language_code: string
+  content_role: string
+  openApiKey: string
+  tokenA: string
+  tokenB: string
+  username: string
+  applicationPassword: string
+}
+
 export function SitesPage() {
-  const sites = useSites()
+  const [refreshKey, setRefreshKey] = useState(0)
+  const [editing, setEditing] = useState<Site | null>(null)
+  const [form, setForm] = useState<SiteForm | null>(null)
+  const [saving, setSaving] = useState(false)
+  const [testing, setTesting] = useState<string | null>(null)
+  const [testResults, setTestResults] = useState<Record<string, { ok: boolean; fetched: number; error?: string }>>({})
+  const sites = useSites(refreshKey)
+  const tested = Object.values(testResults)
+  const healthy = tested.filter((item) => item.ok).length
+
+  function openEditor(site: Site) {
+    setEditing(site)
+    setForm({
+      site_key: site.site_key,
+      name: site.name,
+      site_type: site.site_type,
+      base_url: site.base_url || '',
+      api_base_url: site.api_base_url || '',
+      market: site.market || '',
+      language_code: site.language_code || '',
+      content_role: site.content_role || '',
+      openApiKey: '',
+      tokenA: '',
+      tokenB: '',
+      username: '',
+      applicationPassword: '',
+    })
+  }
+
+  async function saveEditor() {
+    if (!form || saving) return
+    setSaving(true)
+    try {
+      const credentials = form.site_type === 'wp'
+        ? { username: form.username, applicationPassword: form.applicationPassword }
+        : { openApiKey: form.openApiKey, tokenA: form.tokenA, tokenB: form.tokenB }
+      const api_config = Object.fromEntries(Object.entries(credentials).filter(([, value]) => value))
+      await upsertSite({ ...form, api_config })
+      setEditing(null)
+      setForm(null)
+      setRefreshKey((key) => key + 1)
+    } catch (error) {
+      window.alert(error instanceof Error ? error.message : '站点配置保存失败')
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  async function testPosts(site: Site) {
+    if (testing) return
+    setTesting(site.id)
+    try {
+      const result = await syncSitePosts(site.id, 1)
+      setTestResults((items) => ({ ...items, [site.id]: { ok: result.ok, fetched: result.fetched, error: result.error } }))
+    } catch (error) {
+      setTestResults((items) => ({ ...items, [site.id]: { ok: false, fetched: 0, error: error instanceof Error ? error.message : '文章接口测试失败' } }))
+    } finally {
+      setTesting(null)
+    }
+  }
   return (
     <>
       <section className="page" data-screen-label="站点管理">
@@ -99,7 +175,7 @@ export function SitesPage() {
               <span className="kpi__label">路由正常</span>
               <span className="msr msr-fill kpi__icon kpi__icon--blue">verified_user</span>
             </div>
-            <div className="kpi__value">96%</div>
+            <div className="kpi__value">{tested.length ? `${Math.round((healthy / tested.length) * 100)}%` : '—'}</div>
             <div className="kpi__delta">较昨日 +2%</div>
           </div>
           <div className="kpi kpi--pink">
@@ -107,7 +183,7 @@ export function SitesPage() {
               <span className="kpi__label">待确认分配</span>
               <span className="msr kpi__icon kpi__icon--pink">help</span>
             </div>
-            <div className="kpi__value">5</div>
+            <div className="kpi__value">{tested.filter((item) => !item.ok).length}</div>
             <div className="kpi__delta">较昨日 -1</div>
           </div>
           <div className="kpi kpi--green">
@@ -115,7 +191,7 @@ export function SitesPage() {
               <span className="kpi__label">API 健康</span>
               <span className="msr msr-fill kpi__icon kpi__icon--green">cloud_done</span>
             </div>
-            <div className="kpi__value">98%</div>
+            <div className="kpi__value">{tested.length ? `${Math.round((healthy / tested.length) * 100)}%` : '—'}</div>
             <div className="kpi__delta">较昨日 +0.6%</div>
           </div>
         </div>
@@ -198,6 +274,18 @@ export function SitesPage() {
                         <div className="site-card__name">{s.name}</div>
                       </div>
                     </div>
+                    <div style={{ display: 'flex', gap: 8, margin: '10px 0' }}>
+                      <button className="btn btn--ghost btn--xs" type="button" onClick={() => void testPosts(s)} disabled={testing === s.id}>
+                        <span className="msr">{testing === s.id ? 'progress_activity' : 'sync'}</span>
+                        {testing === s.id ? '测试中' : '测试文章接口'}
+                      </button>
+                      <button className="btn btn--ghost btn--xs" type="button" onClick={() => openEditor(s)}>编辑配置</button>
+                    </div>
+                    {testResults[s.id] && (
+                      <div style={{ color: testResults[s.id].ok ? '#5c6e33' : '#a14a3c', fontSize: 12, marginBottom: 8 }}>
+                        {testResults[s.id].ok ? `文章接口正常：读取 ${testResults[s.id].fetched} 篇` : `文章接口失败：${testResults[s.id].error || '未知错误'}`}
+                      </div>
+                    )}
                     <div className="site-card__meta">
                       <span className="site-card__meta-label">域名</span>
                       <span className="site-card__meta-value">{s.domain}</span>
@@ -353,7 +441,59 @@ export function SitesPage() {
           </div>
         </div>
       </aside>
+      {editing && form && (
+        <SiteEditor
+          form={form}
+          saving={saving}
+          onChange={(key, value) => setForm((current) => current ? { ...current, [key]: value } : current)}
+          onSave={() => void saveEditor()}
+          onClose={() => { setEditing(null); setForm(null) }}
+        />
+      )}
     </>
+  )
+}
+
+function SiteEditor({
+  form,
+  saving,
+  onChange,
+  onSave,
+  onClose,
+}: {
+  form: SiteForm
+  saving: boolean
+  onChange: (key: keyof SiteForm, value: string) => void
+  onSave: () => void
+  onClose: () => void
+}) {
+  const field = (key: keyof SiteForm, label: string, type = 'text') => (
+    <label style={{ display: 'grid', gap: 5, fontSize: 12 }}>
+      <span>{label}</span>
+      <input className="input" type={type} value={form[key]} onChange={(event) => onChange(key, event.target.value)} />
+    </label>
+  )
+  return (
+    <div style={{ position: 'fixed', inset: 0, zIndex: 20, background: 'rgba(23,22,20,.35)', display: 'grid', placeItems: 'center', padding: 24 }}>
+      <div className="card" style={{ width: 'min(620px, 100%)', maxHeight: '90vh', overflow: 'auto' }}>
+        <div className="card__title"><span>编辑站点配置：{form.name}</span><button className="icon-btn" type="button" onClick={onClose}>close</button></div>
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginTop: 14 }}>
+          {field('name', '站点名称')}
+          {field('site_key', '站点 Key')}
+          <label style={{ display: 'grid', gap: 5, fontSize: 12 }}><span>站点类型</span><select className="input" value={form.site_type} onChange={(event) => onChange('site_type', event.target.value)}><option value="main">主站</option><option value="blog">博客</option><option value="wp">WordPress</option><option value="other">其他</option></select></label>
+          {field('market', '市场，例如 US / DE')}
+          {field('language_code', '语言，例如 en / German')}
+          {field('content_role', '内容角色')}
+          {field('base_url', '站点 URL')}
+          {field('api_base_url', '文章 API 地址')}
+        </div>
+        <div style={{ marginTop: 18, fontWeight: 700, fontSize: 13 }}>鉴权配置（留空表示保留原配置）</div>
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginTop: 10 }}>
+          {form.site_type === 'wp' ? <>{field('username', 'WordPress 用户名')}{field('applicationPassword', 'Application Password', 'password')}</> : <>{field('openApiKey', 'OpenAPI Key', 'password')}{field('tokenA', 'Token A', 'password')}{field('tokenB', 'Token B', 'password')}</>}
+        </div>
+        <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 20 }}><button className="btn btn--ghost" type="button" onClick={onClose}>取消</button><button className="btn btn--primary" type="button" onClick={onSave} disabled={saving}>{saving ? '保存中…' : '保存配置'}</button></div>
+      </div>
+    </div>
   )
 }
 

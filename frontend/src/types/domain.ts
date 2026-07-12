@@ -36,6 +36,7 @@ export interface Site {
   name: string
   site_type: 'main' | 'blog' | 'wp' | string
   domain: string
+  api_base_url?: string | null
   base_url: string
   market: string | null
   language_code: string | null
