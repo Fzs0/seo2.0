@@ -2,7 +2,10 @@ import { useState, type ReactNode } from 'react'
 import { BarDecor } from '@/components/Charts'
 import { DataGuard } from '@/components/StateBlock'
 import { publishArticle, runArticlePipeline, useKeywords, usePosts, useSites, type PipelineStep } from '@/hooks/useData'
-import type { Keyword } from '@/types/domain'
+import type { Keyword, Site } from '@/types/domain'
+
+type ArticlePipelineResult = Awaited<ReturnType<typeof runArticlePipeline>>
+type ResultTab = 'article' | 'brief' | 'outline' | 'pipeline' | 'seo'
 
 function asNumber(value: number | string | null | undefined) {
   const n = Number(value ?? 0)
@@ -40,7 +43,9 @@ export function ContentPage({ onNotify }: { onNotify?: (title: string, detail?: 
   const [generating, setGenerating] = useState(false)
   const [message, setMessage] = useState<string>()
   const [steps, setSteps] = useState<PipelineStep[]>([])
-  const [lastResult, setLastResult] = useState<Awaited<ReturnType<typeof runArticlePipeline>> | null>(null)
+  const [lastResult, setLastResult] = useState<ArticlePipelineResult | null>(null)
+  const [showResult, setShowResult] = useState(false)
+  const [resultTab, setResultTab] = useState<ResultTab>('article')
   const [selectedSiteId, setSelectedSiteId] = useState('')
   const [publishing, setPublishing] = useState(false)
   const [publishMessage, setPublishMessage] = useState<string>()
@@ -70,6 +75,7 @@ export function ContentPage({ onNotify }: { onNotify?: (title: string, detail?: 
     if (!keyword || generating) return
     setGenerating(true)
     setLastResult(null)
+    setShowResult(false)
     setMessage(`正在执行完整生文链路：${keyword.keyword}`)
     setSteps([
       { key: 'keyword', label: '读取关键词', status: 'running' },
@@ -92,6 +98,8 @@ export function ContentPage({ onNotify }: { onNotify?: (title: string, detail?: 
       const passed = (saved.qa || []).filter((item) => item.ok).length
       setMessage(`已生成：${saved.article?.title || keyword.keyword}｜SERP：${saved.serp?.source || saved.serp?.status || '未使用'}｜QA：${passed}/${saved.qa?.length || 0}`)
       onNotify?.('文章生成完成', `${saved.article?.title || keyword.keyword}｜QA ${passed}/${saved.qa?.length || 0}`)
+      setResultTab('article')
+      setShowResult(true)
       setRefreshKey((key) => key + 1)
     } catch (error) {
       setMessage(error instanceof Error ? error.message : '生成失败')
@@ -229,6 +237,10 @@ export function ContentPage({ onNotify }: { onNotify?: (title: string, detail?: 
           )}
           {lastResult?.status === 'done' && (
             <div className="ai-list">
+              <button className="btn--block" type="button" onClick={() => setShowResult(true)}>
+                查看完整生成结果
+                <span className="msr">open_in_full</span>
+              </button>
               <div className="ai-list__item">
                 <div className="ai-list__dot ai-list__dot--green">
                   <span className="msr">database</span>
@@ -283,6 +295,20 @@ export function ContentPage({ onNotify }: { onNotify?: (title: string, detail?: 
           <div className="btn-caption">当前页只读展示真实数据；任务创建和 worker 下一步接入。</div>
         </div>
       </aside>
+      {showResult && lastResult?.status === 'done' && (
+        <ArticleResultDialog
+          result={lastResult}
+          tab={resultTab}
+          onTabChange={setResultTab}
+          onClose={() => setShowResult(false)}
+          publishSites={publishSites}
+          targetSiteId={targetSiteId}
+          onSiteChange={setSelectedSiteId}
+          publishing={publishing}
+          publishMessage={publishMessage}
+          onPublish={handlePublish}
+        />
+      )}
     </>
   )
 }
@@ -375,5 +401,129 @@ function PreviewBlock({ title, text }: { title: string; text?: string }) {
       <summary>{title}</summary>
       <div style={{ marginTop: 8, maxHeight: 260, overflow: 'auto' }}>{text}</div>
     </details>
+  )
+}
+
+function ArticleResultDialog({
+  result,
+  tab,
+  onTabChange,
+  onClose,
+  publishSites,
+  targetSiteId,
+  onSiteChange,
+  publishing,
+  publishMessage,
+  onPublish,
+}: {
+  result: ArticlePipelineResult
+  tab: ResultTab
+  onTabChange: (tab: ResultTab) => void
+  onClose: () => void
+  publishSites: Site[]
+  targetSiteId: string
+  onSiteChange: (siteId: string) => void
+  publishing: boolean
+  publishMessage?: string
+  onPublish: (dryRun: boolean) => Promise<void>
+}) {
+  const content = result.content || result.contentPreview || '暂无文章正文'
+  const passedQa = (result.qa || []).filter((item) => item.ok).length
+  const tabLabels: Array<[ResultTab, string]> = [
+    ['article', '文章正文'],
+    ['brief', '增强 Brief'],
+    ['outline', '文章大纲'],
+    ['pipeline', '执行过程'],
+    ['seo', 'SEO 与 QA'],
+  ]
+
+  return (
+    <div className="article-dialog-backdrop" role="presentation">
+      <section className="article-dialog" role="dialog" aria-modal="true" aria-labelledby="article-result-title">
+        <div className="article-dialog__head">
+          <div>
+            <div className="eyebrow">ARTICLE PIPELINE · 已保存</div>
+            <h2 id="article-result-title">{result.article?.title || '文章生成结果'}</h2>
+            <div className="article-dialog__meta">
+              <span className="tag tag--green">生成完成</span>
+              <span>{result.contentLength ? `${formatNumber(result.contentLength)} 字符` : '正文长度未知'}</span>
+              <span>SERP：{result.serp?.source || result.serp?.status || '未使用'}</span>
+            </div>
+          </div>
+          <button className="icon-btn" type="button" aria-label="关闭生成结果" onClick={onClose}>
+            <span className="msr">close</span>
+          </button>
+        </div>
+
+        <div className="article-dialog__tabs" role="tablist" aria-label="文章生成结果">
+          {tabLabels.map(([key, label]) => (
+            <button key={key} className={tab === key ? 'is-active' : ''} type="button" role="tab" aria-selected={tab === key} onClick={() => onTabChange(key)}>
+              {label}
+            </button>
+          ))}
+        </div>
+
+        <div className="article-dialog__body">
+          {tab === 'article' && <pre className="article-dialog__content">{content}</pre>}
+          {tab === 'brief' && <pre className="article-dialog__content">{result.brief?.text || '暂无 Brief 内容'}</pre>}
+          {tab === 'outline' && <pre className="article-dialog__content">{result.outline || '暂无文章大纲'}</pre>}
+          {tab === 'pipeline' && (
+            <div className="article-dialog__steps">
+              {result.steps.map((step) => (
+                <div className="article-dialog__step" key={step.key}>
+                  <div className={`article-dialog__step-dot article-dialog__step-dot--${step.status}`}>
+                    <span className="msr">{step.status === 'done' ? 'check' : step.status === 'failed' ? 'error' : 'hourglass_top'}</span>
+                  </div>
+                  <div>
+                    <strong>{step.label}</strong>
+                    <span>{step.status}</span>
+                    {step.message && <p>{step.message}</p>}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+          {tab === 'seo' && (
+            <div className="article-dialog__info-grid">
+              <InfoItem label="保存位置" value={`${result.savedTo?.table || 'seo_agent.articles'} / ${result.savedTo?.articleId || result.article?.id || '未知'}`} />
+              <InfoItem label="Brief 来源" value={result.brief?.aiEnhanced ? 'AI 增强' : '本地生成'} />
+              <InfoItem label="生成模型" value={result.model || '未返回'} />
+              <InfoItem label="SERP 状态" value={`${result.serp?.source || '未使用'} · ${result.serp?.status || '未知'}`} />
+              <InfoItem label="QA 结果" value={`${passedQa}/${result.qa?.length || 0} 项通过`} />
+              <InfoItem label="文章状态" value={result.article?.status || '未知'} />
+              {(result.qa || []).map((item) => <InfoItem key={item.key} label={`QA · ${item.key}`} value={item.ok ? '通过' : '未通过'} />)}
+            </div>
+          )}
+        </div>
+
+        <div className="article-dialog__foot">
+          <select className="input" value={targetSiteId} onChange={(event) => onSiteChange(event.target.value)} aria-label="选择发布站点">
+            <option value="">选择发布站点</option>
+            {publishSites.map((site) => (
+              <option key={site.id} value={site.id}>
+                {site.name} · {site.publish_adapter || site.site_type}{site.publish_ready ? '' : ' · 未就绪'}
+              </option>
+            ))}
+          </select>
+          <button className="btn btn--ghost" type="button" disabled={!targetSiteId || publishing} onClick={() => void onPublish(true)}>
+            发布预检
+          </button>
+          <button className="btn btn--primary" type="button" disabled={!targetSiteId || publishing} onClick={() => void onPublish(false)}>
+            {publishing ? '发布中…' : '确认发布'}
+          </button>
+          <button className="btn btn--ghost" type="button" onClick={onClose}>关闭</button>
+          {publishMessage && <div className="article-dialog__publish-message">{publishMessage}</div>}
+        </div>
+      </section>
+    </div>
+  )
+}
+
+function InfoItem({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="article-dialog__info-item">
+      <span>{label}</span>
+      <strong>{value}</strong>
+    </div>
   )
 }
