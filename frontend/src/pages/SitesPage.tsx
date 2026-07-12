@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { DataGuard } from '@/components/StateBlock'
-import { syncSitePosts, upsertSite, useSites } from '@/hooks/useData'
+import { syncSitePosts, testSiteConnector, upsertSite, useSites } from '@/hooks/useData'
 import type { Site } from '@/types/domain'
 
 const TYPE_LABEL: Record<string, string> = {
@@ -96,7 +96,9 @@ export function SitesPage() {
   const [form, setForm] = useState<SiteForm | null>(null)
   const [saving, setSaving] = useState(false)
   const [testing, setTesting] = useState<string | null>(null)
+  const [connectorTesting, setConnectorTesting] = useState<string | null>(null)
   const [testResults, setTestResults] = useState<Record<string, { ok: boolean; fetched: number; error?: string }>>({})
+  const [connectorResults, setConnectorResults] = useState<Record<string, { ok: boolean; connector_type: string; capabilities: string[]; sample_count?: number; error?: string }>>({})
   const sites = useSites(refreshKey)
   const tested = Object.values(testResults)
   const healthy = tested.filter((item) => item.ok).length
@@ -149,6 +151,27 @@ export function SitesPage() {
       setTestResults((items) => ({ ...items, [site.id]: { ok: false, fetched: 0, error: error instanceof Error ? error.message : '文章接口测试失败' } }))
     } finally {
       setTesting(null)
+    }
+  }
+
+  async function testConnector(site: Site) {
+    if (connectorTesting) return
+    setConnectorTesting(site.id)
+    try {
+      const result = await testSiteConnector(site.id)
+      setConnectorResults((items) => ({ ...items, [site.id]: result }))
+    } catch (error) {
+      setConnectorResults((items) => ({
+        ...items,
+        [site.id]: {
+          ok: false,
+          connector_type: site.site_type,
+          capabilities: [],
+          error: error instanceof Error ? error.message : '连接器检测失败',
+        },
+      }))
+    } finally {
+      setConnectorTesting(null)
     }
   }
   return (
@@ -275,6 +298,10 @@ export function SitesPage() {
                       </div>
                     </div>
                     <div style={{ display: 'flex', gap: 8, margin: '10px 0' }}>
+                      <button className="btn btn--ghost btn--xs" type="button" onClick={() => void testConnector(s)} disabled={connectorTesting === s.id}>
+                        <span className="msr">{connectorTesting === s.id ? 'progress_activity' : 'lan'}</span>
+                        {connectorTesting === s.id ? '检测中' : '检测连接器'}
+                      </button>
                       <button className="btn btn--ghost btn--xs" type="button" onClick={() => void testPosts(s)} disabled={testing === s.id}>
                         <span className="msr">{testing === s.id ? 'progress_activity' : 'sync'}</span>
                         {testing === s.id ? '测试中' : '测试文章接口'}
@@ -284,6 +311,13 @@ export function SitesPage() {
                     {testResults[s.id] && (
                       <div style={{ color: testResults[s.id].ok ? '#5c6e33' : '#a14a3c', fontSize: 12, marginBottom: 8 }}>
                         {testResults[s.id].ok ? `文章接口正常：读取 ${testResults[s.id].fetched} 篇` : `文章接口失败：${testResults[s.id].error || '未知错误'}`}
+                      </div>
+                    )}
+                    {connectorResults[s.id] && (
+                      <div style={{ color: connectorResults[s.id].ok ? '#5c6e33' : '#a14a3c', fontSize: 12, marginBottom: 8 }}>
+                        {connectorResults[s.id].ok
+                          ? `连接器 ${connectorResults[s.id].connector_type} 正常 · ${connectorResults[s.id].capabilities.join('、') || '暂无能力'} · 样本 ${connectorResults[s.id].sample_count ?? 0}`
+                          : `连接器 ${connectorResults[s.id].connector_type} 失败：${connectorResults[s.id].error || '未知错误'}`}
                       </div>
                     )}
                     <div className="site-card__meta">

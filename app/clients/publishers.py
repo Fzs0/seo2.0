@@ -52,12 +52,35 @@ class PublishResult:
 class PublisherBase:
     """所有 publisher 的基类。"""
 
+    connector_type = "unsupported"
+    capabilities: tuple[str, ...] = ()
+
     def __init__(self, site: dict[str, Any], dry_run: bool = True) -> None:
         self.site = site
         self.dry_run = dry_run
 
     async def publish(self, req: PublishRequest) -> PublishResult:
         raise NotImplementedError
+
+    async def read_articles(self, limit: int = 1) -> list[dict[str, Any]]:
+        raise ExternalCallError(f"connector {self.connector_type} does not support read_articles")
+
+    async def check_connection(self) -> dict[str, Any]:
+        try:
+            items = await self.read_articles(limit=1)
+            return {
+                "ok": True,
+                "connector_type": self.connector_type,
+                "capabilities": list(self.capabilities),
+                "sample_count": len(items),
+            }
+        except Exception as error:  # noqa: BLE001
+            return {
+                "ok": False,
+                "connector_type": self.connector_type,
+                "capabilities": list(self.capabilities),
+                "error": str(error),
+            }
 
     def _dry_response(self, req: PublishRequest) -> PublishResult:
         """不真发，返回"如果真发会是什么样"——便于前端/审计预览。"""
@@ -95,6 +118,35 @@ class OpenAPIPublisher(PublisherBase):
     失败/不识别的站点用 dry_run 模式安全返回。
     """
 
+    connector_type = "custom_openapi"
+    capabilities = ("read_articles", "publish_article")
+
+    async def read_articles(self, limit: int = 1) -> list[dict[str, Any]]:
+        api_base = (self.site.get("api_base_url") or self.site.get("base_url") or "").rstrip("/")
+        headers = self._auth_headers()
+        if not api_base or not headers:
+            raise ExternalCallError("site post connector missing api_base_url or auth")
+        data = await request_json(
+            "GET",
+            f"{api_base}/articles",
+            client_label="connector_openapi_articles",
+            params={"limit": min(max(limit, 1), 100)},
+            headers=headers,
+            timeout=60,
+        )
+        items = data if isinstance(data, list) else data.get("items") or data.get("articles") or data.get("data") or []
+        return [item for item in items if isinstance(item, dict)][:limit]
+
+    def _auth_headers(self) -> dict[str, str]:
+        cfg = self.site.get("api_config") or {}
+        if cfg.get("openApiKey"):
+            return {"openApiKey": cfg["openApiKey"]}
+        if cfg.get("tokenB"):
+            return {"token": cfg["tokenB"]}
+        if cfg.get("tokenA"):
+            return {"token": cfg["tokenA"]}
+        return {}
+
     async def publish(self, req: PublishRequest) -> PublishResult:
         if self.dry_run:
             return self._dry_response(req)
@@ -105,15 +157,8 @@ class OpenAPIPublisher(PublisherBase):
         if not api_base:
             return PublishResult(ok=False, dry_run=False, error="site.api_base_url is empty")
 
-        cfg = self.site.get("api_config") or {}
-        # 鉴权：blog 站用 openApiKey，main 站用 token
-        if "openApiKey" in cfg:
-            headers = {"openApiKey": cfg["openApiKey"]}
-        elif "tokenB" in cfg:
-            headers = {"token": cfg["tokenB"]}
-        elif "tokenA" in cfg:
-            headers = {"token": cfg["tokenA"]}
-        else:
+        headers = self._auth_headers()
+        if not headers:
             return PublishResult(ok=False, dry_run=False, error="no auth token in site.api_config")
 
         # 真实协议字段不确定（每个 OpenAPI 实现不同），这里按最常见的字段名
@@ -157,30 +202,57 @@ class WordPressPublisher(PublisherBase):
         { title, content, status, slug, excerpt, meta: { _yoast_wpseo_title, _yoast_wpseo_metadesc } }
     """
 
+    connector_type = "wordpress"
+    capabilities = ("read_articles", "publish_article")
+
+    def _site_url(self) -> str:
+        site_url = (self.site.get("domain") or self.site.get("base_url") or "").rstrip("/")
+        if site_url and not site_url.startswith(("http://", "https://")):
+            site_url = f"https://{site_url}"
+        return site_url
+
+    def _auth_headers(self) -> dict[str, str]:
+        cfg = self.site.get("api_config") or {}
+        username = cfg.get("username")
+        app_pwd = cfg.get("applicationPassword")
+        if not username or not app_pwd:
+            return {}
+        token = base64.b64encode(f"{username}:{app_pwd}".encode("utf-8")).decode("ascii")
+        return {"Authorization": f"Basic {token}"}
+
+    async def read_articles(self, limit: int = 1) -> list[dict[str, Any]]:
+        site_url = self._site_url()
+        headers = self._auth_headers()
+        if not site_url or not headers:
+            raise ExternalCallError("wordpress connector missing site URL or credentials")
+        data = await request_json(
+            "GET",
+            f"{site_url}/wp-json/wp/v2/posts",
+            client_label="connector_wordpress_articles",
+            params={"per_page": min(max(limit, 1), 100), "page": 1, "status": "publish,draft", "_embed": 1},
+            headers=headers,
+            timeout=60,
+        )
+        return data if isinstance(data, list) else []
+
     async def publish(self, req: PublishRequest) -> PublishResult:
         if self.dry_run:
             return self._dry_response(req)
         return await self._real_publish(req)
 
     async def _real_publish(self, req: PublishRequest) -> PublishResult:
-        site_url = (self.site.get("domain") or self.site.get("base_url") or "").rstrip("/")
+        site_url = self._site_url()
         if not site_url:
             return PublishResult(ok=False, dry_run=False, error="site.domain is empty")
 
         cfg = self.site.get("api_config") or {}
-        username = cfg.get("username")
-        app_pwd = cfg.get("applicationPassword")
-        if not username or not app_pwd:
+        headers = self._auth_headers()
+        if not headers:
             return PublishResult(
                 ok=False, dry_run=False,
                 error="site.api_config missing username or applicationPassword",
             )
-        # Basic Auth: base64("user:pass") (注意 applicationPassword 里的空格保留)
-        token = base64.b64encode(f"{username}:{app_pwd}".encode("utf-8")).decode("ascii")
-        headers = {
-            "Authorization": f"Basic {token}",
-            "Content-Type": "application/json",
-        }
+        headers["Content-Type"] = "application/json"
 
         body = {
             "title": req.title,
@@ -230,12 +302,32 @@ async def post_json(url: str, headers: dict[str, str], body: dict[str, Any]) -> 
 
 
 def publisher_for_site(site: dict[str, Any], dry_run: bool = True) -> PublisherBase:
-    """按 site.site_type 路由到对应 adapter。"""
-    st = (site.get("site_type") or "").lower()
-    if st == "wp":
+    """按显式 connector_type/site_type 路由；未知类型不再隐式当作 OpenAPI。"""
+    cfg = site.get("api_config") or {}
+    st = str(site.get("connector_type") or cfg.get("connector_type") or site.get("site_type") or "").lower()
+    if st in {"wp", "wordpress"}:
         return WordPressPublisher(site, dry_run=dry_run)
-    # main / blog / other 都走 OpenAPI 协议（鉴权字段从 api_config 自动识别）
-    return OpenAPIPublisher(site, dry_run=dry_run)
+    if st in {"main", "blog", "openapi", "custom_blog", "custom_saas", "custom_openapi"}:
+        return OpenAPIPublisher(site, dry_run=dry_run)
+    return UnsupportedPublisher(site, dry_run=dry_run, connector_type=st or "unknown")
+
+
+def connector_for_site(site: dict[str, Any], dry_run: bool = True) -> PublisherBase:
+    """Connector 命名入口；publisher_for_site 保留给旧调用方。"""
+    return publisher_for_site(site, dry_run=dry_run)
+
+
+class UnsupportedPublisher(PublisherBase):
+    def __init__(self, site: dict[str, Any], dry_run: bool = True, connector_type: str = "unknown") -> None:
+        super().__init__(site, dry_run=dry_run)
+        self.connector_type = connector_type
+
+    async def publish(self, req: PublishRequest) -> PublishResult:
+        return PublishResult(
+            ok=False,
+            dry_run=self.dry_run,
+            error=f"no connector registered for site type: {self.connector_type}",
+        )
 
 
 __all__ = [
@@ -244,5 +336,7 @@ __all__ = [
     "PublisherBase",
     "OpenAPIPublisher",
     "WordPressPublisher",
+    "UnsupportedPublisher",
     "publisher_for_site",
+    "connector_for_site",
 ]

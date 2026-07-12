@@ -1,7 +1,6 @@
 """从站点 API 拉已发布文章，写入 seo_agent.posts。"""
 from __future__ import annotations
 
-import base64
 import json
 from datetime import datetime
 from typing import Any
@@ -9,7 +8,8 @@ from typing import Any
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.clients.http_client import ExternalCallError, request_json
+from app.clients.http_client import ExternalCallError
+from app.clients.publishers import connector_for_site
 
 
 async def sync_site_posts(session: AsyncSession, *, site_id: str, limit: int = 100) -> dict[str, Any]:
@@ -74,9 +74,10 @@ async def list_posts(
 
 
 async def fetch_site_posts(site: dict[str, Any], *, limit: int = 100) -> list[dict[str, Any]]:
-    if (site.get("site_type") or "").lower() == "wp":
-        return await _fetch_wp_posts(site, limit=limit)
-    return await _fetch_openapi_posts(site, limit=limit)
+    connector = connector_for_site(site, dry_run=True)
+    items = await connector.read_articles(limit=limit)
+    normalizer = _normalize_wp if connector.connector_type == "wordpress" else _normalize_openapi
+    return [normalizer(item) for item in items]
 
 
 async def _load_site(session: AsyncSession, site_id: str) -> dict[str, Any] | None:
@@ -90,55 +91,6 @@ async def _load_site(session: AsyncSession, site_id: str) -> dict[str, Any] | No
         )
     ).mappings().first()
     return dict(row) if row else None
-
-
-async def _fetch_wp_posts(site: dict[str, Any], *, limit: int) -> list[dict[str, Any]]:
-    base = (site.get("base_url") or site.get("domain") or "").rstrip("/")
-    if base and not base.startswith(("http://", "https://")):
-        base = f"https://{base}"
-    cfg = site.get("api_config") or {}
-    headers = {}
-    if cfg.get("username") and cfg.get("applicationPassword"):
-        token = base64.b64encode(f"{cfg['username']}:{cfg['applicationPassword']}".encode()).decode("ascii")
-        headers["Authorization"] = f"Basic {token}"
-    data = await request_json(
-        "GET",
-        f"{base}/wp-json/wp/v2/posts",
-        client_label="site_posts_wp",
-        params={"per_page": min(limit, 100), "page": 1, "status": "publish,draft", "_embed": 1},
-        headers=headers,
-        timeout=60,
-    )
-    items = data if isinstance(data, list) else data.get("items") or data.get("posts") or []
-    return [_normalize_wp(p) for p in items[:limit] if isinstance(p, dict)]
-
-
-async def _fetch_openapi_posts(site: dict[str, Any], *, limit: int) -> list[dict[str, Any]]:
-    base = (site.get("api_base_url") or site.get("base_url") or "").rstrip("/")
-    cfg = site.get("api_config") or {}
-    headers = _openapi_headers(cfg)
-    if not base or not headers:
-        raise ExternalCallError("site post sync missing api_base_url or auth")
-    data = await request_json(
-        "GET",
-        f"{base}/articles",
-        client_label="site_posts_openapi",
-        params={"limit": min(limit, 100)},
-        headers=headers,
-        timeout=60,
-    )
-    items = data if isinstance(data, list) else data.get("items") or data.get("articles") or data.get("data") or []
-    return [_normalize_openapi(p) for p in items[:limit] if isinstance(p, dict)]
-
-
-def _openapi_headers(cfg: dict[str, Any]) -> dict[str, str]:
-    if cfg.get("openApiKey"):
-        return {"openApiKey": cfg["openApiKey"]}
-    if cfg.get("tokenB"):
-        return {"token": cfg["tokenB"]}
-    if cfg.get("tokenA"):
-        return {"token": cfg["tokenA"]}
-    return {}
 
 
 def _normalize_wp(p: dict[str, Any]) -> dict[str, Any]:

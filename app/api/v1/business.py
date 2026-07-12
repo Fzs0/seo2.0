@@ -8,9 +8,11 @@ from typing import Any
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.clients.image_provider import search_images
+from app.clients.publishers import connector_for_site
 from app.clients.serpapi import fetch_google_serp
 from app.core.database import get_db
 from app.services.article_service import (
@@ -257,6 +259,26 @@ async def list_posts_route(
     session: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
     return await list_posts(session, site_id=site_id, limit=limit, offset=offset)
+
+
+@router.get("/sites/{site_id}/connector")
+async def inspect_site_connector_route(
+    site_id: str,
+    session: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    row = await session.execute(
+        text(
+            "SELECT id, site_key, name, site_type, domain, base_url, api_base_url, api_config "
+            "FROM seo_agent.sites WHERE id = CAST(:id AS uuid)"
+        ),
+        {"id": site_id},
+    )
+    site = row.mappings().first()
+    if not site:
+        raise HTTPException(status_code=404, detail="site not found")
+    connector = connector_for_site(dict(site), dry_run=True)
+    result = await connector.check_connection()
+    return {"site_id": site_id, "site_name": site["name"], **result}
 
 
 class SyncPostsBody(BaseModel):

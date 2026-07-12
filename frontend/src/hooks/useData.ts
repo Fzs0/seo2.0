@@ -328,6 +328,18 @@ export function syncSitePosts(siteId: string, limit = 100) {
   )
 }
 
+export function testSiteConnector(siteId: string) {
+  return getJson<{
+    site_id: string
+    site_name: string
+    ok: boolean
+    connector_type: string
+    capabilities: string[]
+    sample_count?: number
+    error?: string
+  }>(`/api/v1/sites/${encodeURIComponent(siteId)}/connector`, new AbortController().signal)
+}
+
 export function upsertSite(payload: Record<string, unknown>) {
   return postJson<Site>('/api/v1/sites', payload)
 }
