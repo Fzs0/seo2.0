@@ -151,6 +151,22 @@ export function useArticles(refreshKey = 0): AsyncState<Article[]> {
   return state
 }
 
+export function getArticleDetail(articleId: string) {
+  return getJson<{
+    id: string
+    title: string
+    status: string
+    serp_snapshot_id?: string | null
+    brief_md?: string | null
+    content_md?: string | null
+    content_html?: string | null
+    article_parts?: Record<string, unknown> | null
+    qa_checklist?: Array<{ key: string; ok: boolean }> | null
+    generation_model?: string | null
+    primary_keyword?: string | null
+  }>(`/api/v1/articles/${encodeURIComponent(articleId)}`, new AbortController().signal)
+}
+
 export function usePosts(refreshKey = 0, siteId?: string): AsyncState<Post[]> {
   const [state, setState] = useState<AsyncState<Post[]>>({ data: null, loading: true, error: null })
 

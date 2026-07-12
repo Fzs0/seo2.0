@@ -1,6 +1,7 @@
 import { useState } from 'react'
+import { ArticleResultDialog, type ArticleResultData } from '@/components/ArticleResultDialog'
 import { DataGuard } from '@/components/StateBlock'
-import { syncAllPosts, syncSitePosts, useArticles, usePosts, useSites } from '@/hooks/useData'
+import { getArticleDetail, syncAllPosts, syncSitePosts, useArticles, usePosts, useSites } from '@/hooks/useData'
 
 function formatDate(iso?: string | null) {
   if (!iso) return '—'
@@ -14,6 +15,8 @@ export function ArticlesPage() {
   const [syncing, setSyncing] = useState(false)
   const [selectedSiteId, setSelectedSiteId] = useState('')
   const [message, setMessage] = useState<string>()
+  const [openingArticleId, setOpeningArticleId] = useState<string>()
+  const [selectedArticle, setSelectedArticle] = useState<ArticleResultData | null>(null)
   const articles = useArticles(refreshKey)
   const sites = useSites()
   const posts = usePosts(refreshKey, selectedSiteId || undefined)
@@ -47,6 +50,32 @@ export function ArticlesPage() {
       setMessage(error instanceof Error ? error.message : '同步失败')
     } finally {
       setSyncing(false)
+    }
+  }
+
+  async function handleOpenArticle(articleId: string) {
+    if (openingArticleId) return
+    setOpeningArticleId(articleId)
+    try {
+      const detail = await getArticleDetail(articleId)
+      const parts = detail.article_parts || {}
+      setSelectedArticle({
+        status: detail.status,
+        steps: [],
+        article: { id: detail.id, title: detail.title, status: detail.status },
+        brief: { source: 'saved', text: detail.brief_md || '' },
+        outline: typeof parts.outline === 'string' ? parts.outline : '',
+        content: detail.content_md || detail.content_html || '',
+        savedTo: { table: 'seo_agent.articles', articleId: detail.id },
+        serp: { id: detail.serp_snapshot_id, source: detail.serp_snapshot_id ? 'saved' : undefined, status: detail.serp_snapshot_id ? 'available' : 'not-loaded' },
+        qa: detail.qa_checklist || [],
+        model: detail.generation_model || undefined,
+        contentLength: (detail.content_md || detail.content_html || '').length,
+      })
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : '文章详情读取失败')
+    } finally {
+      setOpeningArticleId(undefined)
     }
   }
 
@@ -94,6 +123,7 @@ export function ArticlesPage() {
                 <th>关键词</th>
                 <th>模型</th>
                 <th>创建时间</th>
+                <th>操作</th>
               </tr>
             </thead>
             <tbody>
@@ -108,6 +138,11 @@ export function ArticlesPage() {
                   <td style={{ color: 'var(--ink-500)', fontSize: 12 }}>{article.primary_keyword || article.keyword_id || '—'}</td>
                   <td style={{ color: 'var(--ink-500)', fontSize: 12 }}>{article.generation_model || '—'}</td>
                   <td style={{ color: 'var(--ink-500)', fontSize: 12 }}>{formatDate(article.created_at)}</td>
+                  <td>
+                    <button className="btn btn--ghost btn--xs" type="button" onClick={() => void handleOpenArticle(article.id)} disabled={openingArticleId === article.id}>
+                      {openingArticleId === article.id ? '读取中…' : '查看全文'}
+                    </button>
+                  </td>
                 </tr>
               ))}
             </tbody>
@@ -156,6 +191,8 @@ export function ArticlesPage() {
           </table>
         </DataGuard>
       </div>
+
+      {selectedArticle && <ArticleResultDialog result={selectedArticle} onClose={() => setSelectedArticle(null)} />}
     </section>
   )
 }
