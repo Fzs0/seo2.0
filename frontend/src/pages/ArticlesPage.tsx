@@ -111,7 +111,7 @@ export function ArticlesPage() {
     <section className="page" data-screen-label="文章管理">
       <div>
         <h1>文章管理</h1>
-        <p>这里展示从各站点 API 同步回来的已存在文章，数据落在 <code>seo_agent.posts</code>。</p>
+        <p>这里展示 AI 生成稿及其目标发布站点；下方列表展示从各站点 API 同步回来的已有文章。</p>
         {message && <p>{message}</p>}
       </div>
 
@@ -147,6 +147,7 @@ export function ArticlesPage() {
               <tr>
                 <th style={{ width: 36 }}>#</th>
                 <th>生成稿标题</th>
+                <th>目标站点</th>
                 <th>状态</th>
                 <th>关键词</th>
                 <th>模型</th>
@@ -161,6 +162,10 @@ export function ArticlesPage() {
                   <td>
                     <div className="tbl-strong">{article.title}</div>
                     <div style={{ fontSize: 11, color: 'var(--ink-400)', marginTop: 2 }}>{article.id}</div>
+                  </td>
+                  <td>
+                    <span className="tag tag--blue">{article.site_label || sites.data?.find((site) => site.id === article.site_id)?.name || '未分配站点'}</span>
+                    <div style={{ marginTop: 4, color: 'var(--ink-400)', fontSize: 11 }}>{article.site_id || '需要人工选择'}</div>
                   </td>
                   <td><span className="tag tag--green">{article.status}</span></td>
                   <td style={{ color: 'var(--ink-500)', fontSize: 12 }}>{article.primary_keyword || article.keyword_id || '—'}</td>
