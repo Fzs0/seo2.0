@@ -38,6 +38,7 @@ from app.services.keyword_service import (
     import_and_analyze_file,
 )
 from app.services.keyword_ai_service import analyze_keyword_strategy
+from app.services.strategy_service import generate_strategies, list_strategies, review_strategy
 from app.clients.ai_provider import generate_ai_content, is_stage_configured
 from app.services.article_generation_service import generate_article_from_keyword, generate_article_pipeline
 
@@ -167,6 +168,43 @@ async def ai_analyze_keywords(body: KeywordAiAnalyzeBody, session: AsyncSession 
         limit=body.limit,
         opportunity_type=body.opportunityType,
     )
+
+
+class StrategyGenerateBody(BaseModel):
+    siteId: str | None = None
+    limit: int = 20
+    minImpressions: int = 20
+
+
+class StrategyReviewBody(BaseModel):
+    approved: bool
+
+
+@router.post("/workflow/strategies/generate")
+async def generate_strategy_tasks(body: StrategyGenerateBody, session: AsyncSession = Depends(get_db)) -> dict[str, Any]:
+    return await generate_strategies(
+        session,
+        site_id=body.siteId,
+        limit=body.limit,
+        min_impressions=body.minImpressions,
+    )
+
+
+@router.get("/workflow/strategies")
+async def get_strategy_tasks(
+    status: str = "pending",
+    limit: int = 50,
+    session: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    return {"items": await list_strategies(session, status=status, limit=limit)}
+
+
+@router.post("/workflow/strategies/{task_id}/review")
+async def review_strategy_task(task_id: str, body: StrategyReviewBody, session: AsyncSession = Depends(get_db)) -> dict[str, Any]:
+    try:
+        return await review_strategy(session, task_id=task_id, approved=body.approved)
+    except ValueError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
 
 
 # ---------- Brief / Prompt / Article ----------

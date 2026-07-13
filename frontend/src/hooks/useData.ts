@@ -318,6 +318,52 @@ export function analyzeKeywordStrategy(keywordIds: string[], limit?: number, opp
   })
 }
 
+export interface StrategyTask {
+  id: string
+  status: 'pending' | 'approved' | 'rejected' | string
+  priority: string
+  score: number
+  site_id?: string | null
+  site_name?: string | null
+  keyword_id?: string | null
+  article_id?: string | null
+  title: string
+  strategy_type: 'update_article' | 'new_article' | string
+  query: string
+  confidence: number
+  evidence_level: 'confirmed' | 'directional' | 'insufficient' | string
+  reason: string
+  recommended_action: string
+  evidence: { gsc?: Record<string, number>; ga4?: Record<string, number> }
+  execution_task_id?: string
+  created_at?: string
+}
+
+export function generateSeoStrategies(siteId?: string, limit = 20, minImpressions = 20) {
+  return postJson<{ items: StrategyTask[]; created: number; candidates: number }>('/api/v1/workflow/strategies/generate', {
+    siteId,
+    limit,
+    minImpressions,
+  })
+}
+
+export function useStrategies(refreshKey = 0, status = 'pending'): AsyncState<StrategyTask[]> {
+  const [state, setState] = useState<AsyncState<StrategyTask[]>>({ data: null, loading: true, error: null })
+  useEffect(() => {
+    const controller = new AbortController()
+    setState({ data: null, loading: true, error: null })
+    void getJson<{ items: StrategyTask[] }>(`/api/v1/workflow/strategies?status=${encodeURIComponent(status)}&limit=50`, controller.signal)
+      .then((result) => { if (!controller.signal.aborted) setState({ data: result.items, loading: false, error: null }) })
+      .catch((error) => { if (!controller.signal.aborted) setState({ data: null, loading: false, error: error instanceof Error ? error.message : '无法加载策略审核队列' }) })
+    return () => controller.abort()
+  }, [refreshKey, status])
+  return state
+}
+
+export function reviewSeoStrategy(taskId: string, approved: boolean) {
+  return postJson<{ ok: boolean; status: string; execution_task_id?: string }>(`/api/v1/workflow/strategies/${encodeURIComponent(taskId)}/review`, { approved })
+}
+
 export interface SerpSearchResult {
   configured: boolean
   keyword: string

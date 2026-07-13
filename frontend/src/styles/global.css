@@ -2799,8 +2799,21 @@ input[type='range']::-moz-range-thumb {
 .agent-drawer-section h3 { margin: 0 0 7px; font-size: 12px; }
 .agent-drawer-section p { margin: 0; color: var(--ink-500); font-size: 12px; line-height: 1.7; }
 .agent-drawer-actions { display: flex; gap: 8px; margin-top: 18px; }
+.strategy-review-card { display: grid; gap: 12px; }
+.strategy-review-card__toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; }
+.strategy-review-card__message { color: var(--ink-500); font-size: 12px; }
+.strategy-review-card__error { padding: 10px; border-radius: 9px; background: var(--pink-100); color: var(--pink-700); font-size: 12px; }
+.strategy-review-list { display: grid; gap: 10px; }
+.strategy-review-item { display: flex; align-items: flex-start; justify-content: space-between; gap: 14px; padding: 13px; border: 1px solid var(--border-soft); border-radius: 12px; background: var(--bg-elev); }
+.strategy-review-item__main { min-width: 0; display: grid; gap: 6px; }
+.strategy-review-item__head { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+.strategy-review-item__head strong { color: var(--ink-900); font-size: 13px; }
+.strategy-review-item__meta, .strategy-review-item__reason, .strategy-review-item__action { color: var(--ink-500); font-size: 11px; line-height: 1.55; }
+.strategy-review-item__action { color: var(--ink-700); }
+.strategy-review-item__actions { display: flex; flex: none; gap: 7px; }
 @media (max-width: 1100px) { .agent-kpi-row { grid-template-columns: repeat(2, 1fr); } .agent-main-grid, .agent-section-grid { grid-template-columns: 1fr; } .agent-asset-grid { grid-template-columns: repeat(2, 1fr); } }
 @media (max-width: 700px) { .agent-heading-actions { width: 100%; align-items: stretch; } .agent-heading-actions .select-control { flex: 1; } .agent-asset-grid { grid-template-columns: 1fr; } }
+@media (max-width: 700px) { .strategy-review-item { flex-direction: column; } .strategy-review-item__actions { width: 100%; } .strategy-review-item__actions button { flex: 1; } }
 
 /* generated article result dialog */
 .article-dialog-backdrop { position: fixed; inset: 0; z-index: 50; display: grid; place-items: center; padding: 24px; background: rgba(23, 22, 20, .42); }

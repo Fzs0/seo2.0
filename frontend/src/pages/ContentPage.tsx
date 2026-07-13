@@ -1,7 +1,7 @@
 import { useState, type ReactNode } from 'react'
 import { BarDecor } from '@/components/Charts'
 import { DataGuard } from '@/components/StateBlock'
-import { publishArticle, runArticlePipeline, useKeywords, usePosts, useSites, type PipelineStep } from '@/hooks/useData'
+import { generateSeoStrategies, publishArticle, reviewSeoStrategy, runArticlePipeline, useKeywords, usePosts, useSites, useStrategies, type PipelineStep } from '@/hooks/useData'
 import { ArticleResultDialog, type ArticleResultData } from '@/components/ArticleResultDialog'
 import type { Keyword } from '@/types/domain'
 
@@ -47,9 +47,14 @@ export function ContentPage({ onNotify }: { onNotify?: (title: string, detail?: 
   const [selectedSiteId, setSelectedSiteId] = useState('')
   const [publishing, setPublishing] = useState(false)
   const [publishMessage, setPublishMessage] = useState<string>()
+  const [strategyRefreshKey, setStrategyRefreshKey] = useState(0)
+  const [strategyRunning, setStrategyRunning] = useState(false)
+  const [strategyReviewing, setStrategyReviewing] = useState<string | null>(null)
+  const [strategyMessage, setStrategyMessage] = useState<string>()
   const keywords = useKeywords(refreshKey)
   const posts = usePosts()
   const sites = useSites()
+  const strategies = useStrategies(strategyRefreshKey)
   const loading = keywords.loading || posts.loading
   const error = keywords.error || posts.error || sites.error
   const kw = keywords.data ?? []
@@ -67,6 +72,37 @@ export function ContentPage({ onNotify }: { onNotify?: (title: string, detail?: 
   const directions = candidates.slice(0, 3)
   const publishSites = (sites.data ?? []).filter((site) => site.status === 'active')
   const targetSiteId = selectedSiteId || lastResult?.article?.site_id || generatedSiteId || publishSites.find((site) => site.publish_ready)?.id || publishSites[0]?.id || ''
+
+  async function handleGenerateStrategies() {
+    if (strategyRunning) return
+    setStrategyRunning(true)
+    setStrategyMessage('正在读取 GSC / GA4 数据并生成策略…')
+    try {
+      const result = await generateSeoStrategies(undefined, 20, 20)
+      setStrategyMessage(`策略生成完成：新增 ${result.created} 条，候选 ${result.candidates} 条。`)
+      setStrategyRefreshKey((key) => key + 1)
+      onNotify?.('SEO 策略生成完成', `新增 ${result.created} 条待审核策略`)
+    } catch (error) {
+      setStrategyMessage(error instanceof Error ? error.message : '策略生成失败')
+    } finally {
+      setStrategyRunning(false)
+    }
+  }
+
+  async function handleReviewStrategy(taskId: string, approved: boolean) {
+    if (strategyReviewing) return
+    setStrategyReviewing(taskId)
+    try {
+      const result = await reviewSeoStrategy(taskId, approved)
+      setStrategyMessage(approved ? `策略已通过，执行任务 ${result.execution_task_id || '已入队'}。` : '策略已驳回。')
+      setStrategyRefreshKey((key) => key + 1)
+      if (approved) setRefreshKey((key) => key + 1)
+    } catch (error) {
+      setStrategyMessage(error instanceof Error ? error.message : '策略审核失败')
+    } finally {
+      setStrategyReviewing(null)
+    }
+  }
 
   async function handleGenerateOne() {
     const keyword = queue[0]
@@ -139,6 +175,45 @@ export function ContentPage({ onNotify }: { onNotify?: (title: string, detail?: 
         <div>
           <h1>内容策略</h1>
           <p>基于真实关键词库、AI 策略结果和已同步站点文章，整理内容生产方向。</p>
+        </div>
+
+        <div className="card strategy-review-card">
+          <div className="card__title">
+            <span>SEO 策略审核</span>
+            <span className="tag tag--blue">GSC / GA4 真实数据</span>
+          </div>
+          <div className="strategy-review-card__toolbar">
+            <button className="btn btn--primary" type="button" onClick={() => void handleGenerateStrategies()} disabled={strategyRunning}>
+              <span className="msr">{strategyRunning ? 'progress_activity' : 'auto_awesome'}</span>
+              {strategyRunning ? '生成中…' : '根据数据生成策略'}
+            </button>
+            <span className="btn-caption">低于 20 次展示的数据只作为低置信度建议，不自动执行。</span>
+          </div>
+          {strategyMessage && <div className="strategy-review-card__message">{strategyMessage}</div>}
+          {strategies.loading && <div className="agent-empty">正在加载待审核策略…</div>}
+          {!strategies.loading && strategies.error && <div className="strategy-review-card__error">{strategies.error}</div>}
+          {!strategies.loading && !strategies.error && !(strategies.data || []).length && <div className="agent-empty">暂无待审核策略。点击上方按钮读取真实数据。</div>}
+          {!!strategies.data?.length && (
+            <div className="strategy-review-list">
+              {strategies.data.map((strategy) => (
+                <div className="strategy-review-item" key={strategy.id}>
+                  <div className="strategy-review-item__main">
+                    <div className="strategy-review-item__head">
+                      <span className={`tag tag--${strategy.strategy_type === 'update_article' ? 'green' : 'gold'}`}>{strategy.strategy_type === 'update_article' ? '优化已有文章' : '生成新文章'}</span>
+                      <strong>{strategy.title}</strong>
+                    </div>
+                    <div className="strategy-review-item__meta">站点：{strategy.site_name || '未分配'} · 关键词：{strategy.query} · {strategy.priority} · 置信度 {Math.round(strategy.confidence * 100)}%</div>
+                    <div className="strategy-review-item__reason">{strategy.reason}</div>
+                    <div className="strategy-review-item__action">建议：{strategy.recommended_action}</div>
+                  </div>
+                  <div className="strategy-review-item__actions">
+                    <button className="btn btn--primary btn--xs" type="button" disabled={strategyReviewing === strategy.id} onClick={() => void handleReviewStrategy(strategy.id, true)}>通过并入队</button>
+                    <button className="btn btn--ghost btn--xs" type="button" disabled={strategyReviewing === strategy.id} onClick={() => void handleReviewStrategy(strategy.id, false)}>驳回</button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
         </div>
 
         <DataGuard loading={loading} error={error} empty={!kw.length} emptyTitle="暂无内容策略数据" emptyHint="请先导入关键词并运行 AI 分析策略">
