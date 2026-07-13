@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { ArticleResultDialog, type ArticleResultData } from '@/components/ArticleResultDialog'
 import { DataGuard } from '@/components/StateBlock'
-import { getArticleDetail, syncAllPosts, syncSitePosts, useArticles, usePosts, useSites } from '@/hooks/useData'
+import { getArticleDetail, publishArticle, syncAllPosts, syncSitePosts, useArticles, usePosts, useSites } from '@/hooks/useData'
 
 function formatDate(iso?: string | null) {
   if (!iso) return '—'
@@ -17,9 +17,13 @@ export function ArticlesPage() {
   const [message, setMessage] = useState<string>()
   const [openingArticleId, setOpeningArticleId] = useState<string>()
   const [selectedArticle, setSelectedArticle] = useState<ArticleResultData | null>(null)
+  const [articleTargetSiteId, setArticleTargetSiteId] = useState('')
+  const [publishing, setPublishing] = useState(false)
+  const [publishMessage, setPublishMessage] = useState<string>()
   const articles = useArticles(refreshKey)
   const sites = useSites()
   const posts = usePosts(refreshKey, selectedSiteId || undefined)
+  const publishSites = (sites.data ?? []).filter((site) => site.status === 'active')
 
   async function handleSyncSelected() {
     if (!selectedSiteId || syncing) return
@@ -59,10 +63,15 @@ export function ArticlesPage() {
     try {
       const detail = await getArticleDetail(articleId)
       const parts = detail.article_parts || {}
+      const defaultSiteId = detail.site_id && publishSites.some((site) => site.id === detail.site_id)
+        ? detail.site_id
+        : publishSites.find((site) => site.publish_ready)?.id || publishSites[0]?.id || ''
+      setArticleTargetSiteId(defaultSiteId)
+      setPublishMessage(undefined)
       setSelectedArticle({
         status: detail.status,
         steps: [],
-        article: { id: detail.id, title: detail.title, status: detail.status },
+        article: { id: detail.id, site_id: detail.site_id, title: detail.title, status: detail.status },
         brief: { source: 'saved', text: detail.brief_md || '' },
         outline: typeof parts.outline === 'string' ? parts.outline : '',
         content: detail.content_md || detail.content_html || '',
@@ -76,6 +85,25 @@ export function ArticlesPage() {
       setMessage(error instanceof Error ? error.message : '文章详情读取失败')
     } finally {
       setOpeningArticleId(undefined)
+    }
+  }
+
+  async function handlePublish(dryRun: boolean) {
+    const articleId = selectedArticle?.article?.id
+    if (!articleId || publishing) return
+    setPublishing(true)
+    setPublishMessage(dryRun ? '正在执行发布预检…' : '正在发布文章…')
+    try {
+      const result = await publishArticle(articleId, articleTargetSiteId, dryRun)
+      setPublishMessage(result.ok ? (dryRun ? `预检通过：${result.url || '可以发布'}` : `发布成功：${result.url || result.post_id || '已发布'}`) : `发布失败：${result.error || '未知错误'}`)
+      if (result.ok) {
+        setSelectedArticle((current) => current ? { ...current, status: dryRun ? 'approved' : 'published', article: current.article ? { ...current.article, status: dryRun ? 'approved' : 'published', site_id: articleTargetSiteId } : current.article } : current)
+        if (!dryRun) setRefreshKey((key) => key + 1)
+      }
+    } catch (error) {
+      setPublishMessage(error instanceof Error ? error.message : '发布失败')
+    } finally {
+      setPublishing(false)
     }
   }
 
@@ -140,7 +168,7 @@ export function ArticlesPage() {
                   <td style={{ color: 'var(--ink-500)', fontSize: 12 }}>{formatDate(article.created_at)}</td>
                   <td>
                     <button className="btn btn--ghost btn--xs" type="button" onClick={() => void handleOpenArticle(article.id)} disabled={openingArticleId === article.id}>
-                      {openingArticleId === article.id ? '读取中…' : '查看全文'}
+                      {openingArticleId === article.id ? '读取中…' : '查看并发布'}
                     </button>
                   </td>
                 </tr>
@@ -192,7 +220,18 @@ export function ArticlesPage() {
         </DataGuard>
       </div>
 
-      {selectedArticle && <ArticleResultDialog result={selectedArticle} onClose={() => setSelectedArticle(null)} />}
+      {selectedArticle && (
+        <ArticleResultDialog
+          result={selectedArticle}
+          onClose={() => setSelectedArticle(null)}
+          publishSites={publishSites}
+          targetSiteId={articleTargetSiteId}
+          onSiteChange={setArticleTargetSiteId}
+          publishing={publishing}
+          publishMessage={publishMessage}
+          onPublish={handlePublish}
+        />
+      )}
     </section>
   )
 }

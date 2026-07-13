@@ -154,6 +154,7 @@ export function useArticles(refreshKey = 0): AsyncState<Article[]> {
 export function getArticleDetail(articleId: string) {
   return getJson<{
     id: string
+    site_id?: string | null
     title: string
     status: string
     serp_snapshot_id?: string | null
