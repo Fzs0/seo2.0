@@ -41,7 +41,7 @@ async def save_article(session: AsyncSession, payload: dict[str, Any]) -> dict[s
           content_md = EXCLUDED.content_md,
           status = EXCLUDED.status,
           updated_at = now()
-        RETURNING id, title, status, created_at
+        RETURNING id, site_id, title, status, created_at
         """
     )
     # 注意：v1 articles 表在 task_id 上有 FK，但 ON CONFLICT 用 task_id 风险大
@@ -67,7 +67,7 @@ async def save_article(session: AsyncSession, payload: dict[str, Any]) -> dict[s
            CAST(:references_plan AS jsonb), CAST(:qa_checklist AS jsonb),
            :generation_provider, :generation_model, CAST(:raw_ai_response AS jsonb))
         ON CONFLICT DO NOTHING
-        RETURNING id, title, status, created_at
+        RETURNING id, site_id, title, status, created_at
         """
     )
     params = {

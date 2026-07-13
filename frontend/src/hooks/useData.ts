@@ -413,7 +413,7 @@ export async function runArticlePipeline(keyword: Keyword) {
   return postJson<{
     status: 'done' | 'failed'
     steps: PipelineStep[]
-    article?: { id: string; title: string; status: string }
+    article?: { id: string; site_id?: string | null; title: string; status: string }
     brief?: { source?: string; aiEnhanced?: boolean; aiMeta?: Record<string, unknown>; text?: string }
     outline?: string
     content?: string

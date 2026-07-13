@@ -5,7 +5,7 @@ import type { Site } from '@/types/domain'
 export type ArticleResultData = {
   status?: 'done' | 'failed' | string
   steps: PipelineStep[]
-  article?: { id: string; title: string; status: string }
+  article?: { id: string; site_id?: string | null; title: string; status: string }
   brief?: { source?: string; aiEnhanced?: boolean; aiMeta?: Record<string, unknown>; text?: string }
   outline?: string
   content?: string
@@ -121,6 +121,7 @@ export function ArticleResultDialog({
         <div className="article-dialog__foot">
           {onPublish && (
             <>
+              <span className="article-dialog__target-site">目标站点：{publishSites.find((site) => site.id === targetSiteId)?.name || '未分配'}</span>
               <select className="input" value={targetSiteId} onChange={(event) => onSiteChange?.(event.target.value)} aria-label="选择发布站点">
                 <option value="">选择发布站点</option>
                 {publishSites.map((site) => (

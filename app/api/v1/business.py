@@ -396,7 +396,7 @@ async def get_product_route(
 
 class PublishBody(BaseModel):
     article_id: str
-    site_id: str
+    site_id: str | None = None
     dry_run: bool = True
     actor: str | None = None
 

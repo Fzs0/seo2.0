@@ -43,6 +43,7 @@ export function ContentPage({ onNotify }: { onNotify?: (title: string, detail?: 
   const [steps, setSteps] = useState<PipelineStep[]>([])
   const [lastResult, setLastResult] = useState<ArticleResultData | null>(null)
   const [showResult, setShowResult] = useState(false)
+  const [generatedSiteId, setGeneratedSiteId] = useState('')
   const [selectedSiteId, setSelectedSiteId] = useState('')
   const [publishing, setPublishing] = useState(false)
   const [publishMessage, setPublishMessage] = useState<string>()
@@ -65,7 +66,7 @@ export function ContentPage({ onNotify }: { onNotify?: (title: string, detail?: 
   const reviewCount = kw.filter((k) => k.priority === 'Hold' || k.status === 'hold' || k.content_action === 'manual_parent_review').length
   const directions = candidates.slice(0, 3)
   const publishSites = (sites.data ?? []).filter((site) => site.status === 'active')
-  const targetSiteId = selectedSiteId || publishSites.find((site) => site.publish_ready)?.id || publishSites[0]?.id || ''
+  const targetSiteId = selectedSiteId || lastResult?.article?.site_id || generatedSiteId || publishSites.find((site) => site.publish_ready)?.id || publishSites[0]?.id || ''
 
   async function handleGenerateOne() {
     const keyword = queue[0]
@@ -73,6 +74,8 @@ export function ContentPage({ onNotify }: { onNotify?: (title: string, detail?: 
     setGenerating(true)
     setLastResult(null)
     setShowResult(false)
+    setSelectedSiteId('')
+    setGeneratedSiteId(keyword.assigned_site_id || '')
     setMessage(`正在执行完整生文链路：${keyword.keyword}`)
     setSteps([
       { key: 'keyword', label: '读取关键词', status: 'running' },
@@ -86,6 +89,7 @@ export function ContentPage({ onNotify }: { onNotify?: (title: string, detail?: 
     try {
       const saved = await runArticlePipeline(keyword)
       setLastResult(saved)
+      setGeneratedSiteId(saved.article?.site_id || keyword.assigned_site_id || '')
       setSteps(saved.steps)
       if (saved.status === 'failed') {
         const failed = saved.steps.find((item) => item.status === 'failed')
@@ -237,6 +241,7 @@ export function ContentPage({ onNotify }: { onNotify?: (title: string, detail?: 
                 查看完整生成结果
                 <span className="msr">open_in_full</span>
               </button>
+              <div className="btn-caption">目标站点：{publishSites.find((site) => site.id === targetSiteId)?.name || '未分配'}</div>
               <select className="chip" value={targetSiteId} onChange={(event) => setSelectedSiteId(event.target.value)}>
                 {publishSites.map((site) => (
                   <option key={site.id} value={site.id}>

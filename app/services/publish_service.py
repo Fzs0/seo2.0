@@ -27,7 +27,7 @@ async def publish_article(
     session: AsyncSession,
     *,
     article_id: str,
-    site_id: str,
+    site_id: str | None,
     dry_run: bool = True,
     actor: str = "publish_api",
 ) -> dict[str, Any]:
@@ -35,7 +35,7 @@ async def publish_article(
     a = (
         await session.execute(
             text(
-                "SELECT id, title, slug, target_url, status, content_md, meta_title, meta_description, "
+                "SELECT id, site_id, title, slug, target_url, status, content_md, meta_title, meta_description, "
                 "primary_keyword, language_code, market, published_post_id, published_url, published_at "
                 "FROM seo_agent.articles WHERE id = CAST(:id AS uuid)"
             ),
@@ -47,21 +47,25 @@ async def publish_article(
     if not a["content_md"]:
         raise PublishError(f"article id={article_id} has empty content_md")
 
+    target_site_id = site_id or a["site_id"]
+    if not target_site_id:
+        raise PublishError(f"article id={article_id} has no assigned site")
+
     s = (
         await session.execute(
             text(
                 "SELECT id, site_key, name, site_type, domain, base_url, api_base_url, status, api_config, content_role "
                 "FROM seo_agent.sites WHERE id = CAST(:id AS uuid)"
             ),
-            {"id": site_id},
+            {"id": target_site_id},
         )
     ).mappings().first()
     if not s:
-        raise PublishError(f"site id={site_id} not found")
+        raise PublishError(f"site id={target_site_id} not found")
     if s["status"] != "active":
-        raise PublishError(f"site id={site_id} is not active (status={s['status']})")
+        raise PublishError(f"site id={target_site_id} is not active (status={s['status']})")
     if not dry_run and not s["api_config"]:
-        raise PublishError(f"site id={site_id} has empty api_config")
+        raise PublishError(f"site id={target_site_id} has empty api_config")
 
     req = PublishRequest(
         title=a["title"] or a["slug"] or "untitled",
@@ -103,7 +107,7 @@ async def publish_article(
             ),
             {
                 "status": "done" if result.ok else "failed",
-                "site_id": site_id,
+                "site_id": target_site_id,
                 "article_id": article_id,
                 "target_url": result.url or a["target_url"] or "",
                 "title": f"publish article {article_id} -> {s['site_key']}",
@@ -133,7 +137,7 @@ async def publish_article(
                 """
             ),
             {
-                "site_id": site_id,
+                "site_id": target_site_id,
                 "post_id": result.post_id or "",
                 "url": result.url or "",
                 "ts": datetime.utcnow(),
@@ -148,7 +152,7 @@ async def publish_article(
                 "SET site_id = CAST(:site_id AS uuid), status = 'approved', updated_at = now() "
                 "WHERE id = CAST(:id AS uuid)"
             ),
-            {"site_id": site_id, "id": article_id},
+            {"site_id": target_site_id, "id": article_id},
         )
 
     await session.commit()
@@ -162,7 +166,7 @@ async def publish_article(
         "raw": result.raw,
         "task_id": task_id,
         "article_id": article_id,
-        "site_id": site_id,
+        "site_id": target_site_id,
     }
 
 

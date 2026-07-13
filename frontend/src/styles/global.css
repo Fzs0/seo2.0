@@ -2845,6 +2845,7 @@ input[type='range']::-moz-range-thumb {
 .article-dialog__info-item strong { word-break: break-word; line-height: 1.5; }
 .article-dialog__foot { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; padding: 14px 24px; border-top: 1px solid var(--border-soft); }
 .article-dialog__foot .input { min-width: 220px; flex: 1; }
+.article-dialog__target-site { color: var(--ink-500); font-size: 12px; white-space: nowrap; }
 .article-dialog__publish-message { flex-basis: 100%; color: var(--ink-500); font-size: 12px; }
 @media (max-width: 760px) {
   .article-dialog-backdrop { padding: 10px; }
