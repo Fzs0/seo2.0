@@ -11,35 +11,19 @@ interface NavSection {
 
 const navSections: NavSection[] = [
   {
+    label: '日常工作',
     items: [
-      { id: 'agent-command', label: '总控台', icon: 'space_dashboard' },
-      { id: 'agent-assets', label: '资产地图', icon: 'map' },
-      { id: 'agent-opportunities', label: '机会引擎', icon: 'auto_awesome' },
+      { id: 'content', label: '今日策略', icon: 'task_alt' },
+      { id: 'keywords', label: '关键词', icon: 'key' },
+      { id: 'articles', label: '文章', icon: 'article' },
+      { id: 'main-site-content', label: '主站内容', icon: 'storefront' },
+      { id: 'analytics', label: '数据复盘', icon: 'monitoring' },
     ],
   },
   {
-    label: '执行中心',
+    label: '设置',
     items: [
-      { id: 'agent-execution', label: '执行管线', icon: 'route' },
-      { id: 'agent-review', label: '数据复盘', icon: 'monitoring' },
-    ],
-  },
-  {
-    label: '治理与知识',
-    items: [
-      { id: 'agent-risk', label: '风险治理', icon: 'shield' },
-      { id: 'rules', label: '知识系统', icon: 'menu_book' },
-    ],
-  },
-  {
-    label: '操作工具',
-    items: [
-      { id: 'keywords', label: '关键词库', icon: 'key' },
-      { id: 'serp', label: 'SERP 洞察', icon: 'search' },
-      { id: 'content', label: '内容生产', icon: 'edit_note' },
-      { id: 'articles', label: '文章管理', icon: 'article' },
-      { id: 'sites', label: '站点管理', icon: 'domain' },
-      { id: 'sync', label: '同步状态', icon: 'sync' },
+      { id: 'sites', label: '站点', icon: 'domain' },
     ],
   },
 ]

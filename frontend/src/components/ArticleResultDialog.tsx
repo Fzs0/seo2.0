@@ -5,7 +5,18 @@ import type { Site } from '@/types/domain'
 export type ArticleResultData = {
   status?: 'done' | 'failed' | string
   steps: PipelineStep[]
-  article?: { id: string; site_id?: string | null; title: string; status: string }
+  article?: {
+    id: string
+    site_id?: string | null
+    title: string
+    status: string
+    slug?: string | null
+    language_code?: string | null
+    market?: string | null
+    primary_keyword?: string | null
+    meta_title?: string | null
+    meta_description?: string | null
+  }
   brief?: { source?: string; aiEnhanced?: boolean; aiMeta?: Record<string, unknown>; text?: string }
   outline?: string
   content?: string
@@ -17,10 +28,61 @@ export type ArticleResultData = {
   contentLength?: number
 }
 
-type ResultTab = 'article' | 'brief' | 'outline' | 'pipeline' | 'seo'
+type ResultTab = 'article' | 'brief' | 'outline' | 'pipeline' | 'meta' | 'seo'
 
 function formatCount(value: number) {
   return new Intl.NumberFormat('zh-CN').format(value)
+}
+
+function splitFrontmatter(source: string) {
+  let normalized = (source || '').replace(/\r\n?/g, '\n')
+  const wrapped = normalized.match(/^```(?:markdown|md)?\n([\s\S]*?)\n```\s*$/i)
+  if (wrapped) normalized = wrapped[1]
+  const meta: Record<string, string> = {}
+  let lines = normalized.split('\n')
+  if (normalized.startsWith('---\n')) {
+    const end = lines.findIndex((line, index) => index > 0 && line.trim() === '---')
+    if (end >= 0) {
+      for (const line of lines.slice(1, end)) {
+        const match = line.match(/^([A-Za-z][A-Za-z0-9_-]*):\s*(.*)$/)
+        if (!match) continue
+        const value = match[2].trim()
+        meta[match[1]] = value.length >= 2 && value[0] === value[value.length - 1] && ['"', "'"].includes(value[0])
+          ? value.slice(1, -1)
+          : value
+      }
+      lines = lines.slice(end + 1)
+    }
+  }
+  const known = ['title', 'meta title', 'meta description', 'url slug', 'primary keyword', 'secondary keywords', 'last updated', 'evidence needed', 'content qa checklist']
+  const output: string[] = []
+  let foundMetadata = false
+  let index = 0
+  while (index < lines.length) {
+    const line = lines[index]
+    const heading = line.match(/^\s*#{2,6}\s+(.+?)\s*$/)
+    const direct = line.match(/^\s*(Meta Title|Meta Description|URL Slug|Primary Keyword|Secondary Keywords|Last Updated)\s*:\s*(.*)$/i)
+    const label = (heading?.[1] || direct?.[1] || '').trim().toLowerCase()
+    const key = known.find((item) => label === item || label.startsWith(`${item}:`))
+    if (!key) {
+      output.push(line)
+      index += 1
+      continue
+    }
+    foundMetadata = true
+    const inline = heading?.[1]?.includes(':') ? heading[1].split(':').slice(1).join(':').trim() : direct?.[2]?.trim() || ''
+    const values = inline ? [inline] : []
+    index += 1
+    while (index < lines.length && !/^\s*#{1,6}\s+/.test(lines[index])) {
+      if (lines[index].trim()) values.push(lines[index].trim())
+      index += 1
+    }
+    const metadataKey = key.replace(/ /g, '_')
+    if (values.length && !meta[metadataKey]) meta[metadataKey] = values.join(' ').replace(/^['"]|['"]$/g, '')
+  }
+  const firstH1 = output.findIndex((line) => /^\s*#\s+/.test(line))
+  const body = foundMetadata && firstH1 >= 0 ? output.slice(firstH1) : output
+  return { body: body.join('\n').replace(/^\n+/, '').trim(), meta }
 }
 
 export function ArticleResultDialog({
@@ -49,13 +111,17 @@ export function ArticleResultDialog({
   const [localTab, setLocalTab] = useState<ResultTab>('article')
   const activeTab = tab || localTab
   const selectTab = onTabChange || setLocalTab
-  const content = result.content || result.contentPreview || '暂无文章正文'
+  const parsedContent = splitFrontmatter(result.content || result.contentPreview || '')
+  const content = parsedContent.body || '暂无文章正文'
+  const metaTitle = result.article?.meta_title || parsedContent.meta.title || result.article?.title || ''
+  const metaDescription = result.article?.meta_description || parsedContent.meta.meta_description || ''
   const passedQa = (result.qa || []).filter((item) => item.ok).length
   const tabLabels: Array<[ResultTab, string]> = [
     ['article', '文章正文'],
     ['brief', '增强 Brief'],
     ['outline', '文章大纲'],
     ['pipeline', '执行过程'],
+    ['meta', 'SEO 元数据'],
     ['seo', 'SEO 与 QA'],
   ]
 
@@ -105,6 +171,15 @@ export function ArticleResultDialog({
               )) : <div className="agent-empty">历史文章未保存逐步执行记录。</div>}
             </div>
           )}
+          {activeTab === 'meta' && (
+            <div className="article-dialog__info-grid">
+              <InfoItem label="Meta Title" value={metaTitle || '未生成'} />
+              <InfoItem label="Meta Description" value={metaDescription || '未生成'} />
+              <InfoItem label="Focus Keyword" value={result.article?.primary_keyword || '未设置'} />
+              <InfoItem label="Slug" value={result.article?.slug || '未生成'} />
+              <InfoItem label="语种" value={`${result.article?.market || '未知'} / ${result.article?.language_code || '未知'}`} />
+            </div>
+          )}
           {activeTab === 'seo' && (
             <div className="article-dialog__info-grid">
               <InfoItem label="保存位置" value={`${result.savedTo?.table || 'seo_agent.articles'} / ${result.savedTo?.articleId || result.article?.id || '未知'}`} />
@@ -130,6 +205,7 @@ export function ArticleResultDialog({
                   </option>
                 ))}
               </select>
+              {!publishSites.length && <div className="article-dialog__publish-message">没有与文章语种匹配的可用站点</div>}
               <button className="btn btn--ghost" type="button" disabled={!targetSiteId || publishing} onClick={() => void onPublish(true)}>
                 发布预检
               </button>
@@ -161,7 +237,6 @@ type MarkdownBlock =
   | { type: 'list'; ordered: boolean; items: string[] }
   | { type: 'quote'; text: string }
   | { type: 'code'; language: string; text: string }
-  | { type: 'hr' }
   | { type: 'table'; headers: string[]; rows: string[][] }
 
 function MarkdownContent({ source }: { source: string }) {
@@ -198,7 +273,7 @@ function MarkdownContent({ source }: { source: string }) {
             </div>
           )
         }
-        return <hr key={index} />
+        return null
       })}
     </div>
   )
@@ -230,7 +305,6 @@ function parseMarkdown(source: string): MarkdownBlock[] {
       continue
     }
     if (/^\s*(?:---+|\*\*\*+|___+)\s*$/.test(line)) {
-      blocks.push({ type: 'hr' })
       index += 1
       continue
     }

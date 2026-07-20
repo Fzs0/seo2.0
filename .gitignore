@@ -23,6 +23,7 @@ app/__pycache__/
 **/__pycache__/
 .pytest_cache/
 .mypy_cache/
+.venv/
 *.log
 
 # IDE

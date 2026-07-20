@@ -237,12 +237,12 @@ async function main() {
          convert_from(decode(:'notesB64', 'base64'), 'utf8'))
       RETURNING id, version, effective_at
     )
-    SELECT id || '|' || version || '|' || effective_at::text AS info FROM ins \\gset ins_
+    SELECT id, version, effective_at FROM ins \\gset ins_
 
     INSERT INTO seo_agent.rule_audit_log
       (rule_set_id, action, actor, reason, snapshot_diff)
     VALUES
-      (current_setting('ins_.id')::bigint,
+      (:'ins_id'::bigint,
        'create',
        '${ACTOR}',
        convert_from(decode(:'reasonB64', 'base64'), 'utf8'),
@@ -255,7 +255,7 @@ async function main() {
     INSERT INTO seo_agent.rule_audit_log
       (rule_set_id, action, actor, reason, snapshot_diff)
     VALUES
-      (current_setting('ins_.id')::bigint,
+      (:'ins_id'::bigint,
        'activate',
        '${ACTOR}',
        '首次灌入时自动激活 baseline。',
@@ -263,9 +263,7 @@ async function main() {
 
     COMMIT;
 
-    SELECT current_setting('ins_.id') || '|' ||
-           current_setting('ins_.version') || '|' ||
-           current_setting('ins_.effective_at') AS final_info;
+    SELECT :'ins_id' || '|' || :'ins_version' || '|' || :'ins_effective_at' AS final_info;
   `;
 
   // 把脚本写进临时文件再 psql -f

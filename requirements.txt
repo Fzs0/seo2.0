@@ -9,6 +9,8 @@ prometheus-client==0.21.1
 httpx==0.28.1
 tenacity==9.0.0
 PyJWT==2.10.1
+cryptography==44.0.2
+tzdata==2025.2
 
 # 迁移
 alembic==1.14.0

@@ -91,4 +91,11 @@ async def admin_health(session: AsyncSession = Depends(get_db)) -> dict[str, Any
     except Exception as e:  # noqa: BLE001
         db_ok = False
         db_error = str(e)
-    return {"ok": db_ok, "db_error": db_error, "rule_version": get_store().version}
+    store = get_store()
+    return {
+        "ok": db_ok and store.healthy,
+        "db_error": db_error,
+        "rule_version": store.version,
+        "rule_source": store.source,
+        "rule_healthy": store.healthy,
+    }

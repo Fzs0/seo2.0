@@ -1,0 +1,13 @@
+{
+  "source_name": "Ahrefs Official Guide — Paraphrased Research Notes",
+  "canonical_url": "https://ahrefs.com/seo/on-page-seo",
+  "title": "On-page SEO fundamentals — internal research notes",
+  "channel": "seo",
+  "content_type": "research_notes",
+  "language_code": "en",
+  "market": "global",
+  "author": "Internal notes based on Ryan Law's Ahrefs guide",
+  "published_at": null,
+  "rights_confirmed": true,
+  "raw_content": "Treat useful, accurate content that satisfies search intent as the prerequisite for on-page optimization. Small metadata or formatting changes cannot compensate for a page that does not solve the searcher's problem.\n\nPlace the target topic in naturally relevant locations, and use heading levels to make the page structure understandable to readers and search systems. Avoid repeating the keyword when it harms clarity.\n\nWrite title tags and meta descriptions for the actual result a searcher will receive. They should distinguish the page, set the right expectation, and make the value of clicking clear.\n\nUse short descriptive URLs, useful internal links, credible external references, and informative image treatment. These elements should help people navigate and verify the content, not merely satisfy a checklist.\n\nReview competing pages to find missing subtopics and evidence, then add only the gaps that improve the answer. Monitor search performance and user experience after publication so optimization becomes an evidence-driven loop."
+}

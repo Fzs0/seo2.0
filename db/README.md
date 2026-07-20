@@ -4,6 +4,8 @@
 
 所有 DDL 在 `migrations/` 下按编号顺序执行。所有脚本都假设目标 PG 版本 ≥ 14（与 `001_agent_memory_schema.sql` 顶部声明一致）。
 
+> 当前以 `db/migrations/*.sql` 为权威部署入口；Alembic 仅保留到 v6，不能单独用于部署当前应用。
+
 ---
 
 ## 1. 文件清单
@@ -13,6 +15,9 @@
 | `migrations/001_agent_memory_schema.sql` | v1 业务表：`sites` / `keywords` / `posts` / `serp_snapshots` / `tasks` / `articles`（已存在，本轮不动） |
 | `migrations/002_rule_engine.sql` | v2 规则引擎表：`rule_sets` / `rule_field_map` / `rule_audit_log` + 2 个视图 + 3 个触发器 |
 | `migrations/003_localize_comments.sql` | 全量 COMMENT 中文化：v1 + v2 全部表、列、视图的注释。仅改注释、不改 schema，幂等可重跑 |
+| `migrations/015_site_strategy_scope.sql` | 站点业务归属与策略开关：`business_id` / `strategy_enabled` + 范围索引 |
+| `migrations/016_knowledge_claims.sql` | 从独立 knowledge 服务迁入 Claim-only 数据：审核/质量字段保留，不迁移来源、文档、证据和使用记录 |
+| `migrations/017_keyword_business_import_scope.sql` | 把关键词导入唯一键纳入 `business_id`，避免不同业务导入相同市场关键词时互相覆盖 |
 | `scripts/seed_rule_baseline.mjs` | 把 `workflows/seo-standard.json` 灌入一次 baseline 的 Node.js 脚本 |
 
 ---
@@ -22,28 +27,39 @@
 ### 2.1 全新部署
 
 ```bash
-# 1. 跑 v1（如果数据库里还没有 seo_agent schema）
-psql "$DATABASE_URL" -f db/migrations/001_agent_memory_schema.sql
+# 按文件名顺序执行全部幂等 SQL migration
+for migration in db/migrations/*.sql; do
+  psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$migration" || exit $?
+done
 
-# 2. 跑 v2（建表 + 索引 + 触发器 + 视图，COMMENT 为英文）
-psql "$DATABASE_URL" -f db/migrations/002_rule_engine.sql
-
-# 3. 中文化所有 COMMENT（覆盖 v1 + v2 全部表/列/视图）
-psql "$DATABASE_URL" -f db/migrations/003_localize_comments.sql
-
-# 4. 灌一次 baseline
+# 灌一次 baseline
 DATABASE_URL="$DATABASE_URL" node db/scripts/seed_rule_baseline.mjs
 ```
 
-### 2.2 已有 v1、补 v2
+### 2.2 更新已有数据库
 
 ```bash
-psql "$DATABASE_URL" -f db/migrations/002_rule_engine.sql
-psql "$DATABASE_URL" -f db/migrations/003_localize_comments.sql
+for migration in db/migrations/*.sql; do
+  psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$migration" || exit $?
+done
 DATABASE_URL="$DATABASE_URL" node db/scripts/seed_rule_baseline.mjs
 ```
 
-### 2.3 仅重灌 baseline
+### 2.3 迁移独立 knowledge Claim
+
+先执行 `migrations/016_knowledge_claims.sql`，再设置根目录 `.env` 的
+`DATABASE_URL` 和 `knowledge/.env` 的 `KNOWLEDGE_DATABASE_URL`，运行：
+
+```bash
+python scripts/migrate_knowledge_claims.py
+```
+
+脚本只读取 `knowledge.claims`，将全部 Claim 幂等写入
+`seo_agent.knowledge_claims`，保留原 Claim UUID、审核状态、质量状态和内容字段。
+`origin_document_id` 仅作为无外键的来源标识；sources、documents、evidence、usages
+不会迁移，源知识库也不会被脚本删除。
+
+### 2.4 仅重灌 baseline
 
 ```bash
 # 幂等：重复跑是 no-op，不会覆盖已有行
@@ -97,12 +113,7 @@ SELECT id, rule_set_id, action, actor, created_at
 
 ## 5. 回滚
 
-推荐用 **Alembic**（见 §6）一键回滚，不要手写 DROP：
-
-```bash
-alembic downgrade -1    # 回滚一个版本
-alembic downgrade base  # 回到最初
-```
+当前 raw SQL migration 为前向幂等脚本，不提供统一 downgrade；生产回滚请走数据库备份恢复。
 
 **仅测试环境手写 DROP**（生产禁用）：
 

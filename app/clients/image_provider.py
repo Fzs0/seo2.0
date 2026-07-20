@@ -67,7 +67,7 @@ def _normalize_items(provider: str, data: dict[str, Any]) -> list[dict[str, Any]
         return [
             {
                 "id": str(p.get("id")),
-                "url": p.get("url"),
+                "url": (p.get("src") or {}).get("large2x") or (p.get("src") or {}).get("large") or (p.get("src") or {}).get("medium"),
                 "thumbnail": (p.get("src") or {}).get("medium"),
                 "photographer": p.get("photographer"),
                 "alt": p.get("alt"),

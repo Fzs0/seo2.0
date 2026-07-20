@@ -35,6 +35,8 @@ def _load(filename: str, site_type: str) -> list[dict[str, Any]]:
 def _normalize(s: dict[str, Any], site_type: str) -> dict[str, Any]:
     base_url = s.get("siteUrl") or _base_from_api(s.get("apiBaseUrl")) or f"https://{s.get('name')}.com"
     api_base_url = s.get("apiBaseUrl") or s.get("siteUrl")
+    market = _market(s.get("targetMarket"))
+    language_code = _lang(s.get("targetLanguage"))
     return {
         "site_key": s.get("siteKey") or s.get("name"),
         "name": s.get("name"),
@@ -42,11 +44,11 @@ def _normalize(s: dict[str, Any], site_type: str) -> dict[str, Any]:
         "domain": _domain(base_url),
         "base_url": base_url,
         "api_base_url": api_base_url,
-        "market": _market(s.get("targetMarket")),
-        "language_code": _lang(s.get("targetLanguage")),
-        "google_gl": "us" if "US" in str(s.get("targetMarket") or "") else None,
-        "google_hl": "en" if "English" in str(s.get("targetLanguage") or "") else None,
-        "semrush_database": "us" if "US" in str(s.get("targetMarket") or "") else None,
+        "market": market,
+        "language_code": language_code,
+        "google_gl": market.lower() if market and len(market) == 2 else None,
+        "google_hl": language_code,
+        "semrush_database": market.lower() if market and len(market) == 2 else None,
         "content_role": s.get("contentRole"),
         "content_scope": s.get("contentScope"),
         "is_main": site_type == "main",
@@ -60,7 +62,12 @@ def _normalize(s: dict[str, Any], site_type: str) -> dict[str, Any]:
 def _api_config(s: dict[str, Any], site_type: str) -> dict[str, Any]:
     if site_type == "wp":
         return {"username": s.get("username"), "applicationPassword": s.get("applicationPassword")}
-    return {"openApiKey": s.get("openApiKey"), "tokenA": s.get("tokenA"), "tokenB": s.get("tokenB")}
+    config = {"openApiKey": s.get("openApiKey"), "tokenA": s.get("tokenA"), "tokenB": s.get("tokenB")}
+    if site_type == "blog":
+        config.update({"connector_type": "custom_openapi", "articlesPath": "/posts", "publishPath": "/posts/batch"})
+    if s.get("articleUrlPath"):
+        config["articleUrlPath"] = s["articleUrlPath"]
+    return config
 
 
 def _publish_config(s: dict[str, Any]) -> dict[str, Any]:
@@ -84,4 +91,10 @@ def _market(value: str | None) -> str | None:
 
 
 def _lang(value: str | None) -> str | None:
-    return "en" if str(value or "").lower().startswith("english") else value
+    value = str(value or "").strip().lower()
+    return {
+        "english": "en",
+        "german": "de",
+        "french": "fr",
+        "spanish": "es",
+    }.get(value, value or None)

@@ -18,7 +18,7 @@ CREATE TABLE IF NOT EXISTS seo_agent.sites (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   site_key text NOT NULL UNIQUE,
   name text NOT NULL,
-  site_type text NOT NULL CHECK (site_type IN ('main', 'wp', 'blog', 'other')),
+  site_type text NOT NULL CHECK (site_type IN ('main', 'wp', 'blog', 'shopify', 'other')),
   domain text,
   base_url text,
   api_base_url text,
@@ -29,6 +29,8 @@ CREATE TABLE IF NOT EXISTS seo_agent.sites (
   semrush_database text,
   content_role text,
   content_scope text,
+  business_id text,
+  strategy_enabled boolean NOT NULL DEFAULT false,
   is_main boolean NOT NULL DEFAULT false,
   allow_external_links boolean NOT NULL DEFAULT false,
   publish_config jsonb NOT NULL DEFAULT '{}'::jsonb,
@@ -246,6 +248,9 @@ WHERE url IS NOT NULL AND url <> '';
 
 CREATE INDEX IF NOT EXISTS sites_market_language_idx
 ON seo_agent.sites (market, language_code, site_type, status);
+
+CREATE INDEX IF NOT EXISTS sites_strategy_scope_idx
+ON seo_agent.sites (business_id, strategy_enabled, status);
 
 CREATE INDEX IF NOT EXISTS keywords_status_priority_idx
 ON seo_agent.keywords (status, priority, score DESC NULLS LAST);

@@ -4,7 +4,7 @@
 #
 # 步骤：
 #   1. 起 PG + Redis 容器（如果还没起）
-#   2. 跑三条 migration（001 → 002 → 003）
+#   2. 按编号跑全部数据库 migration
 #   3. 灌 baseline（幂等，重跑是 no-op）
 #   4. 复制 .env.example → .env（如不存在）
 #   5. 提示用户 pip install + uvicorn（脚本不替你装）
@@ -183,9 +183,9 @@ run_psql() {
 }
 
 if [[ "${SKIP_MIGRATE:-0}" != "1" ]]; then
-  run_psql db/migrations/001_agent_memory_schema.sql || exit $?
-  run_psql db/migrations/002_rule_engine.sql          || exit $?
-  run_psql db/migrations/003_localize_comments.sql    || exit $?
+  for migration in db/migrations/*.sql; do
+    run_psql "$migration" || exit $?
+  done
 else
   log_warn "migrate" "SKIP_MIGRATE=1，跳过"
 fi

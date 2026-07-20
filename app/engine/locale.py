@@ -33,7 +33,7 @@ def locale_for_market(market_value: str = "") -> dict[str, Any]:
             "warning": "Target market is not selected. Do not run production keyword analysis or article generation.",
         }
 
-    country_part, _, language_part = raw_market.partition("/")
+    country_part, _, language_part = (part.strip() for part in raw_market.partition("/"))
     market_token = _normalize_market(country_part or raw_market)
     presets = get_store().get("locale.presets", {}) or {}
     languages = get_store().get("locale.languages", {}) or {}
@@ -43,6 +43,12 @@ def locale_for_market(market_value: str = "") -> dict[str, Any]:
     fallback_gl = market_token.lower() if len(market_token) == 2 else ""
     fallback_language = language_part or (preset or {}).get("language") or ""
     fallback_language_preset = languages.get(_normalize_language(fallback_language)) or {}
+    fallback_language_code = {
+        "english": "en",
+        "german": "de",
+        "french": "fr",
+        "spanish": "es",
+    }.get(_normalize_language(fallback_language), "")
 
     return {
         "configured": True,
@@ -50,9 +56,9 @@ def locale_for_market(market_value: str = "") -> dict[str, Any]:
         "market": (preset or {}).get("market") or country_part or raw_market,
         "countryCode": (preset or {}).get("countryCode") or market_token,
         "googleGl": (preset or {}).get("googleGl", fallback_gl),
-        "googleHl": (language_preset or {}).get("googleHl") or (preset or {}).get("googleHl") or fallback_language_preset.get("googleGl", ""),
+        "googleHl": (language_preset or {}).get("googleHl") or (preset or {}).get("googleHl") or fallback_language_preset.get("googleHl") or fallback_language_code,
         "language": (language_preset or {}).get("language") or (preset or {}).get("language") or fallback_language,
-        "languageCode": (language_preset or {}).get("languageCode") or (preset or {}).get("languageCode") or fallback_language_preset.get("languageCode", ""),
+        "languageCode": (language_preset or {}).get("languageCode") or (preset or {}).get("languageCode") or fallback_language_preset.get("languageCode") or fallback_language_code,
         "semrushDatabase": (preset or {}).get("semrushDatabase", fallback_gl) if preset else fallback_gl,
         "warning": get_store().get("locale.warnings.EU", "") if market_token == "EU" else "",
     }

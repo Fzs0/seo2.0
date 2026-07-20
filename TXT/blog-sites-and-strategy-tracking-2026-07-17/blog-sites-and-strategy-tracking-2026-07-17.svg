@@ -1,0 +1,65 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="720" viewBox="0 0 1200 720">
+  <defs>
+    <style>
+      .title{font:700 28px Arial,"Microsoft YaHei",sans-serif;fill:#162033}
+      .label{font:600 18px Arial,"Microsoft YaHei",sans-serif;fill:#162033}
+      .small{font:15px Arial,"Microsoft YaHei",sans-serif;fill:#526071}
+      .box{fill:#fff;stroke:#aebdce;stroke-width:2;rx:14}
+      .blue{fill:#eaf3ff;stroke:#6da4e8}
+      .green{fill:#eaf8f0;stroke:#6fc18b}
+      .gold{fill:#fff7df;stroke:#dfb84d}
+      .gray{fill:#f4f6f8;stroke:#b9c2cc}
+      .arrow{stroke:#75879b;stroke-width:3;fill:none;marker-end:url(#arrow)}
+    </style>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L9,3 z" fill="#75879b"/>
+    </marker>
+  </defs>
+  <rect width="1200" height="720" fill="#fbfcfe"/>
+  <text x="60" y="60" class="title">博客站自动发布与策略效果追踪</text>
+  <text x="60" y="94" class="small">主站冻结自动链路；博客站 / WordPress 站点进入可控自动发布闭环</text>
+
+  <rect x="60" y="150" width="250" height="100" class="box blue"/>
+  <text x="185" y="190" text-anchor="middle" class="label">数据与知识</text>
+  <text x="185" y="220" text-anchor="middle" class="small">关键词 · 站点知识 · SERP</text>
+
+  <rect x="360" y="150" width="250" height="100" class="box blue"/>
+  <text x="485" y="190" text-anchor="middle" class="label">AI 策略</text>
+  <text x="485" y="220" text-anchor="middle" class="small">新文 / 更新 · 目标与依据</text>
+
+  <rect x="660" y="150" width="220" height="100" class="box gold"/>
+  <text x="770" y="190" text-anchor="middle" class="label">审核与执行</text>
+  <text x="770" y="220" text-anchor="middle" class="small">博客站 · WP · 自动发布</text>
+
+  <rect x="930" y="150" width="210" height="100" class="box green"/>
+  <text x="1035" y="190" text-anchor="middle" class="label">发布文章</text>
+  <text x="1035" y="220" text-anchor="middle" class="small">URL · 关键词 · 策略快照</text>
+
+  <path d="M310 200 H360" class="arrow"/>
+  <path d="M610 200 H660" class="arrow"/>
+  <path d="M880 200 H930" class="arrow"/>
+
+  <rect x="260" y="390" width="250" height="115" class="box gray"/>
+  <text x="385" y="430" text-anchor="middle" class="label">7 / 14 / 28 天检查</text>
+  <text x="385" y="460" text-anchor="middle" class="small">GSC 页面 / 查询 · GA4 落地页</text>
+  <text x="385" y="484" text-anchor="middle" class="small">暂无数据不判定失败</text>
+
+  <rect x="570" y="390" width="250" height="115" class="box green"/>
+  <text x="695" y="430" text-anchor="middle" class="label">效果结论</text>
+  <text x="695" y="460" text-anchor="middle" class="small">数据不足 · 改善 · 持平 · 下降</text>
+  <text x="695" y="484" text-anchor="middle" class="small">策略是否被验证</text>
+
+  <rect x="880" y="390" width="260" height="115" class="box blue"/>
+  <text x="1010" y="430" text-anchor="middle" class="label">复盘与调整</text>
+  <text x="1010" y="460" text-anchor="middle" class="small">策略假设 → 执行 → 数据</text>
+  <text x="1010" y="484" text-anchor="middle" class="small">→ 下一轮规则与知识</text>
+
+  <path d="M1035 250 V330 H385 V390" class="arrow"/>
+  <path d="M510 448 H570" class="arrow"/>
+  <path d="M820 448 H880" class="arrow"/>
+  <path d="M1010 390 V300 H485 V250" class="arrow"/>
+
+  <rect x="60" y="585" width="1080" height="70" class="box"/>
+  <text x="600" y="615" text-anchor="middle" class="label">主站 exdivo：暂不进入自动策略与自动发文</text>
+  <text x="600" y="640" text-anchor="middle" class="small">后续单独扫描产品、分类页、博客，并输出严格审核报告</text>
+</svg>

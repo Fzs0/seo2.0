@@ -20,7 +20,7 @@ export function ArticlesPage() {
   const [articleTargetSiteId, setArticleTargetSiteId] = useState('')
   const [publishing, setPublishing] = useState(false)
   const [publishMessage, setPublishMessage] = useState<string>()
-  const articles = useArticles(refreshKey)
+  const articles = useArticles(refreshKey, selectedSiteId || undefined)
   const sites = useSites()
   const posts = usePosts(refreshKey, selectedSiteId || undefined)
   const publishSites = (sites.data ?? []).filter((site) => site.status === 'active')
@@ -91,27 +91,27 @@ export function ArticlesPage() {
   async function handlePublish(dryRun: boolean) {
     const articleId = selectedArticle?.article?.id
     if (!articleId || publishing) return
+    if (!dryRun) {
+      setPublishMessage('正式发布已关闭。请回到“今日策略”完成审核并由策略执行链路发布。')
+      return
+    }
     setPublishing(true)
-    setPublishMessage(dryRun ? '正在执行发布预检…' : '正在发布文章…')
+    setPublishMessage('正在执行只读发布预检…')
     try {
       const result = await publishArticle(articleId, articleTargetSiteId, dryRun)
-      setPublishMessage(result.ok ? (dryRun ? `预检通过：${result.url || '可以发布'}` : `发布成功：${result.url || result.post_id || '已发布'}`) : `发布失败：${result.error || '未知错误'}`)
-      if (result.ok) {
-        setSelectedArticle((current) => current ? { ...current, status: dryRun ? 'approved' : 'published', article: current.article ? { ...current.article, status: dryRun ? 'approved' : 'published', site_id: articleTargetSiteId } : current.article } : current)
-        if (!dryRun) setRefreshKey((key) => key + 1)
-      }
+      setPublishMessage(result.ok ? `预检通过：${result.url || '可以回今日策略审核执行'}` : `预检失败：${result.error || '未知错误'}`)
     } catch (error) {
-      setPublishMessage(error instanceof Error ? error.message : '发布失败')
+      setPublishMessage(error instanceof Error ? error.message : '发布预检失败')
     } finally {
       setPublishing(false)
     }
   }
 
   return (
-    <section className="page" data-screen-label="文章管理">
+    <section className="page articles-page--preview-only" data-screen-label="文章管理">
       <div>
         <h1>文章管理</h1>
-        <p>这里展示 AI 生成稿及其目标发布站点；下方列表展示从各站点 API 同步回来的已有文章。</p>
+        <p>这里展示 AI 生成稿及其目标发布站点；文章页仅提供只读发布预检，正式发布必须回到“今日策略”审核执行。</p>
         {message && <p>{message}</p>}
       </div>
 
@@ -140,7 +140,7 @@ export function ArticlesPage() {
           error={articles.error}
           empty={!articles.data || articles.data.length === 0}
           emptyTitle="暂无生成稿件"
-          emptyHint="到内容策略页点击“生成 1 篇文章”后会展示在这里"
+          emptyHint="通过今日策略审核执行生成文章后，稿件会展示在这里"
         >
           <table className="tbl">
             <thead>
@@ -173,7 +173,7 @@ export function ArticlesPage() {
                   <td style={{ color: 'var(--ink-500)', fontSize: 12 }}>{formatDate(article.created_at)}</td>
                   <td>
                     <button className="btn btn--ghost btn--xs" type="button" onClick={() => void handleOpenArticle(article.id)} disabled={openingArticleId === article.id}>
-                      {openingArticleId === article.id ? '读取中…' : '查看并发布'}
+                      {openingArticleId === article.id ? '读取中…' : '查看与预检'}
                     </button>
                   </td>
                 </tr>
@@ -196,30 +196,37 @@ export function ArticlesPage() {
               <tr>
                 <th style={{ width: 36 }}>#</th>
                 <th>标题</th>
-                <th>来源</th>
+                <th>所属站点</th>
                 <th>状态</th>
-                <th>URL</th>
+                <th>文章链接</th>
                 <th>发布时间</th>
-                <th>抓取时间</th>
+                <th>同步时间</th>
               </tr>
             </thead>
             <tbody>
-              {(posts.data ?? []).map((post, i) => (
-                <tr key={post.id}>
+              {(posts.data ?? []).map((post, i) => {
+                const site = sites.data?.find((item) => item.id === post.site_id)
+                const articleUrl = post.url && /^https?:\/\//i.test(post.url) ? post.url : ''
+                return <tr key={post.id}>
                   <td style={{ color: 'var(--ink-400)' }}>{i + 1}</td>
                   <td>
                     <div className="tbl-strong">{post.title}</div>
                     <div style={{ fontSize: 11, color: 'var(--ink-400)', marginTop: 2 }}>
-                      {post.external_id || post.id}
+                      远端 ID：{post.external_id || post.id}
                     </div>
                   </td>
-                  <td><span className="tag tag--blue">{post.source}</span></td>
+                  <td>
+                    <span className="tag tag--blue">{site?.name || '未知站点'}</span>
+                    <div style={{ marginTop: 4, color: 'var(--ink-400)', fontSize: 11 }}>同步方式：{post.source}</div>
+                  </td>
                   <td><span className="tag tag--gray">{post.status || 'unknown'}</span></td>
-                  <td style={{ color: 'var(--ink-500)', fontSize: 12 }}>{post.url || post.slug || '—'}</td>
+                  <td style={{ maxWidth: 360, fontSize: 12, overflowWrap: 'anywhere' }}>
+                    {articleUrl ? <a href={articleUrl} target="_blank" rel="noreferrer">{articleUrl}</a> : '未返回文章地址'}
+                  </td>
                   <td style={{ color: 'var(--ink-500)', fontSize: 12 }}>{formatDate(post.published_at)}</td>
                   <td style={{ color: 'var(--ink-500)', fontSize: 12 }}>{formatDate(post.fetched_at)}</td>
                 </tr>
-              ))}
+              })}
             </tbody>
           </table>
         </DataGuard>

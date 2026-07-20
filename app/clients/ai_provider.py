@@ -53,7 +53,8 @@ async def generate_ai_content(
             client_label=f"ai_{stage}",
             json=payload,
             headers={"Authorization": f"Bearer {api_key}"},
-            timeout=120,
+            timeout=_settings.ai_timeout_seconds,
+            max_attempts=_settings.ai_retry_max,
         )
         content = (
             (data.get("choices") or [{}])[0].get("message", {}).get("content")
@@ -77,4 +78,5 @@ async def generate_ai_content(
             "apiFormat": "openai-compatible",
             "configured": True,
             "status": "ai-request-failed",
+            "error": str(e),
         }

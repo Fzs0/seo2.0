@@ -1,0 +1,86 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1500" height="860" viewBox="0 0 1500 860" role="img" aria-labelledby="title desc">
+  <title id="title">文章正文与 TDK 读取链路</title>
+  <desc id="desc">从文章列表 API 到连接器标准化，再到公开 HTML 兜底解析和异常标记的流程图。</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#f7f3ea"/>
+      <stop offset="1" stop-color="#eef3f7"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="8" stdDeviation="10" flood-color="#243447" flood-opacity=".12"/>
+    </filter>
+    <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M0,0 L12,6 L0,12 Z" fill="#5b7898"/>
+    </marker>
+    <style>
+      .title { font: 600 30px "Microsoft YaHei", "Noto Sans CJK SC", sans-serif; fill: #243447; }
+      .subtitle { font: 400 15px "Microsoft YaHei", "Noto Sans CJK SC", sans-serif; fill: #607080; }
+      .node-title { font: 600 18px "Microsoft YaHei", "Noto Sans CJK SC", sans-serif; fill: #243447; }
+      .node-text { font: 400 14px "Microsoft YaHei", "Noto Sans CJK SC", sans-serif; fill: #52616f; }
+      .flow { fill: none; stroke: #5b7898; stroke-width: 3; marker-end: url(#arrow); }
+      .fallback { fill: none; stroke: #789765; stroke-width: 3; stroke-dasharray: 10 8; marker-end: url(#arrow); }
+      .error { fill: none; stroke: #b96d63; stroke-width: 3; stroke-dasharray: 9 7; marker-end: url(#arrow); }
+    </style>
+  </defs>
+  <rect width="1500" height="860" fill="url(#bg)"/>
+  <text x="750" y="54" text-anchor="middle" class="title">文章正文与 TDK 读取链路</text>
+  <text x="750" y="84" text-anchor="middle" class="subtitle">API 优先，公开 HTML 兜底，远端异常单独标记</text>
+
+  <path class="flow" d="M250 330 C315 330, 350 330, 410 330"/>
+  <path class="flow" d="M650 330 C710 330, 740 330, 800 330"/>
+  <path class="flow" d="M1040 330 C1100 330, 1125 330, 1180 330"/>
+  <path class="fallback" d="M920 440 C920 520, 845 570, 760 610"/>
+  <path class="flow" d="M920 440 C920 500, 1010 545, 1110 600"/>
+  <path class="error" d="M1180 690 C1080 760, 965 770, 830 730"/>
+
+  <g filter="url(#shadow)">
+    <rect x="60" y="250" width="190" height="160" rx="22" fill="#e7eef5" stroke="#b9cada"/>
+    <text x="155" y="294" text-anchor="middle" class="node-title">文章列表 API</text>
+    <text x="84" y="332" class="node-text">文章 ID / slug</text>
+    <text x="84" y="358" class="node-text">标题 / URL / 状态</text>
+    <text x="84" y="384" class="node-text">正文 / TDK（可能缺失）</text>
+  </g>
+
+  <g filter="url(#shadow)">
+    <rect x="410" y="250" width="240" height="160" rx="22" fill="#f1e8cf" stroke="#d7c38e"/>
+    <text x="530" y="294" text-anchor="middle" class="node-title">连接器标准化</text>
+    <text x="434" y="332" class="node-text">WP：content.rendered</text>
+    <text x="434" y="358" class="node-text">Shopify：body / summary</text>
+    <text x="434" y="384" class="node-text">OpenAPI：统一字段映射</text>
+  </g>
+
+  <g filter="url(#shadow)">
+    <rect x="800" y="250" width="240" height="190" rx="22" fill="#e5f0e5" stroke="#b9d0b3"/>
+    <text x="920" y="294" text-anchor="middle" class="node-title">字段检查</text>
+    <text x="824" y="332" class="node-text">正文是否存在</text>
+    <text x="824" y="358" class="node-text">Meta title 是否存在</text>
+    <text x="824" y="384" class="node-text">Description 是否存在</text>
+    <text x="824" y="410" class="node-text">决定是否需要 HTML 兜底</text>
+  </g>
+
+  <g filter="url(#shadow)">
+    <rect x="1180" y="250" width="260" height="190" rx="22" fill="#e8edf3" stroke="#bdcbd8"/>
+    <text x="1310" y="294" text-anchor="middle" class="node-title">正常保存</text>
+    <text x="1208" y="332" class="node-text">posts.content_html</text>
+    <text x="1208" y="358" class="node-text">posts.meta_title</text>
+    <text x="1208" y="384" class="node-text">posts.meta_description</text>
+    <text x="1208" y="410" class="node-text">记录 source 与 fetched_at</text>
+  </g>
+
+  <g filter="url(#shadow)">
+    <rect x="590" y="590" width="340" height="150" rx="22" fill="#f3e4e1" stroke="#d9b6b0"/>
+    <text x="760" y="634" text-anchor="middle" class="node-title">公开 HTML 兜底</text>
+    <text x="620" y="672" class="node-text">请求正常文章 URL，不使用 view-source:</text>
+    <text x="620" y="698" class="node-text">解析 title / meta / article 正文区域</text>
+  </g>
+
+  <g filter="url(#shadow)">
+    <rect x="1110" y="590" width="330" height="150" rx="22" fill="#f4e5e2" stroke="#d9b6b0"/>
+    <text x="1275" y="634" text-anchor="middle" class="node-title">远端异常</text>
+    <text x="1140" y="672" class="node-text">403 / 404 / 没有可解析正文</text>
+    <text x="1140" y="698" class="node-text">标记失效或待确认，不生成误判策略</text>
+  </g>
+
+  <text x="976" y="544" class="subtitle">解析成功</text>
+  <text x="1000" y="773" class="subtitle">解析失败</text>
+</svg>

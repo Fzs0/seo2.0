@@ -1,0 +1,13 @@
+{
+  "source_name": "Ahrefs Official Guide — Paraphrased Research Notes",
+  "canonical_url": "https://ahrefs.com/seo/keyword-research",
+  "title": "Keyword research fundamentals — internal research notes",
+  "channel": "seo",
+  "content_type": "research_notes",
+  "language_code": "en",
+  "market": "global",
+  "author": "Internal notes based on Tim Soulo's Ahrefs guide",
+  "published_at": null,
+  "rights_confirmed": true,
+  "raw_content": "Start keyword research by describing the problems customers need to solve and turning those problems into broad seed topics. Expand those seeds with keyword tools, existing search performance, and competitor research.\n\nDo not prioritize a keyword with one metric alone. Evaluate traffic potential, ranking difficulty, search intent, and business value together, then choose the opportunities the site can realistically serve.\n\nClassify intent before deciding the page format. Informational queries usually need educational content, while commercial or transactional queries often need comparison, category, product, or landing pages.\n\nUse queries already visible in Google Search Console to discover nearby opportunities and pages that may benefit from improvement. Compare competitor rankings to find relevant gaps, but exclude competitors whose audience or business model does not match.\n\nGroup closely related queries around a parent topic when one strong page can satisfy the same search need. This reduces redundant pages and gives each page a clearer purpose."
+}

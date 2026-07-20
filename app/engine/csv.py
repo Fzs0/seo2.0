@@ -21,6 +21,13 @@ _DEFAULT_ALIASES = {
     "sourcePageType": ["source page type", "page type"],
     "serpFeatures": ["serp features", "features"],
     "url": ["url", "ranking url", "page"],
+    "trend": ["trend", "volume trend"],
+    "pkd": ["pkd", "pkd %", "personal keyword difficulty", "personal kewword difficulty", "personal kd"],
+    "potentialTraffic": ["potential traffic", "potential traffic2"],
+    "competitiveDensity": ["competitive density", "com", "competition"],
+    "serpResults": ["results", "results on serp", "serp results", "number of results"],
+    "positions": ["positions", "position"],
+    "metricsUpdatedAt": ["updated", "last updated", "metrics updated"],
 }
 
 
@@ -47,10 +54,19 @@ def _to_number(value: Any) -> float:
     if value is None:
         return 0
     cleaned = re.sub(r"[$%,\s]", "", str(value))
+    multiplier = 1
+    if cleaned.lower().endswith("k"):
+        multiplier, cleaned = 1_000, cleaned[:-1]
+    elif cleaned.lower().endswith("m"):
+        multiplier, cleaned = 1_000_000, cleaned[:-1]
     try:
-        return float(cleaned)
+        return float(cleaned) * multiplier
     except ValueError:
         return 0
+
+
+def _trend_series(value: Any) -> list[float]:
+    return [_to_number(part) for part in str(value or "").split(",") if str(part).strip()]
 
 
 def _make_id(keyword: str, index: int) -> str:
@@ -64,6 +80,14 @@ def _find_header_row(rows: list[list[str]]) -> int:
         if _get_column(rows[idx], headers, "keyword"):
             return idx
     return 0
+
+
+def _raw_row(headers: list[str], row: list[str]) -> dict[str, str]:
+    return {
+        header: row[index] if index < len(row) else ""
+        for index, header in enumerate(headers)
+        if header
+    }
 
 
 def normalize_imported_keywords(rows: list[list[str]]) -> list[dict[str, Any]]:
@@ -86,11 +110,20 @@ def normalize_imported_keywords(rows: list[list[str]]) -> list[dict[str, Any]]:
                 "pageGroup": _get_column(row, headers, "pageGroup"),
                 "sourcePageType": _get_column(row, headers, "sourcePageType"),
                 "serpFeatures": _get_column(row, headers, "serpFeatures"),
+                "trend": (_trend_series(_get_column(row, headers, "trend")) or [0])[-1],
+                "trendData": _trend_series(_get_column(row, headers, "trend")),
+                "pkd": _to_number(_get_column(row, headers, "pkd")),
+                "potentialTraffic": _to_number(_get_column(row, headers, "potentialTraffic")),
+                "competitiveDensity": _to_number(_get_column(row, headers, "competitiveDensity")),
+                "serpResults": int(_to_number(_get_column(row, headers, "serpResults"))),
+                "positions": _get_column(row, headers, "positions"),
+                "metricsUpdatedAt": _get_column(row, headers, "metricsUpdatedAt"),
                 "volume": _to_number(_get_column(row, headers, "volume")),
                 "kd": _to_number(_get_column(row, headers, "difficulty")),
                 "cpc": _to_number(_get_column(row, headers, "cpc")),
                 "intent": _get_column(row, headers, "intent") or "unknown",
                 "url": _get_column(row, headers, "url"),
+                "raw": _raw_row(headers, row),
             }
         )
     return out

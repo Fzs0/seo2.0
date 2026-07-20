@@ -28,7 +28,7 @@ COMMENT ON TABLE seo_agent.sites IS
 COMMENT ON COLUMN seo_agent.sites.id IS              'uuid 主键，跨进程（Node.js + 未来 Python）共享 ID。';
 COMMENT ON COLUMN seo_agent.sites.site_key IS        '站点业务唯一键，例如 "main_store"、"blog_a"。';
 COMMENT ON COLUMN seo_agent.sites.name IS            '人类可读站点名，例如 "主站-英文商城"。';
-COMMENT ON COLUMN seo_agent.sites.site_type IS       '站点类型枚举：main / wp / blog / other。';
+COMMENT ON COLUMN seo_agent.sites.site_type IS       '站点类型枚举：main / wp / blog / shopify / other。';
 COMMENT ON COLUMN seo_agent.sites.domain IS          '站点主域名，例如 example.com。';
 COMMENT ON COLUMN seo_agent.sites.base_url IS        '站点首页完整 URL，用于拼接相对路径。';
 COMMENT ON COLUMN seo_agent.sites.api_base_url IS    '站点 API 入口 URL（WordPress REST、Shopify Storefront 等）。';

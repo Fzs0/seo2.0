@@ -1,15 +1,15 @@
 {
-  "version": "0.2.0",
+  "version": "0.2.5",
   "name": "Independent Site Google SEO Workflow Standard",
   "positioning": {
     "defaultProject": {
       "domain": "",
-      "siteType": "2C鐢靛晢",
+      "siteType": "2C电商",
       "market": "",
       "conversion": "",
       "coreProducts": "",
       "mainPages": "",
-      "blogRoles": "鍗氬A锛氱煡璇嗙鏅?/ FAQ / 娉曡鎽樿 / 鏂版墜鍏ラ棬\n鍗氬B锛氬満鏅汉缇?/ 鍙ｅ懗鐏垫劅 / 閫夎喘寤鸿\n鍗氬C锛氬姣旇瘎娴?/ Best / VS / 鎺掕娓呭崟"
+      "blogRoles": "博客A：知识教程 / FAQ / 法规摘要 / 新手入门\n博客B：场景人群 / 口味灵感 / 选购建议\n博客C：对比评测 / Best / VS / 排行清单"
     }
   },
   "localePolicy": {
@@ -30,19 +30,67 @@
     "博客B-场景人群",
     "博客C-对比评测",
     "暂不做"
-  ],,
+  ],
   "csvColumnAliases": {
     "keyword": ["keyword", "关键词", "query", "search query"],
     "database": ["database", "country database", "semrush database", "db", "国家库", "数据库"],
     "volume": ["volume", "volume2", "search volume", "搜索量"],
-    "difficulty": ["difficulty", "keyword difficulty", "keyword difficulty2", "kd", "难度"],
+    "difficulty": ["difficulty", "keyword difficulty", "kewword difficulty", "keyword difficulty2", "kd", "难度"],
     "intent": ["intent", "意图", "search intent"],
     "topic": ["topic", "topic cluster", "主题", "关键词主题"],
     "seedKeyword": ["seed keyword", "seed", "种子词"],
     "pageGroup": ["page", "页面", "page group", "cluster page"],
     "sourcePageType": ["page type", "semrush page type", "source page type"],
     "serpFeatures": ["serp features", "serp feature", "features", "search features", "google serp features"],
-    "url": ["url", "page url", "landing page", "target url", "ranking url", "existing url"]
+    "url": ["url", "page url", "landing page", "target url", "ranking url", "existing url"],
+    "trend": ["trend", "volume trend", "趋势"],
+    "pkd": ["pkd", "pkd %", "personal keyword difficulty", "personal kewword difficulty", "personal kd"],
+    "potentialTraffic": ["potential traffic", "potential traffic2", "潜在流量"],
+    "competitiveDensity": ["competitive density", "com", "competition", "竞争密度"],
+    "serpResults": ["results", "results on serp", "serp results", "number of results", "结果"],
+    "positions": ["positions", "position"],
+    "metricsUpdatedAt": ["updated", "last updated", "metrics updated", "更新时间"]
+  },
+  "keywordPreflight": {
+    "minLength": 2,
+    "maxLength": 180,
+    "requireDatabase": true,
+    "unknownIntent": "review",
+    "missingMetrics": "review",
+    "description": "行业无关的数据质量、意图标准化和关键词类型识别；业务相关性由 signals/classifier 决定。"
+  },
+  "keywordImportPolicy": {
+    "version": "1.0.0",
+    "common": {
+      "preserveRaw": true,
+      "autoDelete": false,
+      "autoAssignSite": false
+    },
+    "sourceProfiles": {
+      "strategyBuilder": {
+        "requires": ["topic", "page", "pageType", "top10Urls"],
+        "nextStage": "page_cluster_validation"
+      },
+      "topicList": {
+        "requires": ["keyword", "topic"],
+        "nextStage": "provisional_topic"
+      },
+      "flatList": {
+        "requires": ["keyword"],
+        "nextStage": "needs_topic_clustering"
+      },
+      "gscRanked": {
+        "requires": ["keyword", "rankingUrl"],
+        "nextStage": "ranking_url_grouping"
+      }
+    },
+    "pageClusterValidation": {
+      "minimumEvidenceUrls": 7,
+      "top7StrongOverlap": 3,
+      "top10StrongOverlap": 4,
+      "top10AcceptableOverlap": 3,
+      "statuses": ["validated", "provisional", "bridge_review", "split_review"]
+    }
   },
   "signals": {
     "risk": ["thc", "cbd", "weed", "marijuana", "cannabis", "kid", "kids", "teen", "school", "underage", "near me"],
@@ -52,6 +100,30 @@
     "scenario": ["flavour", "flavor", "beginner", "travel", "nicotine free", "rechargeable", "mint", "fruit", "choose", "for "],
     "knowledge": ["what is", "what are", "how to", "guide", "properly", "meaning", "legal", "safe", "safety", "age", "dispose", "battery"],
     "mainBlogExclusions": ["legal", "law", "age", "safe", "safety", "dispose", "battery"]
+  },
+  "classifier": {
+    "labels": {
+      "mainCollection": "\u4e3b\u7ad9-\u96c6\u5408\u9875",
+      "mainBlog": "\u4e3b\u7ad9-\u535a\u5ba2",
+      "blogA": "\u535a\u5ba2A-\u77e5\u8bc6\u6559\u7a0b",
+      "blogB": "\u535a\u5ba2B-\u573a\u666f\u4eba\u7fa4",
+      "blogC": "\u535a\u5ba2C-\u5bf9\u6bd4\u8bc4\u6d4b",
+      "risk": "\u6682\u4e0d\u505a"
+    },
+    "stopwords": {
+      "projectTerms": []
+    },
+    "assignRules": {
+      "order": ["risk", "transactionalCore", "comparisonCoreCommercial", "mainBlog", "comparison", "scenario", "knowledge"],
+      "risk": {"output": {"assignedSite": "\u6682\u4e0d\u505a", "pageType": "\u98ce\u9669\u8bcd\u6c60", "intentBucket": "Risk"}},
+      "transactionalCore": {"output": {"assignedSite": "\u4e3b\u7ad9-\u96c6\u5408\u9875", "pageType": "\u96c6\u5408\u9875 / \u4ea7\u54c1\u5217\u8868", "intentBucket": "Transactional"}},
+      "comparisonCoreCommercial": {"output": {"assignedSite": "\u4e3b\u7ad9-\u535a\u5ba2", "pageType": "\u5546\u4e1a\u524d\u6559\u80b2\u6587\u7ae0 / Listicle", "intentBucket": "Commercial Investigation"}},
+      "mainBlog": {"when": {"phrases": ["how to", "properly", "guide", "choose"]}, "output": {"assignedSite": "\u4e3b\u7ad9-\u535a\u5ba2", "pageType": "\u535a\u5ba2\u6559\u7a0b\u6587\u7ae0", "intentBucket": "Informational + Buyer Adjacent"}},
+      "comparison": {"output": {"assignedSite": "\u535a\u5ba2C-\u5bf9\u6bd4\u8bc4\u6d4b", "pageType": "\u5bf9\u6bd4 / \u8bc4\u6d4b / \u66ff\u4ee3\u65b9\u6848\u6587\u7ae0", "intentBucket": "Comparison"}},
+      "scenario": {"output": {"assignedSite": "\u535a\u5ba2B-\u573a\u666f\u4eba\u7fa4", "pageType": "\u573a\u666f / \u4eba\u7fa4 / \u53e3\u5473\u7075\u611f\u6587\u7ae0", "intentBucket": "Scenario"}},
+      "knowledge": {"output": {"assignedSite": "\u535a\u5ba2A-\u77e5\u8bc6\u6559\u7a0b", "pageType": "\u77e5\u8bc6\u6559\u7a0b / FAQ \u6587\u7ae0", "intentBucket": "Informational"}},
+      "fallback": {"output": {"assignedSite": "\u535a\u5ba2A-\u77e5\u8bc6\u6559\u7a0b", "pageType": "\u63a2\u7d22\u578b\u6587\u7ae0", "intentBucket": "Exploratory"}}
+    }
   },
   "scoring": {
     "maxScore": 100,

@@ -96,6 +96,13 @@ export function AnalyticsPage() {
         </div>
       </div>
 
+      <div className="card automation-panel">
+        <div>
+          <strong>策略效果闭环</strong>
+          <div className="automation-panel__meta">这里保留站点级 GSC / GA4 分析；策略级基线、检查点、效果结论和下次检查请从左侧进入“今日策略 → 5. 效果观察”查看。</div>
+        </div>
+      </div>
+
       <DataGuard loading={overview.loading} error={overview.error} empty={!data} emptyTitle="暂无数据分析数据">
         {data && (
           <>
@@ -153,11 +160,6 @@ export function AnalyticsPage() {
             <div className="serp-grid">
               <BreakdownCard title="GSC 国家分布" icon="public" rows={data.gscCountries} emptyHint="GSC 同步后按国家聚合展示" />
               <BreakdownCard title="GSC 设备分布" icon="devices" rows={data.gscDevices} emptyHint="GSC 同步后按设备聚合展示" />
-            </div>
-
-            <div className="card">
-              <CardTitle icon="auto_awesome" tone="gold" title="AI 引用可见性" tag="尚未接入真实采集源" />
-              <StateBlock icon="auto_awesome" title="暂无 AI 搜索引用数据" hint="GSC 和 GA4 不提供 AI 引用指标；后续需要独立的 AI 搜索结果采集与历史记录接口，当前不展示假数据。" />
             </div>
 
             <div className="serp-grid">

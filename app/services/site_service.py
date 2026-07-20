@@ -6,7 +6,7 @@ from typing import Any
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-SUPPORTED_SITE_TYPES = ("main", "wp", "blog", "other")
+SUPPORTED_SITE_TYPES = ("main", "wp", "blog", "shopify", "other")
 
 
 async def list_sites(
@@ -20,8 +20,8 @@ async def list_sites(
     """????????"""
     sql = "SELECT id, site_key, name, site_type, domain, base_url, api_base_url, " \
           "market, language_code, google_gl, google_hl, semrush_database, " \
-          "content_role, content_scope, is_main, allow_external_links, " \
-          "status, notes, api_config, created_at, updated_at " \
+          "content_role, content_scope, business_id, strategy_enabled, is_main, allow_external_links, " \
+          "status, notes, api_config, knowledge_profile, created_at, updated_at " \
           "FROM seo_agent.sites WHERE 1=1"
     params: dict[str, Any] = {}
     if market:
@@ -44,14 +44,68 @@ async def get_site(session: AsyncSession, site_id: str) -> dict[str, Any] | None
         text(
             "SELECT id, site_key, name, site_type, domain, base_url, api_base_url, "
             "market, language_code, google_gl, google_hl, semrush_database, "
-            "content_role, content_scope, is_main, allow_external_links, "
-            "status, notes, api_config, created_at, updated_at "
+            "content_role, content_scope, business_id, strategy_enabled, is_main, allow_external_links, "
+            "status, notes, api_config, knowledge_profile, created_at, updated_at "
             "FROM seo_agent.sites WHERE id = :id"
         ),
         {"id": site_id},
     )
     row = result.mappings().first()
     return _attach_publish_state(dict(row)) if row else None
+
+
+async def resolve_site(
+    session: AsyncSession,
+    *,
+    site_id: str | None = None,
+    label: str | None = None,
+    market: str | None = None,
+    language_code: str | None = None,
+) -> dict[str, Any] | None:
+    if site_id:
+        row = (
+            await session.execute(
+                text(
+                    "SELECT id, site_key, name, content_role, market, language_code "
+                    "FROM seo_agent.sites WHERE id = :id AND status = 'active' "
+                    "AND (CAST(:market AS text) IS NULL OR market = CAST(:market AS text)) "
+                    "AND (CAST(:language_code AS text) IS NULL OR lower(language_code) = lower(CAST(:language_code AS text)))"
+                ),
+                {"id": site_id, "market": market, "language_code": language_code},
+            )
+        ).mappings().first()
+        return dict(row) if row else None
+    if not label:
+        return None
+    exact = await session.execute(
+        text(
+            "SELECT id, site_key, name, content_role, market, language_code "
+            "FROM seo_agent.sites WHERE status = 'active' "
+            "AND (site_key = :label OR name = :label) "
+            "AND (CAST(:market AS text) IS NULL OR market = CAST(:market AS text)) "
+            "AND (CAST(:language_code AS text) IS NULL OR lower(language_code) = lower(CAST(:language_code AS text)))"
+        ),
+        {"label": label, "market": market, "language_code": language_code},
+    )
+    exact_rows = exact.mappings().all()
+    if len(exact_rows) == 1:
+        return dict(exact_rows[0])
+    result = await session.execute(
+        text(
+            """
+            SELECT id, site_key, name, content_role, market, language_code
+              FROM seo_agent.sites
+             WHERE status = 'active'
+               AND content_role = :label
+               AND (CAST(:market AS text) IS NULL OR market = CAST(:market AS text))
+               AND (CAST(:language_code AS text) IS NULL OR lower(language_code) = lower(CAST(:language_code AS text)))
+             ORDER BY name
+            """
+        ),
+        {"label": label, "market": market, "language_code": language_code},
+    )
+    rows = result.mappings().all()
+    return dict(rows[0]) if len(rows) == 1 else None
 
 
 async def resolve_site_id(
@@ -62,33 +116,14 @@ async def resolve_site_id(
     market: str | None = None,
     language_code: str | None = None,
 ) -> str | None:
-    if site_id:
-        return str(site_id)
-    if not label:
-        return None
-    exact = await session.execute(
-        text("SELECT id FROM seo_agent.sites WHERE site_key = :label OR name = :label LIMIT 1"),
-        {"label": label},
+    site = await resolve_site(
+        session,
+        site_id=site_id,
+        label=label,
+        market=market,
+        language_code=language_code,
     )
-    exact_id = exact.scalar_one_or_none()
-    if exact_id:
-        return str(exact_id)
-    result = await session.execute(
-        text(
-            """
-            SELECT id, count(*) OVER () AS match_count
-              FROM seo_agent.sites
-             WHERE content_role = :label
-               AND (CAST(:market AS text) IS NULL OR market = CAST(:market AS text))
-               AND (CAST(:language_code AS text) IS NULL OR lower(language_code) = lower(CAST(:language_code AS text)))
-             ORDER BY name
-             LIMIT 1
-            """
-        ),
-        {"label": label, "market": market, "language_code": language_code},
-    )
-    row = result.mappings().first()
-    return str(row["id"]) if row and int(row["match_count"]) == 1 else None
+    return str(site["id"]) if site else None
 
 
 async def upsert_site(session: AsyncSession, payload: dict[str, Any]) -> dict[str, Any]:
@@ -102,7 +137,7 @@ async def upsert_site(session: AsyncSession, payload: dict[str, Any]) -> dict[st
 
     existing = (
         await session.execute(
-            text("SELECT api_config, publish_config FROM seo_agent.sites WHERE site_key = :site_key"),
+            text("SELECT api_config, publish_config, raw, knowledge_profile, business_id, strategy_enabled FROM seo_agent.sites WHERE site_key = :site_key"),
             {"site_key": site_key},
         )
     ).mappings().first()
@@ -110,6 +145,12 @@ async def upsert_site(session: AsyncSession, payload: dict[str, Any]) -> dict[st
     input_publish_config = payload.get("publish_config") if "publish_config" in payload else payload.get("publishConfig")
     existing_api_config = (existing or {}).get("api_config") or {}
     existing_publish_config = (existing or {}).get("publish_config") or {}
+    existing_raw = (existing or {}).get("raw") or {}
+    existing_knowledge = (existing or {}).get("knowledge_profile") or {}
+    business_id = payload.get("business_id", payload.get("businessId", (existing or {}).get("business_id")))
+    strategy_enabled = bool(payload.get("strategy_enabled", payload.get("strategyEnabled", (existing or {}).get("strategy_enabled", False))))
+    if strategy_enabled and not str(business_id or "").strip():
+        raise ValueError("启用策略前必须设置 business_id")
     api_config = {**existing_api_config, **(input_api_config or {})}
     publish_config = {**existing_publish_config, **(input_publish_config or {})}
 
@@ -118,14 +159,14 @@ async def upsert_site(session: AsyncSession, payload: dict[str, Any]) -> dict[st
         INSERT INTO seo_agent.sites
           (site_key, name, site_type, domain, base_url, api_base_url,
            market, language_code, google_gl, google_hl, semrush_database,
-           content_role, content_scope, is_main, allow_external_links,
-           publish_config, api_config, status, notes, raw)
+           content_role, content_scope, business_id, strategy_enabled, is_main, allow_external_links,
+           publish_config, api_config, status, notes, raw, knowledge_profile)
         VALUES
           (:site_key, :name, :site_type, :domain, :base_url, :api_base_url,
            :market, :language_code, :google_gl, :google_hl, :semrush_database,
-           :content_role, :content_scope, :is_main, :allow_external_links,
+           :content_role, :content_scope, :business_id, :strategy_enabled, :is_main, :allow_external_links,
            CAST(:publish_config AS jsonb), CAST(:api_config AS jsonb),
-           :status, :notes, CAST(:raw AS jsonb))
+           :status, :notes, CAST(:raw AS jsonb), CAST(:knowledge_profile AS jsonb))
         ON CONFLICT (site_key) DO UPDATE SET
           name = EXCLUDED.name,
           site_type = EXCLUDED.site_type,
@@ -139,14 +180,17 @@ async def upsert_site(session: AsyncSession, payload: dict[str, Any]) -> dict[st
           semrush_database = EXCLUDED.semrush_database,
           content_role = EXCLUDED.content_role,
           content_scope = EXCLUDED.content_scope,
+          business_id = EXCLUDED.business_id,
+          strategy_enabled = EXCLUDED.strategy_enabled,
           is_main = EXCLUDED.is_main,
           allow_external_links = EXCLUDED.allow_external_links,
           publish_config = EXCLUDED.publish_config,
           api_config = EXCLUDED.api_config,
           status = EXCLUDED.status,
           notes = EXCLUDED.notes,
-          raw = EXCLUDED.raw
-        RETURNING id, site_key, name, site_type, status
+          raw = EXCLUDED.raw,
+          knowledge_profile = EXCLUDED.knowledge_profile
+        RETURNING id, site_key, name, site_type, business_id, strategy_enabled, status
         """
     )
     params = {
@@ -163,13 +207,16 @@ async def upsert_site(session: AsyncSession, payload: dict[str, Any]) -> dict[st
         "semrush_database": payload.get("semrush_database") or payload.get("semrushDatabase"),
         "content_role": payload.get("content_role") or payload.get("contentRole"),
         "content_scope": payload.get("content_scope") or payload.get("contentScope"),
+        "business_id": str(business_id).strip() if business_id else None,
+        "strategy_enabled": strategy_enabled,
         "is_main": bool(payload.get("is_main", payload.get("isMain", False))),
         "allow_external_links": bool(payload.get("allow_external_links", payload.get("allowExternalLinks", False))),
         "publish_config": _to_json(publish_config),
         "api_config": _to_json(api_config),
         "status": payload.get("status") or "active",
         "notes": payload.get("notes"),
-        "raw": _to_json(payload.get("raw") or payload),
+        "raw": _to_json({**existing_raw, **(payload.get("raw") if isinstance(payload.get("raw"), dict) else payload)}),
+        "knowledge_profile": _to_json(payload.get("knowledge_profile") if isinstance(payload.get("knowledge_profile"), dict) else existing_knowledge),
     }
     result = await session.execute(sql, params)
     await session.commit()
@@ -189,8 +236,9 @@ async def delete_site(session: AsyncSession, site_id: str) -> bool:
 
 def _attach_publish_state(site: dict[str, Any]) -> dict[str, Any]:
     api_config = site.pop("api_config", None) or {}
+    site["knowledge_profile"] = site.pop("knowledge_profile", None) or None
     site_type = (site.get("site_type") or "").lower()
-    connector_type = str(api_config.get("connector_type") or ("wordpress" if site_type == "wp" else "custom_openapi"))
+    connector_type = str(api_config.get("connector_type") or ("wordpress" if site_type == "wp" else "shopify" if site_type == "shopify" else "custom_openapi"))
     site["connector_type"] = connector_type
     site["api_config_summary"] = {
         "configured_keys": [key for key, value in api_config.items() if value and key not in {"connector_type"}],
@@ -206,6 +254,10 @@ def _attach_publish_state(site: dict[str, Any]) -> dict[str, Any]:
         )
         site["publish_adapter"] = "wordpress"
         site["publish_hint"] = "WordPress ?????" if ready else "?? WordPress ???????"
+    elif connector_type in {"shopify", "shopify_admin"}:
+        ready = bool(site.get("domain") or site.get("base_url"))
+        site["publish_adapter"] = "shopify"
+        site["publish_hint"] = "Shopify GraphQL" if ready else "?? Shopify ???????"
     else:
         ready = bool(
             (site.get("api_base_url") or site.get("base_url"))

@@ -22,6 +22,7 @@ settings = get_settings()
 
 # Google 同步调度：每 N 秒跑一次（默认 6 小时 = 21600 秒）。
 GOOGLE_SYNC_INTERVAL_SECONDS = 21600
+EFFECT_CHECK_INTERVAL_SECONDS = 3600
 
 
 async def _periodic_reload(stop_event: asyncio.Event) -> None:
@@ -72,6 +73,39 @@ async def _periodic_google_sync(stop_event: asyncio.Event) -> None:
             logger.warning("google_sync_scheduled_failed", error=str(e))
 
 
+async def _periodic_scheduled_automation(stop_event: asyncio.Event) -> None:
+    from app.services.automation_service import run_automation_once
+
+    while not stop_event.is_set():
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=max(30, settings.automation_interval_seconds))
+        except asyncio.TimeoutError:
+            pass
+        if stop_event.is_set():
+            break
+        try:
+            async with SessionLocal() as session:
+                await run_automation_once(session, batch_size=settings.automation_batch_size)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("scheduled_automation_failed", error=str(e))
+
+
+async def _periodic_effect_checks(stop_event: asyncio.Event) -> None:
+    """独立处理到期的效果检查；不领取策略执行任务，也不写外站。"""
+    from app.services.automation_service import run_effect_checks_once
+
+    while not stop_event.is_set():
+        try:
+            async with SessionLocal() as session:
+                await run_effect_checks_once(session)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("scheduled_effect_check_failed", error=str(e))
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=EFFECT_CHECK_INTERVAL_SECONDS)
+        except asyncio.TimeoutError:
+            pass
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     configure_logging(settings.log_level, settings.log_json)
@@ -93,12 +127,32 @@ async def lifespan(app: FastAPI):
     except Exception as e:  # noqa: BLE001
         logger.warning("google_config_init_failed", error=str(e))
 
+    try:
+        from app.services.automation_service import recover_interrupted_executions
+        from app.services.keyword_ai_service import clear_unreviewed_assignments
+
+        async with SessionLocal() as session:
+            await clear_unreviewed_assignments(session)
+            recovered = await recover_interrupted_executions(session)
+        if recovered:
+            logger.warning("interrupted_executions_recovered", count=recovered)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("interrupted_execution_recovery_failed", error=str(e))
+
     stop_event = asyncio.Event()
     reload_task = asyncio.create_task(_periodic_reload(stop_event))
     google_sync_task = asyncio.create_task(_periodic_google_sync(stop_event))
+    effect_check_task = asyncio.create_task(_periodic_effect_checks(stop_event))
+    scheduled_automation_task = (
+        asyncio.create_task(_periodic_scheduled_automation(stop_event))
+        if settings.automation_enabled
+        else None
+    )
     app.state.reload_stop = stop_event
     app.state.reload_task = reload_task
     app.state.google_sync_task = google_sync_task
+    app.state.effect_check_task = effect_check_task
+    app.state.scheduled_automation_task = scheduled_automation_task
 
     logger.info("startup_done", rule_version=store.version)
     try:
@@ -106,7 +160,9 @@ async def lifespan(app: FastAPI):
     finally:
         logger.info("shutdown_begin")
         stop_event.set()
-        for task in (reload_task, google_sync_task):
+        for task in (reload_task, google_sync_task, effect_check_task, scheduled_automation_task):
+            if task is None:
+                continue
             try:
                 await asyncio.wait_for(task, timeout=5)
             except asyncio.TimeoutError:
@@ -124,7 +180,7 @@ def create_app() -> FastAPI:
     if settings.app_env != "prod":
         app.add_middleware(
             CORSMiddleware,
-            allow_origins=["*"],
+            allow_origins=["http://127.0.0.1:5173", "http://localhost:5173"],
             allow_credentials=False,
             allow_methods=["*"],
             allow_headers=["*"],

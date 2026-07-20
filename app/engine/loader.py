@@ -8,6 +8,7 @@ payload 结构与 workflows/seo-standard.json 完全等价。
 import asyncio
 import json
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 import structlog
@@ -19,6 +20,17 @@ from app.engine import settings as _settings  # noqa: F401  保留用于未来�
 
 logger = structlog.get_logger(__name__)
 
+REQUIRED_RULE_KEYS = ("signals", "classifier", "localePolicy")
+REQUIRED_CLASSIFIER_KEYS = ("labels", "assignRules")
+
+
+def validate_rule_payload(payload: dict[str, Any]) -> list[str]:
+    errors = [key for key in REQUIRED_RULE_KEYS if not isinstance(payload.get(key), dict)]
+    classifier = payload.get("classifier") if isinstance(payload, dict) else None
+    if isinstance(classifier, dict):
+        errors.extend(f"classifier.{key}" for key in REQUIRED_CLASSIFIER_KEYS if not isinstance(classifier.get(key), dict))
+    return errors
+
 
 class RuleStore:
     """进程内单例，承载当前生效的 payload。"""
@@ -28,6 +40,7 @@ class RuleStore:
         self._version: str = ""
         self._loaded_at: datetime | None = None
         self._effective_at: datetime | None = None
+        self._source: str = ""
         self._lock = asyncio.Lock()
 
     @property
@@ -46,6 +59,14 @@ class RuleStore:
     def effective_at(self) -> datetime | None:
         return self._effective_at
 
+    @property
+    def source(self) -> str:
+        return self._source
+
+    @property
+    def healthy(self) -> bool:
+        return bool(self._payload) and not validate_rule_payload(self._payload)
+
     async def load_from_db(self, session: AsyncSession | None = None) -> dict[str, Any]:
         """从 PG 读 v_active_rule_set 的 payload，覆盖内存。"""
         own_session = session is None
@@ -60,16 +81,34 @@ class RuleStore:
             )
             row = result.mappings().first()
             if not row:
+                fallback_path = Path(__file__).resolve().parents[2] / "workflows" / "seo-standard.json"
+                if fallback_path.exists():
+                    payload = json.loads(fallback_path.read_text(encoding="utf-8"))
+                    errors = validate_rule_payload(payload)
+                    if errors:
+                        raise ValueError(f"local rule payload is incomplete: {', '.join(errors)}")
+                    async with self._lock:
+                        self._payload = payload
+                        self._version = payload.get("version", "file-fallback")
+                        self._effective_at = None
+                        self._loaded_at = datetime.utcnow()
+                        self._source = "file-fallback"
+                    logger.warning("rule_store_using_file_fallback", version=self._version)
+                    return payload
                 logger.warning("no_active_rule_set_in_db")
                 return {}
             async with self._lock:
                 payload = row["payload"]
                 if isinstance(payload, str):
                     payload = json.loads(payload)
+                errors = validate_rule_payload(payload)
+                if errors:
+                    raise ValueError(f"active rule payload is incomplete: {', '.join(errors)}")
                 self._payload = payload
                 self._version = row["version"]
                 self._effective_at = row["effective_at"]
                 self._loaded_at = datetime.utcnow()
+                self._source = "db"
             logger.info(
                 "rule_store_loaded",
                 version=self._version,

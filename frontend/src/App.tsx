@@ -1,37 +1,21 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { Sidebar } from '@/components/Sidebar'
 import { Topbar } from '@/components/Topbar'
-import { DashboardPage } from '@/pages/DashboardPage'
-import { OpportunitiesPage } from '@/pages/OpportunitiesPage'
-import { SerpPage } from '@/pages/SerpPage'
 import { KeywordsPage } from '@/pages/KeywordsPage'
-import { BriefPage } from '@/pages/BriefPage'
 import { ContentPage } from '@/pages/ContentPage'
 import { ArticlesPage } from '@/pages/ArticlesPage'
 import { SitesPage } from '@/pages/SitesPage'
 import { AnalyticsPage } from '@/pages/AnalyticsPage'
-import { RulesPage } from '@/pages/RulesPage'
-import { SyncPage } from '@/pages/SyncPage'
-import { AgentWorkbenchPage } from '@/pages/AgentWorkbenchPage'
+import { MainSiteContentPage } from '@/pages/MainSiteContentPage'
+import { useAutomationStatus } from '@/hooks/useData'
 
 type PageId =
-  | 'agent-command'
-  | 'agent-assets'
-  | 'agent-opportunities'
-  | 'agent-execution'
-  | 'agent-review'
-  | 'agent-risk'
-  | 'dashboard'
-  | 'opportunities'
-  | 'serp'
-  | 'keywords'
-  | 'brief'
   | 'content'
+  | 'keywords'
   | 'articles'
   | 'sites'
   | 'analytics'
-  | 'rules'
-  | 'sync'
+  | 'main-site-content'
 
 function todayLabel() {
   return new Intl.DateTimeFormat('zh-CN', {
@@ -43,50 +27,52 @@ function todayLabel() {
 }
 
 export default function App() {
-  const [page, setPage] = useState<PageId>('agent-command')
+  const [page, setPage] = useState<PageId>('content')
   const [notifications, setNotifications] = useState<Array<{ id: string; title: string; detail?: string; time: string }>>([])
+  const [taskRefreshKey, setTaskRefreshKey] = useState(0)
+  const execution = useAutomationStatus(taskRefreshKey)
+  const seenTasks = useRef<Set<string> | null>(null)
 
   function notify(title: string, detail?: string) {
     const time = new Intl.DateTimeFormat('zh-CN', { hour: '2-digit', minute: '2-digit' }).format(new Date())
     setNotifications((items) => [{ id: crypto.randomUUID(), title, detail, time }, ...items].slice(0, 20))
   }
 
+  useEffect(() => {
+    const timer = window.setInterval(() => setTaskRefreshKey((key) => key + 1), 5000)
+    return () => window.clearInterval(timer)
+  }, [])
+
+  useEffect(() => {
+    if (!execution.data) return
+    const current = new Set(execution.data.recent.map((item) => item.id))
+    if (seenTasks.current) {
+      execution.data.recent
+        .filter((item) => !seenTasks.current?.has(item.id))
+        .forEach((item) => notify(
+          item.task_type === 'keyword_review'
+            ? (item.status === 'done' ? 'AI 关键词分析完成' : 'AI 关键词分析失败')
+            : (item.status === 'done' ? '内容任务执行完成' : '内容任务执行失败'),
+          item.status === 'done' ? item.title : `${item.title}${item.error_message ? `：${item.error_message}` : ''}`,
+        ))
+    }
+    seenTasks.current = current
+  }, [execution.data])
+
   const pageNode = useMemo(() => {
     switch (page) {
-      case 'agent-command':
-        return <AgentWorkbenchPage view="command" onNotify={notify} />
-      case 'agent-assets':
-        return <AgentWorkbenchPage view="assets" onNotify={notify} />
-      case 'agent-opportunities':
-        return <AgentWorkbenchPage view="opportunities" onNotify={notify} />
-      case 'agent-execution':
-        return <AgentWorkbenchPage view="execution" onNotify={notify} />
-      case 'agent-review':
-        return <AnalyticsPage />
-      case 'agent-risk':
-        return <AgentWorkbenchPage view="risk" onNotify={notify} />
-      case 'dashboard':
-        return <AgentWorkbenchPage view="command" onNotify={notify} />
-      case 'opportunities':
-        return <OpportunitiesPage />
-      case 'serp':
-        return <SerpPage />
-      case 'keywords':
-        return <KeywordsPage onNotify={notify} onOpenContent={() => setPage('content')} />
-      case 'brief':
-        return <BriefPage />
       case 'content':
         return <ContentPage onNotify={notify} />
+      case 'keywords':
+        return <KeywordsPage onNotify={notify} onOpenContent={() => setPage('content')} />
       case 'articles':
         return <ArticlesPage />
       case 'sites':
         return <SitesPage />
       case 'analytics':
         return <AnalyticsPage />
-      case 'rules':
-        return <RulesPage />
-      case 'sync':
-        return <SyncPage />
+      case 'main-site-content':
+        return <MainSiteContentPage />
       default:
         return null
     }

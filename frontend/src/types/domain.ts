@@ -1,17 +1,4 @@
-/**
- * Domain types aligned with the backend field names.
- * Mirrors models from:
- *   - app/api/v1/business.py           (sites, keywords, articles, products)
- *   - app/api/v1/analytics.py          (gsc/ga4 source payloads)
- *   - app/api/v1/endpoints.py          (brief, prompt, mock-article, standard)
- *   - app/services/keyword_query_service.py
- *   - app/services/brief_service.py
- *
- * NOTE: This is a **mock** layer — real values are loaded by the API client
- * once endpoints are wired. Pages should never call fetch directly; instead
- * they consume the typed values from the data hooks below so the swap is
- * a one-file change.
- */
+/** Domain types aligned with the backend field names. */
 
 export type Priority = 'high' | 'medium-high' | 'medium' | 'medium-low' | 'low' | 'P0' | 'P1' | 'P2' | 'P3' | 'Hold'
 export type Status =
@@ -30,6 +17,98 @@ export type Status =
   | 'hold'
   | 'dropped'
 
+export interface SiteKnowledgeProfile {
+  status: 'draft' | 'confirmed' | string
+  positioning: string
+  audience: string
+  products: string[]
+  in_scope_topics: string[]
+  out_of_scope_topics: string[]
+  content_types: string[]
+  tone: string
+  conversion_goals: string[]
+  conversion_targets?: string[]
+  restricted_topics?: string[]
+  internal_link_rules?: string[]
+  editorial_rules: string[]
+  evidence: Array<{ source?: string; fact?: string }>
+  generated_at?: string
+  updated_at?: string
+  site_mode?: string
+  core_pages?: Array<{ url: string; page_type?: string; title?: string; h1?: string }>
+  index_scan?: {
+    filename: string
+    files?: Array<{ filename: string; source?: string; compressed?: boolean; indexed_urls?: number; scanned_urls?: number }>
+    source: 'sitemap' | 'url_list' | string
+    indexed_urls: number
+    scanned_urls: number
+    nested_sitemaps: number
+    summary?: SiteIndexScanSummary
+    issues?: SiteIndexScanIssue[]
+    product_hints?: string[]
+    urls?: string[]
+    pages?: Array<{ url: string; page_type?: string; title?: string; h1?: string[]; status?: string }>
+  }
+}
+
+export interface SiteIndexScanSummary {
+  pages: number
+  ok: number
+  issues: number
+  missing_title: number
+  missing_description: number
+  missing_h1: number
+  duplicate_title: number
+}
+
+export interface SiteIndexScanIssue {
+  url: string
+  page_type?: string
+  issues: string[]
+}
+
+export interface SiteIndexScanResult {
+  site_id: string
+  site_name?: string
+  index: {
+    filename: string
+    files?: Array<{ filename: string; source?: string; compressed?: boolean; indexed_urls?: number; scanned_urls?: number }>
+    indexed_urls: number
+    scanned_urls: number
+    nested_sitemaps: number
+  }
+  seo_audit: {
+    summary: SiteIndexScanSummary
+    issues: SiteIndexScanIssue[]
+    product_hints: string[]
+  }
+  knowledge_profile?: SiteKnowledgeProfile
+}
+
+export interface MainSiteContentItem {
+  url: string
+  page_type: string
+  role: string
+  recommendation: string
+  title: string
+  h1: string[]
+  status: string
+}
+
+export interface MainSiteContentPlan {
+  site_id: string
+  site_name: string
+  indexed_urls: number
+  scanned_pages: number
+  unscanned_urls: number
+  counts: Record<string, number>
+  commercial_targets: MainSiteContentItem[]
+  supporting_articles: MainSiteContentItem[]
+  inventory: MainSiteContentItem[]
+  rules: string[]
+  references: string[]
+}
+
 export interface Site {
   id: string
   site_key: string
@@ -46,6 +125,8 @@ export interface Site {
   semrush_database: string | null
   content_role: string | null
   content_scope: string | null
+  business_id: string | null
+  strategy_enabled: boolean
   is_main: boolean
   allow_external_links: boolean
   publish_config: Record<string, unknown>
@@ -53,6 +134,7 @@ export interface Site {
   api_config_summary?: { configured_keys: string[]; articles_path?: string; publish_path?: string }
   status: 'active' | 'paused' | 'review'
   notes: string | null
+  knowledge_profile?: SiteKnowledgeProfile | null
   publish_ready?: boolean
   publish_adapter?: string
   publish_hint?: string
@@ -62,7 +144,7 @@ export interface Keyword {
   id: string
   keyword: string
   normalized_keyword: string
-  source: 'semrush' | 'manual' | 'gsc' | 'import'
+  source: 'semrush' | 'semrush_strategy_builder' | 'manual' | 'gsc' | 'import'
   semrush_database: string
   market: string
   language_code: string
@@ -72,7 +154,24 @@ export interface Keyword {
   kd: number | string | null
   cpc: number | string | null
   intent: 'informational' | 'commercial' | 'transactional' | 'navigational' | 'unknown' | string
+  serp_features?: string[] | Record<string, unknown> | null
+  trend?: number | string | null
+  trend_data?: number[] | null
+  pkd?: number | string | null
+  potential_traffic?: number | string | null
+  competitive_density?: number | string | null
+  serp_results?: number | null
+  keyword_type?: string | null
+  preflight_status?: 'ready' | 'needs_review' | 'invalid' | string
+  preflight_reason?: string | null
+  cluster_validation_status?: string | null
+  business_id?: string | null
+  source_batch_id?: string | null
   topic_cluster: string
+  topic_cluster_id?: string | null
+  cluster_role?: 'pillar' | 'supporting' | 'standalone' | string | null
+  cluster_size?: number | null
+  pillar_keyword?: string | null
   seed_keyword: string
   page_group: string
   assigned_site_id: string
@@ -105,25 +204,6 @@ export interface Keyword {
   updated_at: string
 }
 
-export interface Brief {
-  brief: string
-  locale: { googleGl: string; googleHl: string }
-  articleBriefTemplate: Array<{ name: string; required: boolean }>
-  reference: { triggered: boolean; sources: Array<{ name: string; label: string; url: string }> }
-  parentPage: { url: string; title: string } | null
-  targetAsset: { url: string | null; status: string; contentAction: string }
-  imagePlan: Array<{ name: string; position: string }>
-  recommendedUrl: string
-  briefSource: 'local' | 'ai-enhanced'
-  aiEnhanced: boolean
-  aiMeta: {
-    stage: string
-    provider: string
-    model: string
-    status?: string
-  }
-}
-
 export interface Article {
   id: string
   task_id: string | null
@@ -144,6 +224,26 @@ export interface Article {
   meta_description: string
   generation_provider: string
   generation_model: string
+  created_at: string
+  updated_at: string
+}
+
+export type StrategyEffectStatus = 'observing' | 'winner' | 'neutral' | 'loser' | 'inconclusive' | 'contaminated'
+
+export interface StrategyEffect {
+  id: string
+  status: StrategyEffectStatus
+  site_id: string | null
+  site_name: string | null
+  query: string
+  action_type: string
+  target_url: string | null
+  strategy_fingerprint: string
+  baseline: Record<string, unknown> | null
+  checkpoints: Array<Record<string, unknown>>
+  outcome: Record<string, unknown> | StrategyEffectStatus | null
+  cooldown_until: string | null
+  next_check_at: string | null
   created_at: string
   updated_at: string
 }

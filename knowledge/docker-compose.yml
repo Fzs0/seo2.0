@@ -1,0 +1,30 @@
+name: knowledge-system
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: knowledge-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: knowledge_system
+      POSTGRES_USER: knowledge
+      POSTGRES_PASSWORD: "${KNOWLEDGE_DB_PASSWORD:?Set KNOWLEDGE_DB_PASSWORD in knowledge/.env or the process environment}"
+    ports:
+      - "127.0.0.1:5434:5432"
+    volumes:
+      - knowledge-postgres-data:/var/lib/postgresql/data
+      - ./db/migrations/001_init.sql:/docker-entrypoint-initdb.d/001_init.sql:ro
+      - ./db/migrations/002_batch_ingestion.sql:/docker-entrypoint-initdb.d/002_batch_ingestion.sql:ro
+      - ./db/migrations/003_claim_quality_gate.sql:/docker-entrypoint-initdb.d/003_claim_quality_gate.sql:ro
+      - ./db/migrations/004_market_signals.sql:/docker-entrypoint-initdb.d/004_market_signals.sql:ro
+      - ./db/migrations/005_signal_crawl_jobs.sql:/docker-entrypoint-initdb.d/005_signal_crawl_jobs.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U knowledge -d knowledge_system"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+volumes:
+  knowledge-postgres-data:
+    name: knowledge-system-postgres-data

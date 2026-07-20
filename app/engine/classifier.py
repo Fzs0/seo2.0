@@ -39,6 +39,21 @@ def _core_terms(project: dict[str, Any]) -> list[str]:
     return list(dict.fromkeys(explicit + page_terms))
 
 
+def keyword_scope(raw_keyword: str, project: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Return a cheap business-scope gate before AI or site assignment."""
+    project = project or {}
+    signals = get_store().get("signals", {}) or {}
+    core_terms = signals.get("coreProduct", []) or []
+    terms = list(dict.fromkeys(core_terms + _core_terms(project)))
+    tokens = set(re.findall(r"[a-z0-9]+", (raw_keyword or "").lower()))
+    matched = [term for term in terms if set(re.findall(r"[a-z0-9]+", str(term).lower())) <= tokens]
+    if matched:
+        return {"status": "relevant", "matched": matched[:3], "reason": "命中业务核心词。"}
+    if not terms:
+        return {"status": "needs_review", "matched": [], "reason": "未配置业务核心词，不能自动判断业务相关性。"}
+    return {"status": "irrelevant", "matched": [], "reason": "未命中当前业务核心词，暂不分配站点或生成策略。"}
+
+
 def classify_keyword(
     raw_keyword: str,
     raw_intent: str = "",
@@ -82,7 +97,7 @@ def classify_keyword(
             rule_key == "comparisonCoreCommercial"
             and is_comparison
             and has_core
-            and (is_commercial or "best" in keyword)
+            and is_commercial
         ):
             return _output(out, labels, "Commercial Investigation", labels.get("mainBlog", "主站-博客"), "商业前教育文章 / Listicle")
         if rule_key == "mainBlog":
@@ -95,6 +110,8 @@ def classify_keyword(
                     _has_any(keyword, mb.get("phrases", ["how to", "properly", "guide", "choose"]))
                     or is_commercial
                 )
+                and not is_comparison
+                and not is_scenario
             ):
                 return _output(out, labels, "Informational + Buyer Adjacent", labels.get("mainBlog", "主站-博客"), "主站教程文章")
         if rule_key == "comparison" and is_comparison:

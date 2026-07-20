@@ -2,10 +2,24 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
+
+
+def _json_text(value: Any, default: Any) -> str:
+    if value in (None, ""):
+        value = default
+    if isinstance(value, str):
+        try:
+            json.loads(value)
+            return value
+        except json.JSONDecodeError:
+            value = [part.strip() for part in re.split(r"[,;|]", value) if part.strip()]
+    return json.dumps(value, ensure_ascii=False, default=str)
+
 
 
 async def upsert_sites(session: AsyncSession, sites: list[dict[str, Any]]) -> int:
@@ -74,66 +88,107 @@ async def upsert_sites(session: AsyncSession, sites: list[dict[str, Any]]) -> in
 async def upsert_keywords(session: AsyncSession, keywords: list[dict[str, Any]]) -> int:
     if not keywords:
         return 0
-    rows = [
-        {
-            "keyword": k.get("keyword"),
-            "source": k.get("source") or "semrush",
-            "source_file": k.get("source_file") or k.get("sourceFile"),
-            "semrush_database": k.get("database"),
-            "market": k.get("market"),
-            "language_code": k.get("language_code") or k.get("languageCode"),
-            "google_gl": k.get("google_gl") or k.get("googleGl"),
-            "google_hl": k.get("google_hl") or k.get("googleHl"),
-            "volume": int(k.get("volume") or 0),
-            "kd": float(k.get("kd") or 0),
-            "cpc": float(k.get("cpc") or 0),
-            "intent": k.get("intent"),
-            "topic_cluster": k.get("topicCluster") or k.get("topic_cluster"),
-            "seed_keyword": k.get("seedKeyword") or k.get("seed_keyword"),
-            "page_group": k.get("pageGroup") or k.get("page_group"),
-            "page_type": k.get("pageType") or k.get("page_type"),
-            "page_role": k.get("pageRole") or k.get("page_role"),
-            "assigned_site_label": k.get("assignedSite") or k.get("assigned_site_label"),
-            "target_asset_url": k.get("targetAsset") or k.get("target_asset_url"),
-            "asset_status": k.get("assetStatus") or k.get("asset_status"),
-            "content_action": k.get("contentAction") or k.get("content_action"),
-            "priority": k.get("priority"),
-            "score": float((k.get("scores") or {}).get("total") or k.get("score") or 0),
-            "status": k.get("status") or "analyzed",
-            "reason": k.get("reason"),
-            "raw": json.dumps(k.get("raw") or {}, ensure_ascii=False),
-        }
-        for k in keywords
-    ]
+    rows = []
+    for keyword in keywords:
+        rows.append(
+            {
+                "keyword": keyword.get("keyword"),
+                "source": keyword.get("source") or "semrush",
+                "source_file": keyword.get("source_file") or keyword.get("sourceFile"),
+                "semrush_database": keyword.get("database"),
+                "market": keyword.get("market"),
+                "language_code": keyword.get("language_code") or keyword.get("languageCode"),
+                "google_gl": keyword.get("google_gl") or keyword.get("googleGl"),
+                "google_hl": keyword.get("google_hl") or keyword.get("googleHl"),
+                "volume": int(keyword.get("volume") or 0),
+                "kd": float(keyword.get("kd") or 0),
+                "cpc": float(keyword.get("cpc") or 0),
+                "intent": keyword.get("intent"),
+                "serp_features": _json_text(keyword.get("serpFeatures") or keyword.get("serp_features"), []),
+                "trend": float(keyword.get("trend") or 0),
+                "trend_data": _json_text(keyword.get("trendData") or keyword.get("trend_data"), []),
+                "pkd": float(keyword.get("pkd") or 0),
+                "potential_traffic": float(keyword.get("potentialTraffic") or keyword.get("potential_traffic") or 0),
+                "competitive_density": float(keyword.get("competitiveDensity") or keyword.get("competitive_density") or 0),
+                "serp_results": int(keyword.get("serpResults") or keyword.get("serp_results") or 0),
+                "keyword_type": keyword.get("keywordType") or keyword.get("keyword_type"),
+                "preflight_status": keyword.get("preflightStatus") or keyword.get("preflight_status") or "ready",
+                "preflight_reason": keyword.get("preflightReason") or keyword.get("preflight_reason"),
+                "business_id": keyword.get("businessId") or keyword.get("business_id"),
+                "source_batch_id": keyword.get("sourceBatchId") or keyword.get("source_batch_id"),
+                "topic_cluster": keyword.get("topicCluster") or keyword.get("topic_cluster"),
+                "seed_keyword": keyword.get("seedKeyword") or keyword.get("seed_keyword"),
+                "page_group": keyword.get("pageGroup") or keyword.get("page_group"),
+                "topic_cluster_id": keyword.get("topicClusterId") or keyword.get("topic_cluster_id"),
+                "cluster_role": keyword.get("clusterRole") or keyword.get("cluster_role"),
+                "cluster_size": keyword.get("clusterSize") or keyword.get("cluster_size"),
+                "pillar_keyword": keyword.get("pillarKeyword") or keyword.get("pillar_keyword"),
+                "page_type": keyword.get("pageType") or keyword.get("page_type"),
+                "page_role": keyword.get("pageRole") or keyword.get("page_role"),
+                "assigned_site_id": None,
+                "assigned_site_label": None,
+                "target_asset_url": keyword.get("targetAsset") or keyword.get("target_asset_url"),
+                "asset_status": keyword.get("assetStatus") or keyword.get("asset_status"),
+                "content_action": keyword.get("contentAction") or keyword.get("content_action"),
+                "priority": keyword.get("priority"),
+                "score": float((keyword.get("scores") or {}).get("total") or keyword.get("score") or 0),
+                "status": keyword.get("status") if keyword.get("status") in {"imported", "hold", "dropped"} else "imported",
+                "reason": keyword.get("reason"),
+                "raw": json.dumps(keyword.get("raw") or {}, ensure_ascii=False),
+            }
+        )
     sql = text(
         """
         INSERT INTO seo_agent.keywords
           (keyword, source, source_file, semrush_database, market, language_code, google_gl, google_hl,
-           volume, kd, cpc, intent, topic_cluster, seed_keyword, page_group, page_type, page_role,
-           assigned_site_label, target_asset_url, asset_status, content_action, priority, score, status, reason, raw)
+           volume, kd, cpc, intent, serp_features, trend, trend_data, pkd, potential_traffic, competitive_density, serp_results,
+           keyword_type, preflight_status, preflight_reason, business_id, source_batch_id,
+           topic_cluster, topic_cluster_id, cluster_role, cluster_size, pillar_keyword, seed_keyword, page_group, page_type, page_role,
+           assigned_site_id, assigned_site_label, target_asset_url, asset_status, content_action, priority, score, status, reason, raw)
         VALUES
           (:keyword, :source, :source_file, :semrush_database, :market, :language_code, :google_gl, :google_hl,
-           :volume, :kd, :cpc, :intent, :topic_cluster, :seed_keyword, :page_group, :page_type, :page_role,
-           :assigned_site_label, :target_asset_url, :asset_status, :content_action, :priority, :score, :status, :reason, CAST(:raw AS jsonb))
-        ON CONFLICT (normalized_keyword, COALESCE(semrush_database, ''), COALESCE(market, ''), COALESCE(language_code, ''))
+          :volume, :kd, :cpc, :intent, CAST(:serp_features AS jsonb), :trend, CAST(:trend_data AS jsonb), :pkd, :potential_traffic, :competitive_density, :serp_results,
+          :keyword_type, :preflight_status, :preflight_reason, :business_id, :source_batch_id,
+          :topic_cluster, :topic_cluster_id, :cluster_role, :cluster_size, :pillar_keyword, :seed_keyword, :page_group, :page_type, :page_role,
+           CAST(:assigned_site_id AS uuid), :assigned_site_label, :target_asset_url, :asset_status, :content_action, :priority, :score, :status, :reason, CAST(:raw AS jsonb))
+        ON CONFLICT (COALESCE(business_id, ''), normalized_keyword, COALESCE(semrush_database, ''), COALESCE(market, ''), COALESCE(language_code, ''))
         DO UPDATE SET
+          source = EXCLUDED.source,
+          source_file = EXCLUDED.source_file,
           volume = EXCLUDED.volume,
           kd = EXCLUDED.kd,
           cpc = EXCLUDED.cpc,
           intent = EXCLUDED.intent,
+          serp_features = EXCLUDED.serp_features,
+          trend = EXCLUDED.trend,
+          trend_data = EXCLUDED.trend_data,
+          pkd = EXCLUDED.pkd,
+          potential_traffic = EXCLUDED.potential_traffic,
+          competitive_density = EXCLUDED.competitive_density,
+          serp_results = EXCLUDED.serp_results,
+          keyword_type = EXCLUDED.keyword_type,
+          preflight_status = EXCLUDED.preflight_status,
+          preflight_reason = EXCLUDED.preflight_reason,
+          business_id = EXCLUDED.business_id,
+          source_batch_id = EXCLUDED.source_batch_id,
           topic_cluster = EXCLUDED.topic_cluster,
+          topic_cluster_id = EXCLUDED.topic_cluster_id,
+          cluster_role = EXCLUDED.cluster_role,
+          cluster_size = EXCLUDED.cluster_size,
+          pillar_keyword = EXCLUDED.pillar_keyword,
           seed_keyword = EXCLUDED.seed_keyword,
           page_group = EXCLUDED.page_group,
           page_type = EXCLUDED.page_type,
           page_role = EXCLUDED.page_role,
-          assigned_site_label = EXCLUDED.assigned_site_label,
-          target_asset_url = EXCLUDED.target_asset_url,
-          asset_status = EXCLUDED.asset_status,
-          content_action = EXCLUDED.content_action,
-          priority = EXCLUDED.priority,
-          score = EXCLUDED.score,
-          status = EXCLUDED.status,
-          reason = EXCLUDED.reason,
+          assigned_site_id = CASE WHEN seo_agent.keywords.ai_review ? 'strategy' THEN seo_agent.keywords.assigned_site_id ELSE NULL END,
+          assigned_site_label = CASE WHEN seo_agent.keywords.ai_review ? 'strategy' THEN seo_agent.keywords.assigned_site_label ELSE NULL END,
+          target_asset_url = CASE WHEN seo_agent.keywords.ai_review ? 'strategy' THEN seo_agent.keywords.target_asset_url ELSE EXCLUDED.target_asset_url END,
+          asset_status = CASE WHEN seo_agent.keywords.ai_review ? 'strategy' THEN seo_agent.keywords.asset_status ELSE EXCLUDED.asset_status END,
+          content_action = CASE WHEN seo_agent.keywords.ai_review ? 'strategy' THEN seo_agent.keywords.content_action ELSE EXCLUDED.content_action END,
+          priority = CASE WHEN seo_agent.keywords.ai_review ? 'strategy' THEN seo_agent.keywords.priority ELSE EXCLUDED.priority END,
+          score = CASE WHEN seo_agent.keywords.ai_review ? 'strategy' THEN seo_agent.keywords.score ELSE EXCLUDED.score END,
+          status = CASE WHEN seo_agent.keywords.ai_review ? 'strategy' THEN seo_agent.keywords.status ELSE 'imported' END,
+          reason = CASE WHEN seo_agent.keywords.ai_review ? 'strategy' THEN seo_agent.keywords.reason ELSE EXCLUDED.reason END,
           raw = EXCLUDED.raw
         """
     )

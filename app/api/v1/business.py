@@ -6,7 +6,7 @@ from __future__ import annotations
 from typing import Any
 
 import structlog
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -28,13 +28,16 @@ from app.services.product_service import (
     list_products,
 )
 from app.services.post_sync_service import list_posts, sync_all_site_posts, sync_site_posts
-from app.services.keyword_query_service import get_keyword, list_keywords
+from app.services.keyword_query_service import build_analysis_queue, get_keyword, list_keywords
 from app.services.site_service import (
     delete_site,
     get_site,
     list_sites,
     upsert_site,
 )
+from app.services.site_knowledge_service import generate_site_knowledge, save_site_knowledge
+from app.services.site_index_service import scan_site_index
+from app.services.main_site_content_service import get_main_site_content_plan
 from app.services.site_config_service import sync_sites_from_config
 from app.services.site_snapshot_service import probe_apis
 
@@ -68,6 +71,10 @@ class SiteUpsertBody(BaseModel):
     contentRole: str | None = None
     content_scope: str | None = None
     contentScope: str | None = None
+    business_id: str | None = None
+    businessId: str | None = None
+    strategy_enabled: bool | None = None
+    strategyEnabled: bool | None = None
     is_main: bool = False
     isMain: bool = False
     allow_external_links: bool = False
@@ -79,6 +86,29 @@ class SiteUpsertBody(BaseModel):
     status: str | None = None
     notes: str | None = None
     raw: dict[str, Any] | None = None
+    knowledge_profile: dict[str, Any] | None = None
+
+
+class SiteKnowledgeBody(BaseModel):
+    status: str = "draft"
+    site_mode: str = ""
+    positioning: str = ""
+    audience: str = ""
+    products: list[str] = Field(default_factory=list)
+    in_scope_topics: list[str] = Field(default_factory=list)
+    out_of_scope_topics: list[str] = Field(default_factory=list)
+    content_types: list[str] = Field(default_factory=list)
+    tone: str = ""
+    conversion_goals: list[str] = Field(default_factory=list)
+    conversion_targets: list[str] = Field(default_factory=list)
+    restricted_topics: list[str] = Field(default_factory=list)
+    internal_link_rules: list[str] = Field(default_factory=list)
+    editorial_rules: list[str] = Field(default_factory=list)
+    core_pages: list[dict[str, Any]] = Field(default_factory=list)
+    index_scan: dict[str, Any] = Field(default_factory=dict)
+    evidence: list[dict[str, Any]] = Field(default_factory=list)
+    generated_at: str | None = None
+    updated_at: str | None = None
 
 
 @router.get("/sites")
@@ -116,6 +146,50 @@ async def upsert_site_route(body: SiteUpsertBody, session: AsyncSession = Depend
     return info
 
 
+@router.post("/sites/{site_id}/knowledge/generate")
+async def generate_site_knowledge_route(site_id: str, session: AsyncSession = Depends(get_db)) -> dict[str, Any]:
+    try:
+        return await generate_site_knowledge(session, site_id)
+    except ValueError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+
+
+@router.post("/sites/{site_id}/knowledge")
+async def save_site_knowledge_route(
+    site_id: str,
+    body: SiteKnowledgeBody,
+    session: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    if body.status not in {"draft", "confirmed"}:
+        raise HTTPException(status_code=400, detail="knowledge status must be draft or confirmed")
+    try:
+        profile = await save_site_knowledge(session, site_id, body.model_dump(exclude_none=True))
+    except ValueError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    return {"site_id": site_id, "knowledge_profile": profile}
+
+
+@router.post("/sites/{site_id}/index-scan")
+async def scan_site_index_route(site_id: str, request: Request, session: AsyncSession = Depends(get_db)) -> dict[str, Any]:
+    content = await request.body()
+    if not content:
+        raise HTTPException(status_code=400, detail="请上传 Sitemap 或 URL 索引文件")
+    filename = request.headers.get("x-filename") or "sitemap.xml"
+    replace = request.query_params.get("replace", "true").lower() != "false"
+    try:
+        return await scan_site_index(session, site_id, content, filename, replace=replace)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+
+
+@router.get("/sites/{site_id}/main-content")
+async def main_site_content_route(site_id: str, session: AsyncSession = Depends(get_db)) -> dict[str, Any]:
+    try:
+        return await get_main_site_content_plan(session, site_id)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+
+
 @router.post("/sites/sync-config")
 async def sync_sites_config_route(session: AsyncSession = Depends(get_db)) -> dict[str, Any]:
     return await sync_sites_from_config(session)
@@ -139,6 +213,9 @@ async def list_keywords_route(
     min_score: float | None = None,
     market: str | None = None,
     search: str | None = None,
+    ai_analyzed: bool | None = None,
+    intent: str | None = None,
+    serp_feature: str | None = None,
     limit: int = Query(50, ge=1, le=500),
     offset: int = Query(0, ge=0),
     session: AsyncSession = Depends(get_db),
@@ -151,9 +228,20 @@ async def list_keywords_route(
         min_score=min_score,
         market=market,
         search=search,
+        ai_analyzed=ai_analyzed,
+        intent=intent,
+        serp_feature=serp_feature,
         limit=limit,
         offset=offset,
     )
+
+
+@router.get("/keywords/analysis-queue")
+async def keyword_analysis_queue_route(
+    limit: int = Query(100, ge=1, le=200),
+    session: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    return await build_analysis_queue(session, limit=limit)
 
 
 @router.get("/keywords/{keyword_id}")
@@ -273,6 +361,7 @@ async def inspect_site_connector_route(
         ),
         {"id": site_id},
     )
+
     site = row.mappings().first()
     if not site:
         raise HTTPException(status_code=404, detail="site not found")
@@ -399,6 +488,7 @@ class PublishBody(BaseModel):
     site_id: str | None = None
     dry_run: bool = True
     actor: str | None = None
+    update_post_id: str | None = None
 
 
 @router.post("/publish")
@@ -410,6 +500,7 @@ async def publish_route(body: PublishBody, session: AsyncSession = Depends(get_d
             site_id=body.site_id,
             dry_run=body.dry_run,
             actor=body.actor or "publish_api",
+            update_post_id=body.update_post_id,
         )
     except PublishServiceError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e

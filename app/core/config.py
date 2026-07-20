@@ -66,6 +66,19 @@ class Settings(BaseSettings):
     # 外部 HTTP
     http_timeout_seconds: int = 30
     http_retry_max: int = 3
+    ai_timeout_seconds: int = 90
+    ai_retry_max: int = 2
+
+    # Shopify Admin API（自有店铺 Client Credentials Grant）
+    shopify_client_id: str = ""
+    shopify_client_secret: str = ""
+    shopify_api_version: str = "2026-07"
+
+    # Minimal automation loop; disabled until the first manual run is verified.
+    automation_enabled: bool = False
+    automation_interval_seconds: int = 3600
+    automation_batch_size: int = 1
+    automation_min_impressions: int = 20
 
     def is_ai_stage_configured(self, stage: str) -> bool:
         """判断某个 AI 阶段是否真正配置了外部供应商（不配置就回退本地 brief）。"""

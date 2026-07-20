@@ -2,7 +2,6 @@
 setlocal
 
 cd /d "%~dp0"
-set "PY=%USERPROFILE%\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe"
 set "DB_USER=seo"
 set "DB_PASS=seo_dev_local"
 set "DB_NAME=seo_workbench"
@@ -53,9 +52,8 @@ if not errorlevel 1 (
 )
 
 echo [4/4] starting backend: http://127.0.0.1:8000
-"%PY%" -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
-pause
-exit /b 0
+call "%~dp0start-backend.bat"
+exit /b %errorlevel%
 
 :fail
 echo [FAIL] startup failed. The last error above is the reason.

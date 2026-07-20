@@ -71,6 +71,13 @@ def test_scenario_blog_b(rule_payload):
     assert result["intentBucket"] == "Scenario"
 
 
+def test_mixed_commercial_scenario_prefers_blog_b(rule_payload):
+    result = classify_keyword("mint vape flavor", "informational, commercial", {})
+
+    assert result["assignedSite"] == "博客B-场景人群"
+    assert result["intentBucket"] == "Scenario"
+
+
 def test_knowledge_with_safe_word_blocks_main_blog(rule_payload):
     """how to + core product + safe in exclusion → 降级博客A-知识教程。
 

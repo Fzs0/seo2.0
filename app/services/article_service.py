@@ -38,10 +38,25 @@ async def save_article(session: AsyncSession, payload: dict[str, Any]) -> dict[s
         ON CONFLICT (task_id) WHERE task_id IS NOT NULL
         DO UPDATE SET
           title = EXCLUDED.title,
+          slug = EXCLUDED.slug,
+          serp_snapshot_id = EXCLUDED.serp_snapshot_id,
+          brief_md = EXCLUDED.brief_md,
+          prompt_text = EXCLUDED.prompt_text,
           content_md = EXCLUDED.content_md,
+          article_parts = EXCLUDED.article_parts,
+          meta_title = EXCLUDED.meta_title,
+          meta_description = EXCLUDED.meta_description,
+          internal_link_plan = EXCLUDED.internal_link_plan,
+          image_plan = EXCLUDED.image_plan,
+          references_plan = EXCLUDED.references_plan,
+          qa_checklist = EXCLUDED.qa_checklist,
+          generation_provider = EXCLUDED.generation_provider,
+          generation_model = EXCLUDED.generation_model,
+          raw_ai_response = EXCLUDED.raw_ai_response,
           status = EXCLUDED.status,
           updated_at = now()
-        RETURNING id, site_id, title, status, created_at
+        RETURNING id, site_id, title, slug, status, language_code, market,
+                  meta_title, meta_description, primary_keyword, created_at
         """
     )
     # 注意：v1 articles 表在 task_id 上有 FK，但 ON CONFLICT 用 task_id 风险大
@@ -67,7 +82,8 @@ async def save_article(session: AsyncSession, payload: dict[str, Any]) -> dict[s
            CAST(:references_plan AS jsonb), CAST(:qa_checklist AS jsonb),
            :generation_provider, :generation_model, CAST(:raw_ai_response AS jsonb))
         ON CONFLICT DO NOTHING
-        RETURNING id, site_id, title, status, created_at
+        RETURNING id, site_id, title, slug, status, language_code, market,
+                  meta_title, meta_description, primary_keyword, created_at
         """
     )
     params = {

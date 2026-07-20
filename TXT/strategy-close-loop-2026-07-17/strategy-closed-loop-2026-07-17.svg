@@ -1,0 +1,99 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="920" viewBox="0 0 1440 920" role="img" aria-labelledby="title desc">
+  <title id="title">全局 SEO 策略闭环</title>
+  <desc id="desc">从数据输入、机会决策、AI 复核、内容执行、发布验证到效果复盘的循环流程。</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#f7f3ea"/>
+      <stop offset="1" stop-color="#eef3f7"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="8" stdDeviation="10" flood-color="#243447" flood-opacity=".12"/>
+    </filter>
+    <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M0,0 L12,6 L0,12 Z" fill="#5b7898"/>
+    </marker>
+    <style>
+      .title { font: 600 30px "Microsoft YaHei", "Noto Sans CJK SC", sans-serif; fill: #243447; }
+      .subtitle { font: 400 15px "Microsoft YaHei", "Noto Sans CJK SC", sans-serif; fill: #607080; }
+      .node-title { font: 600 18px "Microsoft YaHei", "Noto Sans CJK SC", sans-serif; fill: #243447; }
+      .node-text { font: 400 14px "Microsoft YaHei", "Noto Sans CJK SC", sans-serif; fill: #52616f; }
+      .center-title { font: 600 23px "Microsoft YaHei", "Noto Sans CJK SC", sans-serif; fill: #ffffff; }
+      .center-text { font: 400 14px "Microsoft YaHei", "Noto Sans CJK SC", sans-serif; fill: #edf4fa; }
+      .flow { fill: none; stroke: #5b7898; stroke-width: 3; marker-end: url(#arrow); }
+      .feedback { fill: none; stroke: #789765; stroke-width: 3; stroke-dasharray: 10 8; marker-end: url(#arrow); }
+    </style>
+  </defs>
+  <rect width="1440" height="920" fill="url(#bg)"/>
+  <text x="720" y="58" text-anchor="middle" class="title">全局 SEO 策略闭环</text>
+  <text x="720" y="88" text-anchor="middle" class="subtitle">从证据采集到效果复盘，再回到下一轮策略制定</text>
+
+  <path class="flow" d="M300 240 C390 180, 470 180, 555 240"/>
+  <path class="flow" d="M885 240 C970 180, 1050 180, 1140 240"/>
+  <path class="flow" d="M1220 365 C1220 470, 1120 510, 1010 540"/>
+  <path class="flow" d="M720 700 C620 770, 500 770, 365 690"/>
+  <path class="feedback" d="M260 615 C175 500, 185 335, 270 280"/>
+
+  <g filter="url(#shadow)">
+    <rect x="70" y="175" width="260" height="170" rx="22" fill="#e7eef5" stroke="#b9cada"/>
+    <text x="200" y="215" text-anchor="middle" class="node-title">1. 数据输入</text>
+    <text x="98" y="250" class="node-text">站点文章与正文结构</text>
+    <text x="98" y="276" class="node-text">Semrush 关键词数据</text>
+    <text x="98" y="302" class="node-text">GSC / GA4 表现数据</text>
+    <text x="98" y="328" class="node-text">SERP 快照与竞争特征</text>
+  </g>
+
+  <g filter="url(#shadow)">
+    <rect x="500" y="175" width="260" height="170" rx="22" fill="#f1e8cf" stroke="#d7c38e"/>
+    <text x="630" y="215" text-anchor="middle" class="node-title">2. 机会决策</text>
+    <text x="528" y="250" class="node-text">新写 / 更新 / 暂缓</text>
+    <text x="528" y="276" class="node-text">搜索意图与主题聚类</text>
+    <text x="528" y="302" class="node-text">站点分配与优先级</text>
+    <text x="528" y="328" class="node-text">蚕食与风险检查</text>
+  </g>
+
+  <g filter="url(#shadow)">
+    <rect x="1010" y="175" width="260" height="170" rx="22" fill="#e5f0e5" stroke="#b9d0b3"/>
+    <text x="1140" y="215" text-anchor="middle" class="node-title">3. AI 复核</text>
+    <text x="1038" y="250" class="node-text">判断原因与推荐动作</text>
+    <text x="1038" y="276" class="node-text">证据来源与知识依据</text>
+    <text x="1038" y="302" class="node-text">置信度与风险说明</text>
+    <text x="1038" y="328" class="node-text">形成可执行策略卡片</text>
+  </g>
+
+  <g filter="url(#shadow)">
+    <rect x="835" y="515" width="300" height="185" rx="22" fill="#f3e4e1" stroke="#d9b6b0"/>
+    <text x="985" y="555" text-anchor="middle" class="node-title">4. 内容执行</text>
+    <text x="865" y="590" class="node-text">生成新文或更新旧文</text>
+    <text x="865" y="616" class="node-text">SEO 结构与事实质检</text>
+    <text x="865" y="642" class="node-text">低风险自动执行</text>
+    <text x="865" y="668" class="node-text">异常进入人工审核</text>
+  </g>
+
+  <g filter="url(#shadow)">
+    <rect x="305" y="515" width="300" height="185" rx="22" fill="#e8edf3" stroke="#bdcbd8"/>
+    <text x="455" y="555" text-anchor="middle" class="node-title">5. 发布与验证</text>
+    <text x="335" y="590" class="node-text">发布状态与 URL 验证</text>
+    <text x="335" y="616" class="node-text">同步站点与内容记录</text>
+    <text x="335" y="642" class="node-text">记录实际执行结果</text>
+    <text x="335" y="668" class="node-text">失败任务重试或升级</text>
+  </g>
+
+  <g filter="url(#shadow)">
+    <rect x="545" y="365" width="350" height="150" rx="28" fill="#2f536f" stroke="#203d53"/>
+    <text x="720" y="415" text-anchor="middle" class="center-title">全局策略大脑</text>
+    <text x="720" y="447" text-anchor="middle" class="center-text">把有限资源分配给当前最值得做的事情</text>
+    <text x="720" y="475" text-anchor="middle" class="center-text">每条决策都能解释、执行、验证</text>
+  </g>
+
+  <g filter="url(#shadow)">
+    <rect x="70" y="735" width="260" height="120" rx="22" fill="#e5f0e5" stroke="#b9d0b3"/>
+    <text x="200" y="775" text-anchor="middle" class="node-title">6. 效果复盘</text>
+    <text x="98" y="810" class="node-text">7 天 / 28 天排名与流量</text>
+    <text x="98" y="836" class="node-text">更新策略记忆与排序规则</text>
+  </g>
+
+  <path class="flow" d="M605 610 C650 560, 690 535, 720 515"/>
+  <path class="flow" d="M835 610 C790 560, 750 535, 720 515"/>
+  <path class="feedback" d="M330 795 C470 860, 675 875, 850 760"/>
+  <text x="585" y="874" class="subtitle">效果数据反向影响下一轮决策</text>
+</svg>

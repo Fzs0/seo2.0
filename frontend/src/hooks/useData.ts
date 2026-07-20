@@ -1,37 +1,20 @@
-/**
- * Data hooks — pages should NEVER call fetch / axios directly.
- * They import the typed `useXxx` hooks here and the swap from
- * mock data to a real backend is a single-file change.
- *
- * To wire the real API:
- *   1. Add a fetch wrapper under /src/api/http.ts that points at the
- *      FastAPI backend (see app/api/v1/... endpoint paths).
- *   2. Replace the body of each hook with a call to that wrapper.
- *   3. Keep the same shape, return type, and field names so page
- *      components don't need to change.
- */
+/** Centralized typed access to the FastAPI backend. */
 import { useEffect, useState } from 'react'
-import {
-  mockSites,
-  mockKeywords,
-  mockBrief,
-  mockGscOpportunities,
-  mockGa4Channels,
-  mockStandard,
-  mockPipelineStages,
-} from '@/mock/data'
 import type {
   Site,
+  SiteIndexScanResult,
+  SiteKnowledgeProfile,
   Keyword,
   Article,
   Post,
-  Brief,
   GscQuery,
   Ga4Channel,
   Ga4LandingPage,
   GscBreakdown,
   DashboardSummary,
   SyncLogEntry,
+  StrategyEffect,
+  MainSiteContentPlan,
 } from '@/types/domain'
 
 export interface SourceSummary {
@@ -40,15 +23,6 @@ export interface SourceSummary {
   domain?: string
   gscSiteUrl?: string
   ga4PropertyId?: string
-}
-
-export interface DashboardOverviewData {
-  sites: Site[]
-  keywords: Keyword[]
-  sources: SourceSummary[]
-  syncLog: SyncLogEntry[]
-  dashboard: DashboardSummary | null
-  selectedSiteId: string | null
 }
 
 export interface GscPage {
@@ -79,14 +53,30 @@ export interface AsyncState<T> {
   error: string | null
 }
 
-/** Wrap a synchronous mock value in a single-tick async shape so
- *  pages render an explicit loading / error / empty state. */
-function mockAsync<T>(value: T): AsyncState<T> {
-  return { data: value, loading: false, error: null }
+export interface StandardPayload {
+  name?: string
+  version?: string
+  scoring?: {
+    maxScore?: number
+    components?: string[]
+    thresholds?: Record<string, number>
+  }
+  signals?: Record<string, string[]>
+  articleRules?: string[]
+  articleBriefTemplate?: {
+    modules?: Array<{ key?: string; label?: string; field?: string; required?: boolean }>
+    qualityGate?: string[]
+  }
+  globalPlanning?: {
+    hardGates?: Array<{ key: string; label: string; blocker?: string; priority?: string }>
+  }
 }
 
-function emptyAsync<T>(errorMsg = 'No data available'): AsyncState<T> {
-  return { data: null, loading: false, error: errorMsg }
+export interface StandardResponse {
+  standard: StandardPayload
+  version: string
+  source: string
+  healthy: boolean
 }
 
 export function useSites(refreshKey = 0): AsyncState<Site[]> {
@@ -105,6 +95,25 @@ export function useSites(refreshKey = 0): AsyncState<Site[]> {
       })
     return () => controller.abort()
   }, [refreshKey])
+
+  return state
+}
+
+export function useMainSiteContent(siteId: string, refreshKey = 0): AsyncState<MainSiteContentPlan> {
+  const [state, setState] = useState<AsyncState<MainSiteContentPlan>>({ data: null, loading: false, error: null })
+
+  useEffect(() => {
+    if (!siteId) {
+      setState({ data: null, loading: false, error: null })
+      return
+    }
+    const controller = new AbortController()
+    setState({ data: null, loading: true, error: null })
+    void getJson<MainSiteContentPlan>(`/api/v1/sites/${encodeURIComponent(siteId)}/main-content`, controller.signal)
+      .then((data) => { if (!controller.signal.aborted) setState({ data, loading: false, error: null }) })
+      .catch((error) => { if (!controller.signal.aborted) setState({ data: null, loading: false, error: error instanceof Error ? error.message : '无法加载主站内容规划' }) })
+    return () => controller.abort()
+  }, [siteId, refreshKey])
 
   return state
 }
@@ -130,13 +139,45 @@ export function useKeywords(refreshKey = 0, limit = 50): AsyncState<Keyword[]> {
   return state
 }
 
-export function useArticles(refreshKey = 0): AsyncState<Article[]> {
+export interface KeywordPage {
+  items: Keyword[]
+  total: number
+  limit: number
+  offset: number
+}
+
+export interface KeywordFilters {
+  aiAnalyzed?: string
+  intent?: string
+  serpFeature?: string
+}
+
+export function useKeywordPage(refreshKey = 0, page = 1, pageSize = 100, filters: KeywordFilters = {}): AsyncState<KeywordPage> {
+  const [state, setState] = useState<AsyncState<KeywordPage>>({ data: null, loading: true, error: null })
+  useEffect(() => {
+    const controller = new AbortController()
+    const offset = Math.max(0, page - 1) * pageSize
+    setState({ data: null, loading: true, error: null })
+    const params = new URLSearchParams({ limit: String(pageSize), offset: String(offset) })
+    if (filters.aiAnalyzed) params.set('ai_analyzed', filters.aiAnalyzed)
+    if (filters.intent) params.set('intent', filters.intent)
+    if (filters.serpFeature) params.set('serp_feature', filters.serpFeature)
+    void getJson<KeywordPage>(`/api/v1/keywords?${params.toString()}`, controller.signal)
+      .then((result) => { if (!controller.signal.aborted) setState({ data: result, loading: false, error: null }) })
+      .catch((error) => { if (!controller.signal.aborted) setState({ data: null, loading: false, error: error instanceof Error ? error.message : '无法加载关键词' }) })
+    return () => controller.abort()
+  }, [refreshKey, page, pageSize, filters.aiAnalyzed, filters.intent, filters.serpFeature])
+  return state
+}
+
+export function useArticles(refreshKey = 0, siteId?: string): AsyncState<Article[]> {
   const [state, setState] = useState<AsyncState<Article[]>>({ data: null, loading: true, error: null })
 
   useEffect(() => {
     const controller = new AbortController()
     setState({ data: null, loading: true, error: null })
-    void getJson<{ items: Article[] }>('/api/v1/articles?limit=100', controller.signal)
+    const query = siteId ? `&site_id=${encodeURIComponent(siteId)}` : ''
+    void getJson<{ items: Article[] }>(`/api/v1/articles?limit=100${query}`, controller.signal)
       .then((result) => {
         if (!controller.signal.aborted) setState({ data: result.items, loading: false, error: null })
       })
@@ -146,7 +187,7 @@ export function useArticles(refreshKey = 0): AsyncState<Article[]> {
         }
       })
     return () => controller.abort()
-  }, [refreshKey])
+  }, [refreshKey, siteId])
 
   return state
 }
@@ -188,19 +229,6 @@ export function usePosts(refreshKey = 0, siteId?: string): AsyncState<Post[]> {
   }, [refreshKey, siteId])
 
   return state
-}
-
-export function useBrief(keywordId?: string): AsyncState<Brief> {
-  if (!keywordId) return emptyAsync<Brief>('No keyword selected')
-  return mockAsync(mockBrief)
-}
-
-export function useGscOpportunities(): AsyncState<GscQuery[]> {
-  return mockAsync(mockGscOpportunities)
-}
-
-export function useGa4Channels(): AsyncState<Ga4Channel[]> {
-  return mockAsync(mockGa4Channels)
 }
 
 export function useDashboard(siteId?: string, refreshKey = 0): AsyncState<DashboardSummary> {
@@ -271,12 +299,20 @@ export function useSyncLog(siteId?: string, refreshKey = 0): AsyncState<SyncLogE
   return state
 }
 
-export function useStandardRules() {
-  return mockAsync(mockStandard)
-}
-
-export function usePipelineStages() {
-  return mockAsync(mockPipelineStages)
+export function useStandardRules(): AsyncState<StandardResponse> {
+  const [state, setState] = useState<AsyncState<StandardResponse>>({ data: null, loading: true, error: null })
+  useEffect(() => {
+    const controller = new AbortController()
+    void getJson<StandardResponse>('/api/v1/workflow/standard', controller.signal)
+      .then((result) => {
+        if (!controller.signal.aborted) setState({ data: result, loading: false, error: null })
+      })
+      .catch((error) => {
+        if (!controller.signal.aborted) setState({ data: null, loading: false, error: error instanceof Error ? error.message : '无法加载规则配置' })
+      })
+    return () => controller.abort()
+  }, [])
+  return state
 }
 
 const API_BASE = (import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:8000').replace(/\/$/, '')
@@ -290,17 +326,31 @@ async function getJson<T>(path: string, signal: AbortSignal): Promise<T> {
   return response.json() as Promise<T>
 }
 
-async function postJson<T>(path: string, body: unknown): Promise<T> {
-  const response = await fetch(`${API_BASE}${path}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  })
-  if (!response.ok) {
-    const detail = await response.text()
-    throw new Error(detail || `${response.status} ${response.statusText}`)
+async function postJson<T>(path: string, body: unknown, method: 'POST' | 'PUT' = 'POST'): Promise<T> {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const response = await fetch(`${API_BASE}${path}`, {
+        method,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      })
+      if (!response.ok) {
+        const detail = await response.text()
+        throw new Error(detail || `${response.status} ${response.statusText}`)
+      }
+      return response.json() as Promise<T>
+    } catch (error) {
+      if (attempt === 0 && error instanceof TypeError) {
+        await new Promise((resolve) => window.setTimeout(resolve, 300))
+        continue
+      }
+      if (error instanceof TypeError) {
+        throw new Error(`后端连接中断：${API_BASE}${path}。请确认后端服务正在运行。`)
+      }
+      throw error
+    }
   }
-  return response.json() as Promise<T>
+  throw new Error('请求后端失败')
 }
 
 export function triggerAnalyticsSync(siteId: string, daysBack = 7) {
@@ -308,14 +358,6 @@ export function triggerAnalyticsSync(siteId: string, daysBack = 7) {
     '/api/v1/analytics/sync',
     { siteId, daysBack },
   )
-}
-
-export function analyzeKeywordStrategy(keywordIds: string[], limit?: number, opportunityType?: string) {
-  return postJson<{ updated: number; error?: string }>('/api/v1/workflow/keywords/ai-analyze', {
-    keywordIds,
-    limit: limit || keywordIds.length || 10,
-    opportunityType,
-  })
 }
 
 export interface StrategyTask {
@@ -334,34 +376,210 @@ export interface StrategyTask {
   evidence_level: 'confirmed' | 'directional' | 'insufficient' | string
   reason: string
   recommended_action: string
+  internal_link_plan?: Array<{ target_url?: string; title?: string; anchor?: string; reason?: string }>
   evidence: { gsc?: Record<string, number>; ga4?: Record<string, number> }
   execution_task_id?: string
+  execution_status?: 'queued' | 'running' | 'done' | 'failed' | 'blocked' | 'canceled' | string | null
+  execution_error?: string | null
+  execution_logs?: Array<{ at?: string; stage?: string; message?: string }>
+  execution_started_at?: string | null
+  execution_finished_at?: string | null
+  execution_run_after?: string | null
+  auto_publish?: boolean | null
   created_at?: string
 }
 
-export function generateSeoStrategies(siteId?: string, limit = 20, minImpressions = 20) {
-  return postJson<{ items: StrategyTask[]; created: number; candidates: number }>('/api/v1/workflow/strategies/generate', {
+export interface StrategyCandidate extends StrategyTask {
+  candidate_status?: 'available' | 'selected' | 'excluded' | 'hold' | 'superseded' | 'executed' | string
+  selected?: boolean
+}
+
+export interface StrategyCandidatePage {
+  items: StrategyCandidate[]
+  total: number
+  page: number
+  limit: number
+}
+
+export interface StrategyPlan {
+  id?: string
+  business_id: string
+  analysis_batch_id?: string | null
+  action_budget: number
+  site_quotas: Record<string, number>
+  selected_candidate_ids: string[]
+  status?: string
+  created_at?: string
+}
+
+export interface StrategyFilters {
+  search?: string
+  siteId?: string
+  strategyType?: string
+  priority?: string
+  evidenceLevel?: string
+}
+
+export function generateSeoStrategies(businessId: string, siteId?: string, actionBudget = 4, siteQuotas: Record<string, number> = {}, minImpressions = 20) {
+  return postJson<{ business_id: string; site_scope: Array<{ id: string; name: string; site_type: string }>; items: StrategyTask[]; created: number; candidates: number; total_candidates?: number; planned_actions?: number; analysis_batch_id?: string; plan?: StrategyPlan; unassigned?: number; quarantined?: number; error?: string }>('/api/v1/workflow/strategies/generate', {
+    businessId,
     siteId,
-    limit,
+    limit: Math.max(1, Math.min(actionBudget || 4, 10)),
+    actionBudget,
+    siteQuotas,
     minImpressions,
   })
 }
 
-export function useStrategies(refreshKey = 0, status = 'pending'): AsyncState<StrategyTask[]> {
-  const [state, setState] = useState<AsyncState<StrategyTask[]>>({ data: null, loading: true, error: null })
+export function useStrategyCandidates(refreshKey = 0, businessId?: string): AsyncState<StrategyCandidatePage> {
+  const [state, setState] = useState<AsyncState<StrategyCandidatePage>>({ data: null, loading: true, error: null })
   useEffect(() => {
+    if (!businessId) {
+      setState({ data: { items: [], total: 0, page: 1, limit: 100 }, loading: false, error: null })
+      return
+    }
     const controller = new AbortController()
-    setState({ data: null, loading: true, error: null })
-    void getJson<{ items: StrategyTask[] }>(`/api/v1/workflow/strategies?status=${encodeURIComponent(status)}&limit=50`, controller.signal)
-      .then((result) => { if (!controller.signal.aborted) setState({ data: result.items, loading: false, error: null }) })
-      .catch((error) => { if (!controller.signal.aborted) setState({ data: null, loading: false, error: error instanceof Error ? error.message : '无法加载策略审核队列' }) })
+    setState((current) => ({ data: current.data, loading: current.data == null, error: null }))
+    const load = async () => {
+      const items: StrategyCandidate[] = []
+      let page = 1
+      let total = 0
+      do {
+        const result = await getJson<StrategyCandidatePage>(`/api/v1/workflow/strategies/candidates?business_id=${encodeURIComponent(businessId)}&page=${page}&limit=100`, controller.signal)
+        items.push(...result.items)
+        total = result.total
+        page += 1
+      } while (!controller.signal.aborted && items.length < total)
+      return { items, total, page: 1, limit: 100 }
+    }
+    void load()
+      .then((result) => { if (!controller.signal.aborted) setState({ data: result, loading: false, error: null }) })
+      .catch((error) => { if (!controller.signal.aborted) setState({ data: null, loading: false, error: error instanceof Error ? error.message : '无法加载策略候选池' }) })
     return () => controller.abort()
-  }, [refreshKey, status])
+  }, [refreshKey, businessId])
   return state
 }
 
-export function reviewSeoStrategy(taskId: string, approved: boolean) {
-  return postJson<{ ok: boolean; status: string; execution_task_id?: string }>(`/api/v1/workflow/strategies/${encodeURIComponent(taskId)}/review`, { approved })
+export function useStrategyPlan(refreshKey = 0, businessId?: string): AsyncState<StrategyPlan> {
+  const [state, setState] = useState<AsyncState<StrategyPlan>>({ data: null, loading: true, error: null })
+  useEffect(() => {
+    if (!businessId) {
+      setState({ data: null, loading: false, error: null })
+      return
+    }
+    const controller = new AbortController()
+    setState((current) => ({ data: current.data, loading: current.data == null, error: null }))
+    void getJson<StrategyPlan>(`/api/v1/workflow/strategies/plan?business_id=${encodeURIComponent(businessId)}`, controller.signal)
+      .then((result) => { if (!controller.signal.aborted) setState({ data: result, loading: false, error: null }) })
+      .catch((error) => { if (!controller.signal.aborted) setState({ data: null, loading: false, error: error instanceof Error ? error.message : '无法加载今日计划' }) })
+    return () => controller.abort()
+  }, [refreshKey, businessId])
+  return state
+}
+
+export function saveStrategyPlan(businessId: string, actionBudget: number, siteQuotas: Record<string, number>, selectedCandidateIds: string[]) {
+  return postJson<StrategyPlan>('/api/v1/workflow/strategies/plan', { businessId, actionBudget, siteQuotas, selectedCandidateIds }, 'PUT')
+}
+
+export function useStrategies(refreshKey = 0, status = 'pending', filters: StrategyFilters = {}, businessId?: string): AsyncState<StrategyTask[]> {
+  const [state, setState] = useState<AsyncState<StrategyTask[]>>({ data: null, loading: true, error: null })
+  useEffect(() => {
+    if (!businessId) {
+      setState({ data: [], loading: false, error: null })
+      return
+    }
+    const controller = new AbortController()
+    setState((current) => ({
+      data: current.data,
+      loading: current.data == null,
+      error: null,
+    }))
+    const params = new URLSearchParams({ status, limit: '200' })
+    params.set('business_id', businessId)
+    if (filters.search?.trim()) params.set('search', filters.search.trim())
+    if (filters.siteId) params.set('site_id', filters.siteId)
+    if (filters.strategyType) params.set('strategy_type', filters.strategyType)
+    if (filters.priority) params.set('priority', filters.priority)
+    if (filters.evidenceLevel) params.set('evidence_level', filters.evidenceLevel)
+    void getJson<{ items: StrategyTask[] }>(`/api/v1/workflow/strategies?${params.toString()}`, controller.signal)
+      .then((result) => { if (!controller.signal.aborted) setState({ data: result.items, loading: false, error: null }) })
+      .catch((error) => { if (!controller.signal.aborted) setState({ data: null, loading: false, error: error instanceof Error ? error.message : '无法加载策略审核队列' }) })
+    return () => controller.abort()
+  }, [refreshKey, status, filters.search, filters.siteId, filters.strategyType, filters.priority, filters.evidenceLevel, businessId])
+  return state
+}
+
+export function useStrategyEffects(refreshKey = 0, businessId?: string): AsyncState<StrategyEffect[]> {
+  const [state, setState] = useState<AsyncState<StrategyEffect[]>>({ data: null, loading: true, error: null })
+  useEffect(() => {
+    if (!businessId) {
+      setState({ data: [], loading: false, error: null })
+      return
+    }
+    const controller = new AbortController()
+    setState({ data: null, loading: true, error: null })
+    void getJson<{ items: StrategyEffect[] }>(`/api/v1/workflow/strategies/effects?business_id=${encodeURIComponent(businessId)}`, controller.signal)
+      .then((result) => { if (!controller.signal.aborted) setState({ data: result.items, loading: false, error: null }) })
+      .catch((error) => { if (!controller.signal.aborted) setState({ data: null, loading: false, error: error instanceof Error ? error.message : '无法加载策略效果' }) })
+    return () => controller.abort()
+  }, [refreshKey, businessId])
+  return state
+}
+
+export function reviewSeoStrategy(taskId: string, approved: boolean, executeNow = false) {
+  return postJson<{ ok: boolean; status: string; execution_task_id?: string }>(`/api/v1/workflow/strategies/${encodeURIComponent(taskId)}/review`, { approved, executeNow })
+}
+
+export function executeSeoStrategy(taskId: string) {
+  return postJson<{ ok: boolean; status: string; execution_task_id?: string; error?: string; result?: unknown }>(`/api/v1/workflow/strategies/${encodeURIComponent(taskId)}/execute`, {})
+}
+
+export function cancelSeoStrategy(taskId: string) {
+  return postJson<{ ok: boolean; status: string; execution_task_id?: string; error?: string }>(`/api/v1/workflow/strategies/${encodeURIComponent(taskId)}/cancel`, {})
+}
+
+export function stopSeoStrategy(taskId: string) {
+  return postJson<{ ok: boolean; status: string; execution_task_id?: string; error?: string }>(`/api/v1/workflow/strategies/${encodeURIComponent(taskId)}/stop`, {})
+}
+
+export interface AutomationStatus {
+  business_id?: string
+  parallel_limit: number
+  queued: number
+  running: number
+  done: number
+  failed: number
+  recent: Array<{ id: string; task_type: string; title: string; status: string; error_message?: string | null; finished_at?: string | null }>
+}
+
+export function useAutomationStatus(refreshKey = 0, businessId?: string): AsyncState<AutomationStatus> {
+  const [state, setState] = useState<AsyncState<AutomationStatus>>({ data: null, loading: true, error: null })
+  useEffect(() => {
+    const controller = new AbortController()
+    setState((current) => ({
+      data: current.data,
+      loading: current.data == null,
+      error: null,
+    }))
+    const query = businessId ? `?business_id=${encodeURIComponent(businessId)}` : ''
+    void getJson<AutomationStatus>(`/api/v1/workflow/automation/status${query}`, controller.signal)
+      .then((result) => { if (!controller.signal.aborted) setState({ data: { ...result, business_id: businessId }, loading: false, error: null }) })
+      .catch((error) => { if (!controller.signal.aborted) setState({ data: null, loading: false, error: error instanceof Error ? error.message : '无法加载自动化状态' }) })
+    return () => controller.abort()
+  }, [refreshKey, businessId])
+  return state
+}
+
+export function runAutomationOnce() {
+  return postJson<{ status: string; processed: number; result?: unknown; generated?: unknown }>('/api/v1/workflow/automation/run-once', {})
+}
+
+export function clearStrategyQueue(businessId: string) {
+  return postJson<{ executions_canceled: number; strategies_canceled: number; plans_cleared: number; candidates_cleared: number; analysis_batches_cleared: number }>(`/api/v1/workflow/automation/clear-queue?business_id=${encodeURIComponent(businessId)}`, {})
+}
+
+export function saveAutomationSettings(settings: { enabled: boolean; intervalSeconds: number; batchSize: number; minImpressions: number }) {
+  return postJson<{ saved: boolean; restart_required: boolean }>('/api/v1/workflow/automation/settings', settings)
 }
 
 export interface SerpSearchResult {
@@ -391,6 +609,89 @@ export function syncSitePosts(siteId: string, limit = 100) {
   )
 }
 
+export interface ContentAuditItem {
+  id?: string
+  action: 'update_article' | 'new_article' | 'hold' | string
+  priority: string
+  confidence: number
+  evidence_level: string
+  site_id: string
+  site_name?: string | null
+  post_id?: string | null
+  keyword_id?: string | null
+  title: string
+  query: string
+  url?: string | null
+  reason: string
+  recommended_action: string
+  issues: Array<{ code: string; label: string; detail: string }>
+  evidence: Array<{ source: string; fact: string }>
+  confidence_factors: Array<{ name: string; value: number; detail: string }>
+  data_evidence?: {
+    gsc?: Record<string, unknown> | null
+    ga4?: Record<string, unknown> | null
+    keyword?: Record<string, unknown> | null
+    serp?: Record<string, unknown> | null
+  }
+  ai?: {
+    summary?: string
+    reason?: string
+    recommended_action?: string
+    confidence?: number | null
+    evidence_used?: string[]
+    provider?: string
+    model?: string
+  }
+  review_status?: string
+  created_at?: string
+  updated_at?: string
+}
+
+export interface ContentAuditReport {
+  business_id: string
+  site_scope: Array<{ id: string; name: string; site_type: string }>
+  scanned_at: string
+  sync?: { ok: boolean; saved: number; results: Array<{ ok: boolean; site_id: string; saved: number; error?: string }> } | null
+  summary: { sites: number; articles: number; page_clusters?: number; coverage_review_clusters?: number; update_candidates: number; new_candidates: number; hold_candidates: number }
+  data_sources?: {
+    gsc?: { available: boolean; page_rows: number }
+    ga4?: { available: boolean; landing_page_rows: number }
+    keyword_data?: { available: boolean; rows: number }
+    serp?: { configured: boolean; available?: boolean; cached: number; fetched: number; attempted?: number }
+    ai?: { configured: boolean; status: string; reviewed: number; persisted?: number; model?: string }
+  }
+  items: ContentAuditItem[]
+}
+
+export function scanContentAudit(businessId: string, limitPerSite = 100, limit = 200) {
+  return postJson<ContentAuditReport>('/api/v1/workflow/content-audit/scan', {
+    businessId,
+    refresh: true,
+    limitPerSite,
+    limit,
+  })
+}
+
+export function useContentAuditReviews(refreshKey = 0, businessId?: string): AsyncState<ContentAuditItem[]> {
+  const [state, setState] = useState<AsyncState<ContentAuditItem[]>>({ data: null, loading: true, error: null })
+
+  useEffect(() => {
+    if (!businessId) {
+      setState({ data: [], loading: false, error: null })
+      return
+    }
+    const controller = new AbortController()
+    setState({ data: null, loading: true, error: null })
+    const businessQuery = `&business_id=${encodeURIComponent(businessId)}`
+    void getJson<{ items: ContentAuditItem[] }>(`/api/v1/workflow/content-audit/reviews?status=pending&limit=50${businessQuery}`, controller.signal)
+      .then((result) => { if (!controller.signal.aborted) setState({ data: result.items, loading: false, error: null }) })
+      .catch((error) => { if (!controller.signal.aborted) setState({ data: null, loading: false, error: error instanceof Error ? error.message : '无法加载已保存的 AI 复核结果' }) })
+    return () => controller.abort()
+  }, [refreshKey, businessId])
+
+  return state
+}
+
 export function testSiteConnector(siteId: string) {
   return getJson<{
     site_id: string
@@ -411,6 +712,61 @@ export function upsertSite(payload: Record<string, unknown>) {
   return postJson<Site>('/api/v1/sites', payload)
 }
 
+export function generateSiteKnowledge(siteId: string) {
+  return postJson<{
+    site_id: string
+    knowledge_profile: SiteKnowledgeProfile
+    ai: { status: string; configured: boolean; provider?: string; model?: string }
+    sources: { posts: number; keywords: number }
+  }>(`/api/v1/sites/${encodeURIComponent(siteId)}/knowledge/generate`, {})
+}
+
+export function saveSiteKnowledge(siteId: string, profile: SiteKnowledgeProfile) {
+  return postJson<{ site_id: string; knowledge_profile: SiteKnowledgeProfile }>(
+    `/api/v1/sites/${encodeURIComponent(siteId)}/knowledge`,
+    profile,
+  )
+}
+
+export function clearSiteKnowledge(siteId: string, preserveIndexScan: boolean, profile?: SiteKnowledgeProfile | null) {
+  return postJson<{ site_id: string; knowledge_profile: SiteKnowledgeProfile }>(
+    `/api/v1/sites/${encodeURIComponent(siteId)}/knowledge`,
+    {
+      status: 'draft',
+      ...(preserveIndexScan ? { index_scan: profile?.index_scan || {} } : {}),
+    },
+  )
+}
+
+export function scanSiteIndex(siteId: string, file: File, replace = true) {
+  const path = `/api/v1/sites/${encodeURIComponent(siteId)}/index-scan?replace=${replace ? 'true' : 'false'}`
+  const lowerName = file.name.toLowerCase()
+  const contentType = lowerName.endsWith('.gz') ? 'application/gzip' : lowerName.endsWith('.xml') ? 'application/xml' : 'text/plain'
+  return fetch(`${API_BASE}${path}`, {
+    method: 'POST',
+    headers: { 'Content-Type': contentType, 'x-filename': file.name },
+    body: file,
+  }).then(async (response) => {
+    if (!response.ok) {
+      const detail = await response.text()
+      throw new Error(detail || `${response.status} ${response.statusText}`)
+    }
+    return response.json() as Promise<SiteIndexScanResult>
+  }).catch((error) => {
+    if (error instanceof TypeError) {
+      throw new Error(`后端连接中断：${API_BASE}${path}。请确认后端服务正在运行。`)
+    }
+    throw error
+  })
+}
+
+export function deleteSite(siteId: string) {
+  return fetch(`${API_BASE}/api/v1/sites/${encodeURIComponent(siteId)}`, { method: 'DELETE' }).then(async (response) => {
+    if (!response.ok) throw new Error((await response.text()) || `${response.status} ${response.statusText}`)
+    return response.json() as Promise<{ deleted: boolean }>
+  })
+}
+
 export function publishArticle(articleId: string, siteId: string, dryRun: boolean) {
   return postJson<{
     ok: boolean
@@ -428,12 +784,116 @@ export function publishArticle(articleId: string, siteId: string, dryRun: boolea
   })
 }
 
-export async function importSemrushFile(file: File) {
-  return postJson<{ keywords: Keyword[]; saved: number; filename: string }>('/api/v1/workflow/import-file', {
-    filename: file.name,
-    contentText: await file.text(),
-    save: true,
+export interface SemrushStrategyPreview {
+  filename: string
+  previewOnly: boolean
+  sheet: string
+  rowCount: number
+  databases: string[]
+  topicCount: number
+  pageClusterCount: number
+  pageTypeCounts: Record<string, number>
+  intentCounts: Record<string, number>
+  metrics: {
+    volumeSum: number
+    kdAverage: number
+    kdMin: number
+    kdMax: number
+    top10Coverage: number
+  }
+  clusterValidation: {
+    ruleVersion: string
+    counts: Record<string, number>
+    aiReadyCount: number
+    reviewCount: number
+  }
+  anomalies: Array<{ code: string; label: string; count: number; clusterIds: string[] }>
+  clusters: Array<{
+    id: string
+    page: string
+    topics: string[]
+    pageTypes: string[]
+    keywordCount: number
+    intentCounts: Record<string, number>
+    volumeSum: number
+    kdAverage: number
+    top10UrlCount: number
+    contentReferenceCount: number
+    validationStatus: string
+    validationCenterKeyword: string
+    validationReason: string
+  }>
+}
+
+async function fileToBase64(file: File): Promise<string> {
+  const dataUrl = await new Promise<string>((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => resolve(String(reader.result || ''))
+    reader.onerror = () => reject(reader.error || new Error('无法读取文件'))
+    reader.readAsDataURL(file)
   })
+  return dataUrl.split(',', 2)[1] || ''
+}
+
+export async function previewSemrushStrategyFile(file: File) {
+  return postJson<SemrushStrategyPreview>('/api/v1/workflow/semrush-strategy/preview', {
+    filename: file.name,
+    contentBase64: await fileToBase64(file),
+  })
+}
+
+export async function importSemrushStrategyFile(file: File, businessId: string, market: string) {
+  return postJson<{
+    saved: number
+    poolCount: number
+    sourceBatchId: string
+    businessId: string
+    market: string
+    preview: SemrushStrategyPreview
+    message: string
+  }>('/api/v1/workflow/semrush-strategy/import', {
+    filename: file.name,
+    contentBase64: await fileToBase64(file),
+    businessId,
+    market,
+    confirmed: true,
+  })
+}
+
+export function validateImportedSemrushStrategy(businessId: string, sourceBatchId?: string) {
+  return postJson<{
+    saved: number
+    sourceBatchId: string
+    businessId: string
+    preview: SemrushStrategyPreview
+    message: string
+  }>('/api/v1/workflow/semrush-strategy/validate-imported', {
+    businessId,
+    ...(sourceBatchId ? { sourceBatchId } : {}),
+  })
+}
+
+export interface SemrushStrategyAiAnalysisRun {
+  id: string
+  status: string
+  decision?: { total?: number; updated?: number; remaining?: number; message?: string }
+  error_message?: string
+}
+
+export function startSemrushStrategyAiAnalysis(businessId: string, keywordIds: string[] = [], limit = 10) {
+  return postJson<{ run_id?: string | null; status: string; decision?: { total?: number; updated?: number; remaining?: number; message?: string } }>('/api/v1/workflow/semrush-strategy/ai-analyze', { businessId, keywordIds, limit })
+}
+
+export function getSemrushStrategyAiAnalysis(runId: string, signal = new AbortController().signal) {
+  return getJson<SemrushStrategyAiAnalysisRun>(`/api/v1/workflow/semrush-strategy/ai-analyze/${encodeURIComponent(runId)}`, signal)
+}
+
+export function getLatestSemrushStrategyAiAnalysis(businessId: string, signal = new AbortController().signal) {
+  return getJson<SemrushStrategyAiAnalysisRun | null>(`/api/v1/workflow/semrush-strategy/ai-analyze/latest?business_id=${encodeURIComponent(businessId)}`, signal)
+}
+
+export function cancelSemrushStrategyAiAnalysis(runId: string) {
+  return postJson<{ run_id: string; status: string }>(`/api/v1/workflow/semrush-strategy/ai-analyze/${encodeURIComponent(runId)}/cancel`, {})
 }
 
 export async function generateArticleDraft(keyword: Keyword) {
@@ -460,7 +920,18 @@ export async function runArticlePipeline(keyword: Keyword) {
   return postJson<{
     status: 'done' | 'failed'
     steps: PipelineStep[]
-    article?: { id: string; site_id?: string | null; title: string; status: string }
+    article?: {
+      id: string
+      site_id?: string | null
+      title: string
+      status: string
+      slug?: string | null
+      language_code?: string | null
+      market?: string | null
+      primary_keyword?: string | null
+      meta_title?: string | null
+      meta_description?: string | null
+    }
     brief?: { source?: string; aiEnhanced?: boolean; aiMeta?: Record<string, unknown>; text?: string }
     outline?: string
     content?: string
@@ -471,64 +942,6 @@ export async function runArticlePipeline(keyword: Keyword) {
     model?: string
     contentLength?: number
   }>('/api/v1/workflow/article-pipeline', { keywordId: keyword.id })
-}
-
-export function useDashboardOverview(siteId?: string): AsyncState<DashboardOverviewData> {
-  const [state, setState] = useState<AsyncState<DashboardOverviewData>>({
-    data: null,
-    loading: true,
-    error: null,
-  })
-
-  useEffect(() => {
-    const controller = new AbortController()
-    setState({ data: null, loading: true, error: null })
-
-    void (async () => {
-      try {
-        const [sitesResult, keywordsResult, sourcesResult, syncLogResult] = await Promise.all([
-          getJson<{ items: Site[] }>('/api/v1/sites?limit=500', controller.signal),
-          getJson<{ items: Keyword[] }>('/api/v1/keywords?limit=500', controller.signal),
-          getJson<{ items: SourceSummary[] }>('/api/v1/analytics/sources', controller.signal),
-          getJson<{ items: SyncLogEntry[] }>('/api/v1/analytics/sync-log?limit=10', controller.signal),
-        ])
-        const selectedSiteId = siteId || sitesResult.items[0]?.id || null
-        const dashboard = selectedSiteId
-          ? await getJson<DashboardSummary>(
-              `/api/v1/analytics/dashboard/${encodeURIComponent(selectedSiteId)}`,
-              controller.signal,
-            )
-          : null
-
-        if (!controller.signal.aborted) {
-          setState({
-            data: {
-              sites: sitesResult.items,
-              keywords: keywordsResult.items,
-              sources: sourcesResult.items,
-              syncLog: syncLogResult.items,
-              dashboard,
-              selectedSiteId,
-            },
-            loading: false,
-            error: null,
-          })
-        }
-      } catch (error) {
-        if (!controller.signal.aborted) {
-          setState({
-            data: null,
-            loading: false,
-            error: error instanceof Error ? error.message : '无法加载决策总览数据',
-          })
-        }
-      }
-    })()
-
-    return () => controller.abort()
-  }, [siteId])
-
-  return state
 }
 
 export function useAnalyticsOverview(siteId?: string, refreshKey = 0): AsyncState<AnalyticsOverviewData> {
