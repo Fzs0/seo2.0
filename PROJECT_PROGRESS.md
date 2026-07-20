@@ -53,6 +53,7 @@ Google GSC/GA4 OAuth 的 `RS256` 依赖已修复：现有 `.venv` 已安装 `cry
 2026-07-20 站点地图更新闭环已补齐：`/sites/{site_id}/index-scan` 默认覆盖旧索引，支持 `replace=false` 追加合并；页面提供本地上传入口，自动识别并解压 GZip。未启动后端，尚未执行真实上传验收。
 2026-07-20 站点地图 URL 抓取因 Cloudflare Challenge 对后端请求返回 403，已移除 URL 抓取入口，保留本地上传覆盖方案。
 2026-07-20 已将主站业务知识与多渠道自动策略闭环方案，以及迁移前检查清单归档到 `TXT/main-site-business-knowledge-strategy-2026-07-20/` 和 `TXT/migration-2026-07-20/`；本次仅建立迁移检查点，尚未部署或执行真实数据库迁移。
+2026-07-20 已补充压缩包迁移手册 `TXT/migration-2026-07-20/SEO2_MIGRATION_GUIDE_2026-07-20.md` 和可直接交给 MiniMax 的整体迁移提示词 `TXT/migration-2026-07-20/MINIMAX_PROJECT_MIGRATION_PROMPT_2026-07-20.md`；真实密钥、数据库备份和 exports 数据仍需单独转移。
 2026-07-20 已按 Google/Shopify 电商 SEO 资料增加主站内容分层 V1：新增只读“主站内容”页面和 `/sites/{site_id}/main-content` 接口，把产品页/分类页定义为商业承接层，把博客定义为支持层；暂不自动生成或发布主站文章，普通博客策略开关保持关闭。
 
 ## 1. 当前主线
