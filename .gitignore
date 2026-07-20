@@ -1,35 +1,84 @@
-# Local secrets — never commit
+# =============================================================
+# SEO 2.0 - .gitignore
+# 原则：只跟踪代码和文档，**绝不**跟踪密钥、真实数据、本地构建
+# =============================================================
+
+# ---- Local secrets (never commit) ----
 config/*.local.json
 config/google-data-sources.local.json
 config/*.local.yaml
 config/*.local.yml
 config/*.local.env
-
-# Local credentials (keep working dirs out of source control)
-*.pem
-*.key
 .env
 .env.local
 .env.*.local
+.env.example
+**/.env
+**/.env.local
+**/.env.example
+*.pem
+*.key
+*.pem.b64
+google-credentials*.json
+service-account*.json
 
-# Build artifacts
+# ---- Virtual envs (root + nested) ----
+.venv/
+venv/
+env/
+**/.venv/
+**/venv/
+**/env/
+
+# ---- Local working areas & runtime artifacts (NEVER commit) ----
+# 真实业务 DB dump，含 9 站 / 138 posts 等真实数据
+migration-data/
+# 已导入的知识库原始导出（CSV/JSON）
+exports/
+# Codex runtime 工作区
+.codex/
+# 本地 agent 助手配置
+.agents/
+.pytest_cache/
+.pytest-tmp*/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# ---- Build artifacts ----
 web/dist/
 web/node_modules/
 frontend/dist/
 frontend/node_modules/
 frontend/*.log
 frontend/*.tsbuildinfo
-app/__pycache__/
+knowledge/backend/.venv/
+knowledge/frontend/node_modules/
+knowledge/frontend/dist/
+
+# ---- Python bytecode ----
 **/__pycache__/
-.pytest_cache/
-.mypy_cache/
-.venv/
+**/*.pyc
+**/*.pyo
+**/*.pyd
+*.so
+*.egg-info/
+
+# ---- Local logs ----
 *.log
 
-# IDE
+# ---- IDE / OS ----
 .vscode/
 .idea/
-
-# OS
+*.swp
+*.swo
+*~
 .DS_Store
 Thumbs.db
+
+# ---- Local-only data dumps (defense in depth) ----
+*.dump
+*.bak
+*.tmp
+nul
