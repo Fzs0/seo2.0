@@ -141,11 +141,16 @@
 | POST | `/api/v1/connectors/{connector_id}/test` | 无 | 使用已保存 secret 测试当前版本；成功后记录响应结构指纹并标记已验证。 |
 | POST | `/api/v1/connectors/{connector_id}/activate` | 无 | 仅激活当前已验证版本。 |
 | POST | `/api/v1/connectors/{connector_id}/sync-products` | 无 | 拉取全部受限分页并按 `(source_connector_id, external_id)` 幂等写入产品表，同时保存 SEO 审计结果。 |
+| POST | `/api/v1/connectors/{connector_id}/sync-collections` | 无 | 读取 OEMApps 全部专辑和商品库存，反向校验专辑成员并幂等写入产品分类表。 |
+| GET | `/api/v1/connectors/{connector_id}/collections` | `limit?` | 查看已同步的产品分类、TDK、描述、成员商品和 SEO 缺口。 |
 | GET | `/api/v1/connectors/{connector_id}/versions` | 无 | 查看历史版本及验证状态。 |
 | GET | `/api/v1/connectors/{connector_id}/runs` | 无 | 查看最近测试/同步运行记录。 |
 | POST | `/api/v1/connectors/{connector_id}/products/{product_id}/seo-update/preview` | SEO patch | 实时读取商品详情，返回 TDK/图片 ALT 差异、商品快照哈希和 variant ID；不写外部站点。 |
 | POST | `/api/v1/connectors/{connector_id}/products/{product_id}/seo-update/execute` | SEO patch、`expected_snapshot_hash`、`confirm_variant_recreation=true` | 快照未变化时将批准字段合并进完整商品结构并执行单商品 PUT，随后回读验证；保存更新审计。 |
 | GET | `/api/v1/connectors/{connector_id}/seo-update-runs` | `limit?` | 查看 OEMApps 商品 SEO 写回记录和 variant ID 前后变化。 |
+| POST | `/api/v1/connectors/{connector_id}/collections/{collection_id}/seo-update/preview` | 分类 SEO patch | 实时读取专辑详情并从商品列表反向重建成员；返回 TDK 差异、快照哈希和成员 ID，不写外部站点。 |
+| POST | `/api/v1/connectors/{connector_id}/collections/{collection_id}/seo-update/execute` | 分类 SEO patch、`expected_snapshot_hash`、`confirm_membership_top_reset=true` | 合并完整专辑 PUT Body，写后回读 TDK 和成员关系并保存审计。由于读取接口不返回 `is_top`，必须显式确认提交成员 `is_top=0`。 |
+| GET | `/api/v1/connectors/{connector_id}/collection-seo-update-runs` | `limit?` | 查看专辑 SEO 写回、成员前后快照和验证结果。 |
 
 网络保护包括：仅允许 HTTPS 443、逐次校验跳转目标、DNS 解析结果必须全部为公网地址、精确主机白名单、超时和响应大小限制、JSON 内容类型校验。通用自定义连接器保持只读；只有固定域名的 OEMApps 适配器提供显式 SEO 写回，且要求连接器已激活、单商品预览、快照匹配、variant 重建确认、完整审计和写后回读。
 

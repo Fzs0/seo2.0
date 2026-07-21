@@ -450,7 +450,7 @@ async def preview_oemapps_seo_update(
     product_id: str,
     patch: dict[str, Any],
 ) -> dict[str, Any]:
-    _, token = await _oemapps_runtime(session, connector_id)
+    _, token = await load_oemapps_runtime(session, connector_id)
     await session.commit()
     client = OemAppsProducts(token)
     try:
@@ -483,7 +483,7 @@ async def execute_oemapps_seo_update(
 ) -> dict[str, Any]:
     if not confirm_variant_recreation:
         raise ValueError("confirm_variant_recreation must be true for OEMApps product PUT")
-    _, token = await _oemapps_runtime(session, connector_id)
+    _, token = await load_oemapps_runtime(session, connector_id)
     await session.commit()
     client = OemAppsProducts(token)
     run_id: Any = None
@@ -606,7 +606,7 @@ async def list_oemapps_seo_update_runs(
     }
 
 
-async def _oemapps_runtime(
+async def load_oemapps_runtime(
     session: AsyncSession, connector_id: str
 ) -> tuple[dict[str, Any], str]:
     stored, secrets = await _load_runtime(session, connector_id, require_active=True)

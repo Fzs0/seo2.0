@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field, model_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.connectors.custom_data import ConnectorConfig, ConnectorError
+from app.connectors.oemapps_collections import OemAppsCollectionError
 from app.connectors.oemapps_products import OemAppsProductError
 from app.connectors.safe_http import ConnectorHttpError
 from app.connectors.secrets import ConnectorSecretError
@@ -28,6 +29,13 @@ from app.services.custom_connector_service import (
     test_config_request,
     test_connector,
     update_connector,
+)
+from app.services.oemapps_collection_service import (
+    execute_collection_seo_update,
+    list_collection_update_runs,
+    list_synced_collections,
+    preview_collection_seo_update,
+    sync_oemapps_collections,
 )
 
 
@@ -91,6 +99,35 @@ class OemAppsSeoExecuteBody(OemAppsSeoPatch):
         return self.model_dump(
             exclude_unset=True,
             exclude={"expected_snapshot_hash", "confirm_variant_recreation"},
+        )
+
+
+class OemAppsCollectionSeoPatch(BaseModel):
+    meta_title: str | None = Field(default=None, max_length=500)
+    meta_description: str | None = Field(default=None, max_length=2000)
+    meta_keywords: list[str] | None = Field(default=None, max_length=100)
+
+    @model_validator(mode="after")
+    def validate_patch(self) -> "OemAppsCollectionSeoPatch":
+        fields = {"meta_title", "meta_description", "meta_keywords"}
+        if not (self.model_fields_set & fields):
+            raise ValueError("at least one collection SEO field must be provided")
+        if self.meta_keywords is not None and any(len(value) > 200 for value in self.meta_keywords):
+            raise ValueError("each meta keyword must be at most 200 characters")
+        return self
+
+    def as_patch(self) -> dict[str, Any]:
+        return self.model_dump(exclude_unset=True)
+
+
+class OemAppsCollectionSeoExecuteBody(OemAppsCollectionSeoPatch):
+    expected_snapshot_hash: str = Field(min_length=64, max_length=64)
+    confirm_membership_top_reset: bool = False
+
+    def as_patch(self) -> dict[str, Any]:
+        return self.model_dump(
+            exclude_unset=True,
+            exclude={"expected_snapshot_hash", "confirm_membership_top_reset"},
         )
 
 
@@ -198,6 +235,69 @@ async def sync_connector_products_route(
         return await sync_connector_products(session, connector_id)
     except (ValueError, ConnectorError, ConnectorHttpError, ConnectorSecretError) as error:
         raise _bad_request(error) from error
+
+
+@router.post("/{connector_id}/sync-collections")
+async def sync_oemapps_collections_route(
+    connector_id: str, session: AsyncSession = Depends(get_db)
+) -> dict[str, Any]:
+    try:
+        return await sync_oemapps_collections(session, connector_id)
+    except (ValueError, ConnectorSecretError, OemAppsCollectionError) as error:
+        raise _bad_request(error) from error
+
+
+@router.get("/{connector_id}/collections")
+async def list_oemapps_collections_route(
+    connector_id: str,
+    limit: int = Query(200, ge=1, le=500),
+    session: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    return await list_synced_collections(session, connector_id, limit=limit)
+
+
+@router.post("/{connector_id}/collections/{collection_id}/seo-update/preview")
+async def preview_oemapps_collection_seo_update_route(
+    connector_id: str,
+    collection_id: str,
+    body: OemAppsCollectionSeoPatch,
+    session: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    try:
+        return await preview_collection_seo_update(
+            session, connector_id, collection_id, body.as_patch()
+        )
+    except (ValueError, ConnectorSecretError, OemAppsCollectionError) as error:
+        raise _bad_request(error) from error
+
+
+@router.post("/{connector_id}/collections/{collection_id}/seo-update/execute")
+async def execute_oemapps_collection_seo_update_route(
+    connector_id: str,
+    collection_id: str,
+    body: OemAppsCollectionSeoExecuteBody,
+    session: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    try:
+        return await execute_collection_seo_update(
+            session,
+            connector_id,
+            collection_id,
+            body.as_patch(),
+            expected_snapshot_hash=body.expected_snapshot_hash,
+            confirm_membership_top_reset=body.confirm_membership_top_reset,
+        )
+    except (ValueError, ConnectorSecretError, OemAppsCollectionError) as error:
+        raise _bad_request(error) from error
+
+
+@router.get("/{connector_id}/collection-seo-update-runs")
+async def collection_seo_update_runs_route(
+    connector_id: str,
+    limit: int = Query(50, ge=1, le=200),
+    session: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    return await list_collection_update_runs(session, connector_id, limit=limit)
 
 
 @router.post("/{connector_id}/products/{product_id}/seo-update/preview")

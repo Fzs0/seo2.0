@@ -40,6 +40,16 @@ def test_openapi_exposes_connector_management_routes() -> None:
     assert "/api/v1/connectors/{connector_id}/sync-products" in paths
     assert "/api/v1/connectors/{connector_id}/products/{product_id}/seo-update/preview" in paths
     assert "/api/v1/connectors/{connector_id}/products/{product_id}/seo-update/execute" in paths
+    assert "/api/v1/connectors/{connector_id}/sync-collections" in paths
+    assert "/api/v1/connectors/{connector_id}/collections" in paths
+    assert (
+        "/api/v1/connectors/{connector_id}/collections/{collection_id}/seo-update/preview"
+        in paths
+    )
+    assert (
+        "/api/v1/connectors/{connector_id}/collections/{collection_id}/seo-update/execute"
+        in paths
+    )
 
 
 def test_oemapps_execute_requires_seo_patch_and_explicit_confirmation_field() -> None:

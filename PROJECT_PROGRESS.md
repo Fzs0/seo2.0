@@ -35,6 +35,8 @@
 
 2026-07-21 ExDivo OEMApps 连接器已正式落库并激活：站点 ID `24aa6361-9b34-4db8-8b22-c1324cac7c5c`，连接器 ID `ca557e1f-bd47-4590-b2ef-58cb366cee0f`；104 个商品已全部同步到 `seo_agent.products`，0 条拒绝。数据库审计为 49 个缺 Meta Title、49 个缺 Meta Description、461 张图片缺 ALT。连接器加密密钥已保存到 Windows 用户环境变量，Token 已加密入库且未出现在测试响应中；8000 端口进程仍需用户通过 `start-backend.bat` 重启以加载新代码和环境。
 
+2026-07-21 ExDivo 产品分类接口已接入 OEMApps 适配器：`GET /collections/list`、`GET /collections/{id}` 和完整 `PUT /collections/{id}` 已真实验证。12 个专辑已同步到 `seo_agent.product_collections`，其中 10 个缺 Meta Title、10 个缺 Meta Description，共校验 100 条专辑商品关系。编辑接口使用只有 1 个成员的 `ALIBARBAR` 做同值 PUT，内容和成员保持不变，仅更新时间变化。由于读取接口不暴露成员 `is_top`，正式 SEO 写回要求预览快照、成员数量一致、显式确认 `is_top=0`、单专辑执行、审计和写后回读。
+
 ## 0.1 跨窗口恢复点（2026-07-20）
 
 当前主线已从“先做主站文章”收敛为“先建立主站商业页面归属，再生成支持文章”：
