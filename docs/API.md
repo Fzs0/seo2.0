@@ -120,11 +120,34 @@
 | 方法 | 路径 | 请求 | 响应/说明 |
 | --- | --- | --- | --- |
 | GET | `/api/v1/products` | 查询：`site_id`、`status`、`category`、`search`、`min_price`、`max_price`、`limit=50`（1..500）、`offset=0` | 分页产品结果。 |
-| GET | `/api/v1/products/by-external/{external_id}` | 路径：`external_id` | 按外部 ID 查询；不存在返回 404。该路径先于 `/{product_id}` 注册。 |
+| GET | `/api/v1/products/by-external/{external_id}` | 路径：`external_id`；可选查询 `site_id` | 按外部 ID 查询；不存在返回 404。连接器数据建议传 `site_id` 消除不同来源的 ID 歧义。该路径先于 `/{product_id}` 注册。 |
 | GET | `/api/v1/products/{product_id}` | 路径：整数 `product_id` | 按内部 ID 查询；不存在返回 404。 |
 | POST | `/api/v1/site-snapshot` | `SiteSnapshotBody` | 并发探测输入的 API，返回 `{siteResults, total}`；会发起外部调用。 |
 | POST | `/api/v1/serpapi` | `SerpApiBody` | 查询 Google SERP；默认 `gl=us`、`hl=en`，需要 SerpApi 配置。 |
 | POST | `/api/v1/images/search` | `ImageSearchBody` | 从 Pexels/Unsplash/Pixabay 等图片提供商搜索，需对应 Key。 |
+
+#### 2.8.1 自定义商品数据连接器
+
+自定义连接器 V1 是只读商品导入入口。配置由请求模板、精确域名白名单、分页规则、响应成功条件和字段映射组成；支持 GET/POST、受限 JSONPath 与常用类型转换。敏感值通过 `${secret:名称}` 占位，并使用 `CONNECTOR_SECRET_KEY` 加密保存，接口响应不返回密文或明文。配置须先测试通过，再激活和同步。自建站统一使用 OEMApps 预设，每个站点只需要关联 `site_id` 并配置不同的 Token；Shopify 暂不接入该预设。
+
+| 方法 | 路径 | 请求 | 响应/说明 |
+| --- | --- | --- | --- |
+| POST | `/api/v1/connectors/preview` | `{config, response, limit?}` | 使用粘贴的 JSON 样例验证映射，不发起外部请求；返回标准商品、映射错误和 SEO 缺口。 |
+| POST | `/api/v1/connectors/test-request` | `{config, secrets?, limit?}` | 测试未保存配置的真实只读请求；响应不回显 secret 或原始上游记录。 |
+| POST | `/api/v1/connectors` | `{name, site_id?, config, secrets?}` | 保存草稿及版本；secret 加密保存。 |
+| POST | `/api/v1/connectors/oemapps` | `{site_id, token}` | 创建或轮换自建站 OEMApps 连接器；列表地址、分页和商品字段映射均使用内置预设。 |
+| GET | `/api/v1/connectors` | 无 | 连接器列表。 |
+| GET / PUT | `/api/v1/connectors/{connector_id}` | PUT：`{name?, site_id?, config?, secrets?}` | 查看脱敏配置或创建新草稿版本。 |
+| POST | `/api/v1/connectors/{connector_id}/test` | 无 | 使用已保存 secret 测试当前版本；成功后记录响应结构指纹并标记已验证。 |
+| POST | `/api/v1/connectors/{connector_id}/activate` | 无 | 仅激活当前已验证版本。 |
+| POST | `/api/v1/connectors/{connector_id}/sync-products` | 无 | 拉取全部受限分页并按 `(source_connector_id, external_id)` 幂等写入产品表，同时保存 SEO 审计结果。 |
+| GET | `/api/v1/connectors/{connector_id}/versions` | 无 | 查看历史版本及验证状态。 |
+| GET | `/api/v1/connectors/{connector_id}/runs` | 无 | 查看最近测试/同步运行记录。 |
+| POST | `/api/v1/connectors/{connector_id}/products/{product_id}/seo-update/preview` | SEO patch | 实时读取商品详情，返回 TDK/图片 ALT 差异、商品快照哈希和 variant ID；不写外部站点。 |
+| POST | `/api/v1/connectors/{connector_id}/products/{product_id}/seo-update/execute` | SEO patch、`expected_snapshot_hash`、`confirm_variant_recreation=true` | 快照未变化时将批准字段合并进完整商品结构并执行单商品 PUT，随后回读验证；保存更新审计。 |
+| GET | `/api/v1/connectors/{connector_id}/seo-update-runs` | `limit?` | 查看 OEMApps 商品 SEO 写回记录和 variant ID 前后变化。 |
+
+网络保护包括：仅允许 HTTPS 443、逐次校验跳转目标、DNS 解析结果必须全部为公网地址、精确主机白名单、超时和响应大小限制、JSON 内容类型校验。通用自定义连接器保持只读；只有固定域名的 OEMApps 适配器提供显式 SEO 写回，且要求连接器已激活、单商品预览、快照匹配、variant 重建确认、完整审计和写后回读。
 
 ### 2.9 Google Analytics / Search Console
 

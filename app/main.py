@@ -195,10 +195,12 @@ def create_app() -> FastAPI:
     from app.api.admin.manage import router as admin_router
     from app.api.v1.analytics import router as v1_analytics_router
     from app.api.v1.business import router as v1_business_router
+    from app.api.v1.connectors import router as v1_connectors_router
     from app.api.v1.endpoints import router as v1_router
 
     app.include_router(v1_router, prefix="/api/v1")
     app.include_router(v1_business_router, prefix="/api/v1")
+    app.include_router(v1_connectors_router, prefix="/api/v1")
     app.include_router(v1_analytics_router, prefix="/api/v1")
     app.include_router(admin_router, prefix="/admin")
 

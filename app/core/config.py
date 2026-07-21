@@ -67,6 +67,7 @@ class Settings(BaseSettings):
     http_timeout_seconds: int = 30
     http_retry_max: int = 3
     ai_timeout_seconds: int = 90
+    connector_secret_key: str = ""
     ai_retry_max: int = 2
 
     # Shopify Admin API（自有店铺 Client Credentials Grant）

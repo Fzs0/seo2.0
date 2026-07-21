@@ -54,6 +54,8 @@ async def list_products(
             f"""
             SELECT id, external_id, site_id, handle, title, url, category, price,
                    status, image, description, keywords, source, extracted_at,
+                   source_connector_id, canonical_url, meta_title, meta_description,
+                   meta_keywords, images, variants, seo_audit, source_updated_at,
                    created_at, updated_at
               FROM seo_agent.products
               {where}
@@ -76,6 +78,8 @@ async def get_product(session: AsyncSession, product_id: int) -> dict[str, Any] 
         text(
             "SELECT id, external_id, site_id, handle, title, url, category, price, "
             "status, image, description, keywords, source, extracted_at, "
+            "source_connector_id, canonical_url, meta_title, meta_description, "
+            "meta_keywords, images, variants, seo_audit, source_updated_at, "
             "created_at, updated_at "
             "FROM seo_agent.products WHERE id = :id"
         ),
@@ -86,16 +90,23 @@ async def get_product(session: AsyncSession, product_id: int) -> dict[str, Any] 
 
 
 async def get_product_by_external_id(
-    session: AsyncSession, external_id: str
+    session: AsyncSession, external_id: str, *, site_id: str | None = None
 ) -> dict[str, Any] | None:
+    site_clause = " AND site_id = :site_id" if site_id else ""
+    params: dict[str, Any] = {"eid": external_id}
+    if site_id:
+        params["site_id"] = site_id
     result = await session.execute(
         text(
             "SELECT id, external_id, site_id, handle, title, url, category, price, "
             "status, image, description, keywords, source, extracted_at, "
+            "source_connector_id, canonical_url, meta_title, meta_description, "
+            "meta_keywords, images, variants, seo_audit, source_updated_at, "
             "created_at, updated_at "
-            "FROM seo_agent.products WHERE external_id = :eid"
+            f"FROM seo_agent.products WHERE external_id = :eid{site_clause} "
+            "ORDER BY source_connector_id NULLS FIRST LIMIT 1"
         ),
-        {"eid": external_id},
+        params,
     )
     row = result.mappings().first()
     return _row_to_dict(row) if row else None
@@ -106,7 +117,7 @@ def _row_to_dict(row: Any) -> dict[str, Any] | None:
         return None
     d = dict(row)
     # jsonb 字段反序列化
-    for k in ("image", "raw"):
+    for k in ("image", "images", "variants", "seo_audit", "raw"):
         v = d.get(k)
         if isinstance(v, str):
             try:

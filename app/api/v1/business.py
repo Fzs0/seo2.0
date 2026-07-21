@@ -463,9 +463,11 @@ async def list_products_route(
 
 @router.get("/products/by-external/{external_id}")
 async def get_product_by_external_id_route(
-    external_id: str, session: AsyncSession = Depends(get_db)
+    external_id: str,
+    site_id: str | None = None,
+    session: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
-    p = await get_product_by_external_id(session, external_id)
+    p = await get_product_by_external_id(session, external_id, site_id=site_id)
     if not p:
         raise HTTPException(status_code=404, detail="product not found")
     return p
