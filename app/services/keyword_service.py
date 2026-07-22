@@ -25,11 +25,12 @@ logger = structlog.get_logger(__name__)
 
 
 def _import_rejection_reason(item: dict[str, Any]) -> str:
-    if item.get("preflightStatus") != "ready":
+    defer_to_ai = item.get("source") == "import" and bool(item.get("allowUnresolvedScope"))
+    if item.get("preflightStatus") != "ready" and not (defer_to_ai and item.get("preflightStatus") == "needs_review"):
         return item.get("preflightReason") or "未通过基础数据检查"
     if item.get("marketMismatch"):
         return item.get("marketMismatchReason") or "市场数据库不匹配"
-    if item.get("scopeStatus") != "relevant":
+    if item.get("scopeStatus") != "relevant" and not (defer_to_ai and item.get("scopeStatus") == "needs_review"):
         return item.get("reason") or "未命中当前业务范围"
     if item.get("priority") == "Hold" or item.get("status") == "hold":
         return item.get("reason") or "本地规则判定为 Hold"
@@ -147,8 +148,21 @@ def analyze_keywords(
                 "scopeStatus": "needs_review",
             }
         asset = resolve_target_asset(item, project)
-        scope = keyword_scope(item.get("keyword", ""), project)
-        if item.get("preflightStatus") != "invalid" and scope["status"] != "relevant":
+        # A normal file selected for one business is source-page evidence, not a
+        # cross-business classifier input. Its relevance is decided by the
+        # business's confirmed site profile in the later AI review; applying
+        # global product terms here would leak another business's vocabulary.
+        scope = (
+            {
+                "status": "needs_review",
+                "matched": [],
+                "reason": "站点来源关键词待结合当前业务画像进行 AI 复核。",
+            }
+            if item.get("allowUnresolvedScope")
+            else keyword_scope(item.get("keyword", ""), project)
+        )
+        defer_unresolved_scope = bool(item.get("allowUnresolvedScope")) and scope["status"] == "needs_review"
+        if item.get("preflightStatus") != "invalid" and scope["status"] != "relevant" and not defer_unresolved_scope:
             item = {
                 **item,
                 "status": "hold",
@@ -211,11 +225,24 @@ def analyze_keywords(
 
 
 def import_and_analyze_csv(csv_text: str, project: dict[str, Any]) -> list[dict[str, Any]]:
-    return analyze_keywords(import_csv_keywords(csv_text), project, assign_site=False)
+    return analyze_keywords(
+        [{**item, "source": "import", "allowUnresolvedScope": True} for item in import_csv_keywords(csv_text)],
+        project,
+        assign_site=False,
+    )
 
 
 def import_and_analyze_file(payload: dict[str, Any], project: dict[str, Any]) -> list[dict[str, Any]]:
-    return analyze_keywords(import_keywords_from_file(payload), project, assign_site=False)
+    """Analyze a normal keyword file while retaining source-page evidence in ``raw``.
+
+    This route is intentionally separate from Semrush Strategy Builder: ordinary
+    site keyword tables do not claim to contain Semrush-curated page clusters.
+    """
+    return analyze_keywords(
+        [{**item, "source": "import", "allowUnresolvedScope": True} for item in import_keywords_from_file(payload)],
+        project,
+        assign_site=False,
+    )
 
 
 def prepare_semrush_strategy_import(

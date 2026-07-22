@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 async def list_keywords(
     session: AsyncSession,
     *,
+    business_id: str | None = None,
     status: str | None = None,
     priority: str | None = None,
     assigned_site_id: str | None = None,
@@ -25,6 +26,9 @@ async def list_keywords(
     """返回 { items: [...], total: int, limit, offset }。"""
     where = "WHERE 1=1"
     params: dict[str, Any] = {"limit": max(1, min(limit, 500)), "offset": max(0, offset)}
+    if business_id:
+        where += " AND business_id = :business_id"
+        params["business_id"] = business_id
     if status:
         where += " AND status = :status"
         params["status"] = status

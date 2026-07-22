@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import { useBusinessScope } from '@/businessScope'
 import { useMainSiteContent, useSites } from '@/hooks/useData'
 
 const TYPE_LABELS: Record<string, string> = {
@@ -11,12 +12,13 @@ const TYPE_LABELS: Record<string, string> = {
 
 export function MainSiteContentPage() {
   const sites = useSites()
-  const mainSites = (sites.data ?? []).filter((site) => site.is_main || site.site_type === 'main')
+  const { businessId } = useBusinessScope()
+  const mainSites = (sites.data ?? []).filter((site) => site.business_id === businessId && (site.is_main || site.site_type === 'main'))
   const [siteId, setSiteId] = useState('')
   const plan = useMainSiteContent(siteId)
 
   useEffect(() => {
-    if (!siteId && mainSites[0]) setSiteId(mainSites[0].id)
+    if (!mainSites.some((site) => site.id === siteId)) setSiteId(mainSites[0]?.id || '')
   }, [mainSites, siteId])
 
   return (

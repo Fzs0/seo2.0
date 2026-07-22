@@ -267,7 +267,7 @@ async def _load_keywords(
     opportunity_type: str | None,
 ) -> list[dict[str, Any]]:
     params: dict[str, Any] = {"business_id": business_id, "limit": max(1, min(limit, _AI_REQUEST_SIZE))}
-    where = "WHERE business_id = :business_id AND status IN ('imported', 'analyzed', 'planned') AND COALESCE(preflight_status, 'ready') = 'ready' AND COALESCE(priority, '') <> 'Hold' AND cluster_role IN ('pillar', 'standalone') AND raw #>> '{_strategy_builder,cluster_validation,status}' IN ('validated', 'provisional') AND NOT (COALESCE(ai_review, '{}'::jsonb) ?| ARRAY['strategy', 'reservation'])"
+    where = "WHERE business_id = :business_id AND status IN ('imported', 'analyzed', 'planned') AND (COALESCE(preflight_status, 'ready') = 'ready' OR (source = 'import' AND preflight_status = 'needs_review')) AND COALESCE(priority, '') <> 'Hold' AND cluster_role IN ('pillar', 'standalone') AND (source <> 'semrush_strategy_builder' OR raw #>> '{_strategy_builder,cluster_validation,status}' IN ('validated', 'provisional')) AND NOT (COALESCE(ai_review, '{}'::jsonb) ?| ARRAY['strategy', 'reservation'])"
     if keyword_ids:
         where += " AND topic_cluster_id IN (SELECT topic_cluster_id FROM seo_agent.keywords WHERE business_id = :business_id AND id::text = ANY(:ids))"
         params["ids"] = keyword_ids
@@ -289,6 +289,9 @@ async def _load_keywords(
                    asset_status, content_action, priority, score, status, reason, ai_review,
                    raw #> '{{_strategy_builder,cluster_validation}}' AS cluster_validation,
                    raw #> '{{_strategy_builder,top10_urls}}' AS top10_urls,
+                   raw->>'url' AS imported_page_url,
+                   raw->>'title' AS imported_page_title,
+                   raw->>'description' AS imported_page_description,
                    (
                      SELECT jsonb_agg(member ORDER BY member.volume DESC, member.kd ASC)
                        FROM (
@@ -400,6 +403,7 @@ def _prompt(
             "Choose assignedSiteId and assignedSiteLabel only from allowedSites. Match market/language and content role; return null when no site is suitable.",
             "If an allowed site has a confirmed knowledge_profile, use its positioning, audience, products, in_scope_topics, out_of_scope_topics, content_types, and editorial_rules as hard content boundaries. Never use a draft or empty profile as a fact.",
             "Use Semrush signals as evidence: intent, keywordType, volume, KD, PKD, potentialTraffic, competitiveDensity, serpResults, trendData, and serpFeatures. SERP features should influence pageType and required sections (for example People also ask suggests FAQ), but never be treated as facts about the page.",
+            "When importedPageUrl, importedPageTitle, or importedPageDescription is present, it is user-supplied context for an existing page. Use it to decide whether to update or avoid duplicating that page; do not treat its description as independently verified factual evidence.",
             "Each output item fields: keywordId, relevance, intent, priority, pageType, pageRole, contentAction, assignedSiteId, assignedSiteLabel, topicCluster, targetAssetUrl, strategyReason, briefDirection, confidence. keywordId must be the input representative id.",
             "member_keywords and top10_urls are cluster evidence, not separate assignments. Return one decision for the whole topicClusterId and never split individual members across sites.",
             f"Content planning context: {json.dumps(planning_context, ensure_ascii=False, default=str)}" if planning_context else "",
@@ -635,6 +639,7 @@ async def _save_strategy(
                SET assigned_site_id = CAST(:assigned_site_id AS uuid),
                    assigned_site_label = :assigned_site_label,
                    priority = COALESCE(:priority, priority),
+                   preflight_status = CASE WHEN source = 'import' AND preflight_status = 'needs_review' THEN 'ready' ELSE preflight_status END,
                    status = :status,
                    reason = COALESCE(:reason, reason),
                    ai_review = CAST(:ai_review AS jsonb),
@@ -730,7 +735,7 @@ async def clear_unreviewed_assignments(
 
 
 async def _count_unanalyzed(session: AsyncSession, business_id: str, keyword_ids: list[str] | None) -> int:
-    where = "business_id = :business_id AND status IN ('imported', 'analyzed', 'planned') AND COALESCE(preflight_status, 'ready') = 'ready' AND COALESCE(priority, '') <> 'Hold' AND cluster_role IN ('pillar', 'standalone') AND raw #>> '{_strategy_builder,cluster_validation,status}' IN ('validated', 'provisional') AND NOT (COALESCE(ai_review, '{}'::jsonb) ?| ARRAY['strategy', 'reservation'])"
+    where = "business_id = :business_id AND status IN ('imported', 'analyzed', 'planned') AND (COALESCE(preflight_status, 'ready') = 'ready' OR (source = 'import' AND preflight_status = 'needs_review')) AND COALESCE(priority, '') <> 'Hold' AND cluster_role IN ('pillar', 'standalone') AND (source <> 'semrush_strategy_builder' OR raw #>> '{_strategy_builder,cluster_validation,status}' IN ('validated', 'provisional')) AND NOT (COALESCE(ai_review, '{}'::jsonb) ?| ARRAY['strategy', 'reservation'])"
     params: dict[str, Any] = {"business_id": business_id}
     if keyword_ids:
         where += " AND topic_cluster_id IN (SELECT topic_cluster_id FROM seo_agent.keywords WHERE business_id = :business_id AND id::text = ANY(:ids))"

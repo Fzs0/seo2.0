@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { DataGuard } from '@/components/StateBlock'
-import { cancelSemrushStrategyAiAnalysis, getLatestSemrushStrategyAiAnalysis, getSemrushStrategyAiAnalysis, importSemrushStrategyFile, previewSemrushStrategyFile, startSemrushStrategyAiAnalysis, useKeywordPage, useSites, validateImportedSemrushStrategy, type KeywordFilters, type SemrushStrategyAiAnalysisRun, type SemrushStrategyPreview } from '@/hooks/useData'
+import { useBusinessScope } from '@/businessScope'
+import { cancelSemrushStrategyAiAnalysis, getLatestSemrushStrategyAiAnalysis, getSemrushStrategyAiAnalysis, importKeywordFile, importSemrushStrategyFile, previewKeywordFile, previewSemrushStrategyFile, startSemrushStrategyAiAnalysis, useKeywordPage, validateImportedSemrushStrategy, type KeywordFileImportPreview, type KeywordFilters, type SemrushStrategyAiAnalysisRun, type SemrushStrategyPreview } from '@/hooks/useData'
 import type { Priority } from '@/types/domain'
 
 const INTENT_TAG: Record<string, { label: string; tone: 'pink' | 'gold' | 'blue' | 'green' }> = {
@@ -71,28 +72,21 @@ export function KeywordsPage({ onNotify, onOpenContent }: { onNotify?: (title: s
   const [message, setMessage] = useState<string>()
   const [strategyPreview, setStrategyPreview] = useState<SemrushStrategyPreview | null>(null)
   const [strategyFile, setStrategyFile] = useState<File | null>(null)
+  const [keywordFilePreview, setKeywordFilePreview] = useState<KeywordFileImportPreview | null>(null)
+  const [keywordFile, setKeywordFile] = useState<File | null>(null)
   const [importedBatchId, setImportedBatchId] = useState('')
-  const [businessId, setBusinessId] = useState('')
+  const { businessId, businessSites } = useBusinessScope()
   const [targetMarket, setTargetMarket] = useState('US / English')
   const [keywordFilters, setKeywordFilters] = useState<KeywordFilters>({})
-  const kw = useKeywordPage(refreshKey, page, 100, keywordFilters)
-  const sites = useSites()
-  const strategySites = (sites.data ?? []).filter((site) => site.status === 'active' && site.strategy_enabled && site.business_id)
-  const businessIds = Array.from(new Set(strategySites.map((site) => site.business_id as string))).sort()
+  const kw = useKeywordPage(refreshKey, page, 100, { ...keywordFilters, businessId: businessId || undefined })
   const blockingAnomalies = strategyPreview?.anomalies.filter((item) => STRATEGY_BLOCKING_ANOMALIES.has(item.code)) ?? []
   const aiRunning = !!aiRun && !AI_RUN_TERMINAL.has(aiRun.status)
+  const hasAiReadySite = businessSites.some((site) => site.status === 'active' && site.strategy_enabled && !!site.market && !!site.language_code)
 
-  useEffect(() => {
-    if (!businessIds.length) {
-      setBusinessId('')
-      return
-    }
-    if (!businessIds.includes(businessId)) setBusinessId(businessIds[0])
-  }, [businessId, businessIds.join('|')])
 
   useEffect(() => {
     setPage(1)
-  }, [keywordFilters.aiAnalyzed, keywordFilters.intent, keywordFilters.serpFeature])
+  }, [businessId, keywordFilters.aiAnalyzed, keywordFilters.intent, keywordFilters.serpFeature])
 
   useEffect(() => {
     setAiRun(null)
@@ -136,18 +130,34 @@ export function KeywordsPage({ onNotify, onOpenContent }: { onNotify?: (title: s
     setImporting(true)
     setStrategyFile(null)
     setStrategyPreview(null)
+    setKeywordFile(null)
+    setKeywordFilePreview(null)
     setImportedBatchId('')
-    setMessage(`正在生成 Semrush Strategy Builder 只读预览：${file.name}…`)
+    setMessage(`正在识别并预览关键词文件：${file.name}…`)
     try {
-      const result = await previewSemrushStrategyFile(file)
-      setStrategyFile(file)
-      setStrategyPreview(result)
-      if (result.databases.length === 1) {
-        const fileMarket = result.databases[0] === 'us' ? 'US / English' : result.databases[0] === 'de' ? 'DE / German' : ''
-        if (fileMarket) setTargetMarket(fileMarket)
+      if (file.name.toLowerCase().endsWith('.xlsx')) {
+        try {
+          const result = await previewSemrushStrategyFile(file)
+          setStrategyFile(file)
+          setStrategyPreview(result)
+          if (result.databases.length === 1) {
+            const fileMarket = result.databases[0] === 'us' ? 'US / English' : result.databases[0] === 'de' ? 'DE / German' : ''
+            if (fileMarket) setTargetMarket(fileMarket)
+          }
+          setMessage(`识别为 Semrush 页面簇文件：${formatNumber(result.rowCount)} 条关键词、${formatNumber(result.pageClusterCount)} 个页面簇；未写入正式关键词池。`)
+          onNotify?.('Semrush 页面簇预览完成', `${formatNumber(result.pageClusterCount)} 个页面簇，未写入数据库`)
+          return
+        } catch (error) {
+          const detail = error instanceof Error ? error.message : ''
+          if (!detail.includes('未找到包含 Keyword、Page、Topic、Page type')) throw error
+        }
       }
-      setMessage(`预览完成：${formatNumber(result.rowCount)} 条关键词、${formatNumber(result.pageClusterCount)} 个页面簇；未写入正式关键词池。`)
-      onNotify?.('Semrush 页面簇预览完成', `${formatNumber(result.pageClusterCount)} 个页面簇，未写入数据库`)
+      if (!businessId) throw new Error('请先在顶部选择目标业务，再导入普通关键词文件')
+      const result = await previewKeywordFile(file, businessId, targetMarket)
+      setKeywordFile(file)
+      setKeywordFilePreview(result)
+      setMessage(`识别为普通关键词文件：原始 ${formatNumber(result.preflightSummary.total)} 条，初筛保留 ${formatNumber(result.preflightSummary.accepted)} 条；未写入正式关键词池。`)
+      onNotify?.('关键词文件预览完成', `${formatNumber(result.preflightSummary.accepted)} 条可进入现有分析链路，未写入数据库`)
     } catch (error) {
       setMessage(error instanceof Error ? error.message : '导入失败')
     } finally {
@@ -156,10 +166,21 @@ export function KeywordsPage({ onNotify, onOpenContent }: { onNotify?: (title: s
   }
 
   async function handleConfirmImport() {
-    if (!strategyFile || !strategyPreview || !businessId || !targetMarket || confirming || importedBatchId) return
+    if (!businessId || !targetMarket || confirming || importedBatchId) return
     setConfirming(true)
-    setMessage(`正在确认导入 ${formatNumber(strategyPreview.rowCount)} 条关键词…`)
     try {
+      if (keywordFile && keywordFilePreview) {
+        setMessage(`正在确认导入 ${formatNumber(keywordFilePreview.preflightSummary.accepted)} 条关键词…`)
+        const result = await importKeywordFile(keywordFile, businessId, targetMarket)
+        setImportedBatchId(result.sourceBatchId)
+        setMessage(`${result.message} 已保留原文件中的页面 URL、标题和描述作为后续分析上下文。`)
+        setPage(1)
+        setRefreshKey((key) => key + 1)
+        onNotify?.('关键词文件导入完成', `${formatNumber(result.saved)} 条关键词已写入；可直接进入 AI 分析`)
+        return
+      }
+      if (!strategyFile || !strategyPreview) return
+      setMessage(`正在确认导入 ${formatNumber(strategyPreview.rowCount)} 条关键词…`)
       const result = await importSemrushStrategyFile(strategyFile, businessId, targetMarket)
       setImportedBatchId(result.sourceBatchId)
       setMessage(`${result.message} 当前业务关键词池共 ${formatNumber(result.poolCount)} 条。`)
@@ -232,22 +253,19 @@ export function KeywordsPage({ onNotify, onOpenContent }: { onNotify?: (title: s
       <div>
         <h1>关键词库</h1>
         <p>
-          关键词来源：Semrush / 手工 / GSC。Strategy Builder 文件导入后先做页面簇校验，不启动 AI。
+          上传后自动识别 Semrush 页面簇文件或普通关键词文件。普通文件会进入预筛与 AI 分析；Semrush 页面簇会先进行结构校验。
         </p>
         {message && <p>{message}</p>}
       </div>
 
       <div className="filter-row">
-        <select className="input" value={businessId} onChange={(event) => setBusinessId(event.target.value)} disabled={importing || confirming || validating || aiRunning || !businessIds.length} aria-label="页面簇目标业务" style={{ maxWidth: 220 }}>
-          {!businessIds.length && <option value="">没有启用策略的业务</option>}
-          {businessIds.map((item) => <option key={item} value={item}>{item}</option>)}
-        </select>
+        <span className="chip"><span className="msr">business_center</span>当前业务：{businessId || '未选择'}</span>
         <label className="btn btn--primary">
           <span className="msr">{importing ? 'progress_activity' : 'upload_file'}</span>
-          {importing ? '预览中' : '预览 Strategy Builder'}
+          {importing ? '识别中' : '导入关键词文件'}
           <input
             type="file"
-            accept=".xlsx"
+            accept=".xlsx,.csv,.tsv"
             style={{ display: 'none' }}
             disabled={importing || confirming || validating || aiRunning}
             onChange={(event) => {
@@ -258,18 +276,47 @@ export function KeywordsPage({ onNotify, onOpenContent }: { onNotify?: (title: s
         </label>
         <button className="btn" type="button" onClick={() => void handleValidateImported()} disabled={!businessId || importing || confirming || validating || aiRunning}>
           <span className="msr">{validating ? 'progress_activity' : 'rule'}</span>
-          {validating ? '整理中' : '整理已导入页面簇'}
+          {validating ? '整理中' : '整理已导入 Semrush 页面簇'}
         </button>
-        <button className="btn btn--primary" type="button" onClick={() => void handleStartAiAnalysis()} disabled={!businessId || importing || confirming || validating || aiRunning}>
+        <button className="btn btn--primary" type="button" onClick={() => void handleStartAiAnalysis()} disabled={!businessId || !hasAiReadySite || importing || confirming || validating || aiRunning}>
           <span className="msr">{aiRunning ? 'progress_activity' : 'psychology'}</span>
-          {aiRunning ? 'AI 分析中' : 'AI 分析可用页面簇'}
+          {aiRunning ? 'AI 分析中' : 'AI 分析可用关键词簇'}
         </button>
         {aiRunning && <button className="btn" type="button" onClick={() => void handleCancelAiAnalysis()} disabled={cancelingAi}>{cancelingAi ? '停止中' : '停止 AI 分析'}</button>}
         {!aiRunning && !!kw.data?.total && onOpenContent && <button className="btn" type="button" onClick={onOpenContent}>下一步：前往今日策略</button>}
       </div>
-      <p>“整理已导入页面簇”仅按本地规则校验并保存结果，不是 AI 分析，不会分配站点或执行策略。</p>
-      <p>AI 仅分析“已验证”和“暂可用”页面簇；“桥接复核”和“拆簇复核”不会进入。</p>
+      <p>“整理已导入 Semrush 页面簇”仅按本地规则校验并保存结果，不是 AI 分析，不会分配站点或执行策略。</p>
+      <p>Semrush 页面簇仅分析“已验证”和“暂可用”项目；普通关键词文件按预筛通过后的关键词簇进入同一 AI 分析流程。</p>
+      {!hasAiReadySite && businessId && <p className="text-muted">当前业务还没有“启用策略”且已配置市场和语种的站点；可以先预览和导入，但请在站点管理完成配置后再启动 AI 分析。</p>}
       {aiRun && <p>AI 任务：{AI_RUN_LABEL[aiRun.status] || aiRun.status}{aiRun.decision && ` · 总计 ${formatNumber(aiRun.decision.total)} · 已更新 ${formatNumber(aiRun.decision.updated)} · 剩余 ${formatNumber(aiRun.decision.remaining)}`}{aiRun.decision?.message && ` · ${aiRun.decision.message}`}{aiRun.error_message && ` · ${aiRun.error_message}`}</p>}
+
+      {keywordFilePreview && (
+        <section className="card">
+          <div className="card__title">
+            <span>普通关键词文件 · 只读预览</span>
+            <span className={`tag tag--${importedBatchId ? 'green' : 'gray'}`}>{importedBatchId ? '已确认导入' : '未写入关键词池'}</span>
+          </div>
+          <p>{keywordFilePreview.filename} · 将保留原文件中的 URL、标题和描述，用于识别已有页面与避免重复选题。</p>
+          <div className="rail-stats">
+            <div className="rail-stat"><span className="rail-stat__label">原始关键词</span><strong className="rail-stat__value">{formatNumber(keywordFilePreview.preflightSummary.total)}</strong></div>
+            <div className="rail-stat"><span className="rail-stat__label">初筛保留</span><strong className="rail-stat__value">{formatNumber(keywordFilePreview.preflightSummary.accepted)}</strong></div>
+            <div className="rail-stat"><span className="rail-stat__label">初筛剔除</span><strong className="rail-stat__value">{formatNumber(keywordFilePreview.preflightSummary.rejected)}</strong></div>
+            <div className="rail-stat"><span className="rail-stat__label">关键词簇</span><strong className="rail-stat__value">{formatNumber(new Set(keywordFilePreview.keywords.map((item) => item.topicClusterId).filter(Boolean)).size)}</strong></div>
+          </div>
+          {Object.keys(keywordFilePreview.preflightSummary.rejectionReasons).length > 0 && <p>初筛原因：{Object.entries(keywordFilePreview.preflightSummary.rejectionReasons).map(([reason, count]) => `${reason || '未说明'} ${formatNumber(count)} 条`).join('；')}</p>}
+          <div className="filter-row">
+            <select className="input" value={targetMarket} onChange={(event) => setTargetMarket(event.target.value)} disabled={confirming || !!importedBatchId} aria-label="导入目标市场" style={{ maxWidth: 220 }}>
+              <option value="US / English">US / English</option>
+              <option value="DE / German">DE / German</option>
+            </select>
+            <button className="btn btn--primary" type="button" onClick={() => void handleConfirmImport()} disabled={confirming || !!importedBatchId || !keywordFile || !businessId || !targetMarket}>
+              <span className="msr">{confirming ? 'progress_activity' : importedBatchId ? 'check_circle' : 'database'}</span>
+              {confirming ? '导入中' : importedBatchId ? '已导入' : `确认导入 ${formatNumber(keywordFilePreview.preflightSummary.accepted)} 条`}
+            </button>
+          </div>
+          <p>确认后只写入关键词池；随后可点击“AI 分析可用关键词簇”。不会直接生成、发布或更新文章。</p>
+        </section>
+      )}
 
       {strategyPreview && (
         <section className="card">

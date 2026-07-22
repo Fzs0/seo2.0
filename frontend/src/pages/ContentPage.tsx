@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { cancelSeoStrategy, clearStrategyQueue, executeSeoStrategy, generateSeoStrategies, reviewSeoStrategy, saveStrategyPlan, scanContentAudit, stopSeoStrategy, useAutomationStatus, useSites, useStrategies, useStrategyCandidates, useStrategyEffects, useStrategyPlan, type ContentAuditReport, type StrategyCandidate, type StrategyFilters, type StrategyTask } from '@/hooks/useData'
 import type { StrategyEffect, StrategyEffectStatus } from '@/types/domain'
+import { useBusinessScope } from '@/businessScope'
 
 const EFFECT_STATUSES: Array<{ status: StrategyEffectStatus; label: string; tone: string }> = [
   { status: 'observing', label: '观察中', tone: 'blue' },
@@ -76,11 +77,10 @@ export function ContentPage({ onNotify }: { onNotify?: (title: string, detail?: 
   const [auditMessage, setAuditMessage] = useState<string>()
   const [auditReport, setAuditReport] = useState<ContentAuditReport | null>(null)
   const [strategyFilters, setStrategyFilters] = useState<StrategyFilters>({})
-  const [businessId, setBusinessId] = useState('')
+  const { businessId } = useBusinessScope()
   const sites = useSites()
   const publishSites = sites.data ?? []
   const strategySites = publishSites.filter((site) => site.status === 'active' && site.strategy_enabled && site.business_id)
-  const businessIds = Array.from(new Set(strategySites.map((site) => site.business_id as string))).sort()
   const currentStrategySites = strategySites.filter((site) => site.business_id === businessId)
   const candidates = useStrategyCandidates(strategyRefreshKey, businessId || undefined)
   const todayPlan = useStrategyPlan(strategyRefreshKey, businessId || undefined)
@@ -88,15 +88,13 @@ export function ContentPage({ onNotify }: { onNotify?: (title: string, detail?: 
   const executionStrategies = useStrategies(strategyRefreshKey, 'approved', {}, businessId || undefined)
   const effects = useStrategyEffects(strategyRefreshKey, businessId || undefined)
   const automation = useAutomationStatus(strategyRefreshKey, businessId || undefined)
-  useEffect(() => {
-    if (!businessIds.length) {
-      setBusinessId('')
-      return
-    }
-    if (!businessIds.includes(businessId)) setBusinessId(businessIds[0])
-  }, [businessId, businessIds.join('|')])
   const planFingerprint = JSON.stringify(todayPlan.data ?? null)
   const currentSiteIds = currentStrategySites.map((site) => site.id).join('|')
+  useEffect(() => {
+    setAuditReport(null)
+    setAuditMessage(undefined)
+    setStrategyFilters({})
+  }, [businessId])
   useEffect(() => {
     if (!businessId) {
       setActionBudget(4)
@@ -365,13 +363,10 @@ export function ContentPage({ onNotify }: { onNotify?: (title: string, detail?: 
             </div>
           </div>
           <div className="strategy-review-card__toolbar">
-            <select className="input" value={businessId} onChange={(event) => { setBusinessId(event.target.value); setAuditReport(null); setStrategyFilters({}) }} aria-label="当前策略业务" style={{ maxWidth: 220 }}>
-              {!businessIds.length && <option value="">没有已启用业务</option>}
-              {businessIds.map((id) => <option key={id} value={id}>{id}</option>)}
-            </select>
+            <span className="chip"><span className="msr">business_center</span>当前业务：{businessId || '未选择'}</span>
             <button className="btn btn--primary" type="button" onClick={() => void handleContentAudit()} disabled={auditRunning || !businessId}>
               <span className="msr">{auditRunning ? 'progress_activity' : 'travel_explore'}</span>
-              {auditRunning ? '扫描中…' : '扫描全部站点'}
+              {auditRunning ? '扫描中…' : '扫描当前业务站点'}
             </button>
             <span className="btn-caption">当前业务：{businessId || '未设置'}；参与站点：{currentStrategySites.map((site) => site.name).join('、') || '无'}；已排除 {Math.max(0, publishSites.length - currentStrategySites.length)} 个站点。</span>
           </div>
@@ -691,12 +686,14 @@ export function ContentPage({ onNotify }: { onNotify?: (title: string, detail?: 
                           <div className="strategy-effect-item__section">
                             <strong>执行前基线</strong>
                             {baselineMetrics.length ? <div className="strategy-effect-item__metrics">{baselineMetrics.slice(0, 8).map(([label, value]) => <span key={`${label}-${value}`}>{label}：{value}</span>)}</div> : <span className="strategy-effect-item__missing">未记录，当前不可判定完整闭环</span>}
+                            {effect.baseline_note && <div className="strategy-effect-item__missing">{effect.baseline_note}</div>}
                           </div>
                           <div className="strategy-effect-item__section">
                             <strong>最近检查{checkpointAt ? ` · ${formatEffectDate(checkpointAt)}` : ''}</strong>
                             {checkpointMetrics.length ? <div className="strategy-effect-item__metrics">{checkpointMetrics.slice(0, 8).map(([label, value]) => <span key={`${label}-${value}`}>{label}：{value}</span>)}</div> : <span>尚未检查</span>}
                           </div>
                           {(outcomeText || outcomeMetrics.length > 0) && <div className="strategy-effect-item__section"><strong>效果结论</strong>{outcomeText || <div className="strategy-effect-item__metrics">{outcomeMetrics.slice(0, 8).map(([label, value]) => <span key={`${label}-${value}`}>{label}：{value}</span>)}</div>}</div>}
+                          {effect.published_at && <div className="strategy-review-item__meta">{effect.action_type === 'update_article' ? '更新完成时间' : '发布时间'}：{formatEffectDate(effect.published_at)}</div>}
                           <div className="strategy-review-item__meta">下次检查：{formatEffectDate(effect.next_check_at)}{effect.cooldown_until ? ` · 冷却至 ${formatEffectDate(effect.cooldown_until)}` : ''}</div>
                           <div className="strategy-review-item__action">目标 URL：{targetUrl ? <a href={targetUrl} target="_blank" rel="noreferrer">{targetUrl}</a> : effect.target_url || '未记录'}</div>
                         </div>

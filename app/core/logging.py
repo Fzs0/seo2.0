@@ -1,13 +1,30 @@
 """结构化日志（structlog）+ JSON 输出。所有日志含 trace_id 与模块名。"""
 import logging
 import sys
+from pathlib import Path
 from typing import Any
 
 import structlog
 from structlog.contextvars import merge_contextvars
 
 
-def configure_logging(level: str = "INFO", json_output: bool = True) -> None:
+class _TeeWriter:
+    """Keep compact structured logs visible in the terminal and in one local file."""
+
+    def __init__(self, *streams: Any) -> None:
+        self._streams = streams
+
+    def write(self, value: str) -> int:
+        for stream in self._streams:
+            stream.write(value)
+        return len(value)
+
+    def flush(self) -> None:
+        for stream in self._streams:
+            stream.flush()
+
+
+def configure_logging(level: str = "INFO", json_output: bool = True, log_file: str = "") -> None:
     """初始化全局日志配置。
 
     - json_output=True：JSON 行（含 timestamp / level / trace_id / module / event）
@@ -15,6 +32,11 @@ def configure_logging(level: str = "INFO", json_output: bool = True) -> None:
     """
     log_level = getattr(logging, level.upper(), logging.INFO)
     logging.basicConfig(level=log_level, stream=sys.stdout, format="%(message)s")
+    output: Any = sys.stdout
+    if log_file:
+        path = Path(log_file)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        output = _TeeWriter(sys.stdout, path.open("a", encoding="utf-8", buffering=1))
 
     shared_processors: list[Any] = [
         merge_contextvars,
@@ -36,7 +58,7 @@ def configure_logging(level: str = "INFO", json_output: bool = True) -> None:
         processors=[*shared_processors, renderer],
         wrapper_class=structlog.make_filtering_bound_logger(log_level),
         context_class=dict,
-        logger_factory=structlog.PrintLoggerFactory(),
+        logger_factory=structlog.PrintLoggerFactory(file=output),
         cache_logger_on_first_use=True,
     )
 

@@ -1,6 +1,8 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { DataGuard } from '@/components/StateBlock'
-import { clearSiteKnowledge, deleteSite, generateSiteKnowledge, saveSiteKnowledge, scanSiteIndex, syncSitePosts, testSiteConnector, upsertSite, useSites } from '@/hooks/useData'
+import { useBusinessScope } from '@/businessScope'
+import { activateCustomConnector, clearSiteKnowledge, configureOemAppsConnector, deleteSite, discoverSiteBusiness, generateSiteKnowledge, listCustomConnectors, saveSiteKnowledge, scanSiteIndex, syncCustomConnectorProducts, syncOemAppsCollections, syncSitePosts, testCustomConnector, testSiteConnector, upsertSite, useSites } from '@/hooks/useData'
+import type { CustomConnector } from '@/hooks/useData'
 import type { Site, SiteIndexScanResult, SiteKnowledgeProfile } from '@/types/domain'
 
 const TYPE_LABEL: Record<string, string> = {
@@ -92,6 +94,8 @@ type SiteForm = {
   content_role: string
   content_scope: string
   business_id: string
+  is_main: boolean
+  allow_external_links: boolean
   strategy_enabled: boolean
   notes: string
   openApiKey: string
@@ -102,6 +106,71 @@ type SiteForm = {
 }
 
 type ConnectorResult = Awaited<ReturnType<typeof testSiteConnector>>
+type BusinessDiscoveryResult = Awaited<ReturnType<typeof discoverSiteBusiness>>
+
+type BusinessConfirmation = {
+  business_id: string
+  market: string
+  language_code: string
+  target_url: string
+  strategy_enabled: boolean
+}
+
+type BusinessOnboardingForm = {
+  business_name: string
+  site_type: string
+  base_url: string
+}
+
+function blankBusinessOnboarding(): BusinessOnboardingForm {
+  return {
+    business_name: '', site_type: 'shopify', base_url: '',
+  }
+}
+
+function splitLines(value: string) {
+  return value.split(/[\n,，]/).map((item) => item.trim()).filter(Boolean)
+}
+
+function siteKeyFromBusinessId(value: string) {
+  return value.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '')
+}
+
+function businessIdFromSite(name: string, baseUrl: string) {
+  try {
+    const url = new URL(baseUrl.includes('://') ? baseUrl : `https://${baseUrl}`)
+    const hostname = url.hostname.replace(/^www\./i, '')
+    const fromHost = siteKeyFromBusinessId(hostname.split('.')[0] || hostname)
+    if (fromHost.length >= 2) return fromHost.slice(0, 64)
+  } catch {
+    // The caller validates the URL and shows the actionable error.
+  }
+  return siteKeyFromBusinessId(name).slice(0, 64)
+}
+
+function isOemAppsUrl(value: string) {
+  try {
+    const url = new URL(value.includes('://') ? value : `https://${value}`)
+    return url.hostname.toLowerCase() === 'openapi.oemapps.com'
+  } catch {
+    return false
+  }
+}
+
+function articlePathsForForm(form: Pick<SiteForm, 'connector_type' | 'api_base_url' | 'articlesPath' | 'publishPath'>) {
+  if (form.connector_type === 'custom_openapi' && isOemAppsUrl(form.api_base_url)) {
+    return { articlesPath: '/posts', publishPath: '/posts', isPreset: true }
+  }
+  return { articlesPath: form.articlesPath, publishPath: form.publishPath, isPreset: false }
+}
+
+function isBusinessMain(site: Pick<Site, 'is_main' | 'site_type'>) {
+  return site.is_main || ['main', 'shopify'].includes(site.site_type)
+}
+
+function isBusinessMainForm(form: Pick<SiteForm, 'is_main' | 'site_type'>) {
+  return form.is_main || ['main', 'shopify'].includes(form.site_type)
+}
 
 function formFromSite(site: Site): SiteForm {
   return {
@@ -112,8 +181,8 @@ function formFromSite(site: Site): SiteForm {
     domain: site.domain || '',
     base_url: site.base_url || '',
     api_base_url: site.api_base_url || '',
-    articlesPath: site.api_config_summary?.articles_path || (site.connector_type === 'wordpress' ? '/wp-json/wp/v2/posts' : '/articles'),
-    publishPath: site.api_config_summary?.publish_path || (site.connector_type === 'wordpress' ? '/wp-json/wp/v2/posts' : '/articles/save'),
+    articlesPath: site.api_config_summary?.articles_path || (site.connector_type === 'wordpress' ? '/wp-json/wp/v2/posts' : '/posts'),
+    publishPath: site.api_config_summary?.publish_path || (site.connector_type === 'wordpress' ? '/wp-json/wp/v2/posts' : '/posts/batch'),
     market: site.market || '',
     language_code: site.language_code || '',
     google_gl: site.google_gl || '',
@@ -122,6 +191,8 @@ function formFromSite(site: Site): SiteForm {
     content_role: site.content_role || '',
     content_scope: site.content_scope || '',
     business_id: site.business_id || '',
+    is_main: site.is_main,
+    allow_external_links: site.allow_external_links,
     strategy_enabled: site.strategy_enabled,
     notes: site.notes || '',
     openApiKey: '',
@@ -158,6 +229,7 @@ function hasKnowledgeData(profile?: SiteKnowledgeProfile | null) {
 }
 
 export function SitesPage() {
+  const { businessId, refresh: refreshBusinessScope } = useBusinessScope()
   const [refreshKey, setRefreshKey] = useState(0)
   const [editing, setEditing] = useState<Site | null>(null)
   const [form, setForm] = useState<SiteForm | null>(null)
@@ -171,11 +243,23 @@ export function SitesPage() {
   const [knowledgeSaving, setKnowledgeSaving] = useState<string | null>(null)
   const [knowledgeClearing, setKnowledgeClearing] = useState<string | null>(null)
   const [knowledgeEditing, setKnowledgeEditing] = useState<{ site: Site; profile: SiteKnowledgeProfile } | null>(null)
+  const [businessOnboarding, setBusinessOnboarding] = useState<BusinessOnboardingForm | null>(null)
+  const [businessOnboardingSaving, setBusinessOnboardingSaving] = useState(false)
+  const [businessDiscoveryOpen, setBusinessDiscoveryOpen] = useState(false)
+  const [businessDiscoverySiteId, setBusinessDiscoverySiteId] = useState('')
+  const [businessDiscoveryResult, setBusinessDiscoveryResult] = useState<BusinessDiscoveryResult | null>(null)
+  const [businessDiscoveryRunning, setBusinessDiscoveryRunning] = useState(false)
+  const [businessConfirmation, setBusinessConfirmation] = useState<BusinessConfirmation>({ business_id: '', market: '', language_code: 'en', target_url: '', strategy_enabled: false })
+  const [businessConfirming, setBusinessConfirming] = useState(false)
   const [indexScanning, setIndexScanning] = useState<string | null>(null)
   const [indexScanResults, setIndexScanResults] = useState<Record<string, SiteIndexScanResult>>({})
   const sites = useSites(refreshKey)
   const tested = Object.values(testResults)
   const healthy = tested.filter((item) => item.ok).length
+  const displaySites = [...(sites.data ?? [])]
+    .filter((site) => Boolean(businessId) && site.business_id === businessId)
+    .sort((left, right) => Number(isBusinessMain(right)) - Number(isBusinessMain(left)) || left.name.localeCompare(right.name))
+  const currentMainSite = displaySites.find(isBusinessMain)
 
   function openEditor(site: Site) {
     setEditing(site)
@@ -183,23 +267,201 @@ export function SitesPage() {
   }
 
   function openNewSite() {
-    const site = blankSite()
+    if (!businessId || !currentMainSite) {
+      window.alert('请先在顶部选择一个已建主站的业务，再新增该业务的附属站点。')
+      return
+    }
+    const site = {
+      ...blankSite(),
+      business_id: businessId,
+      market: currentMainSite.market,
+      language_code: currentMainSite.language_code,
+      google_gl: currentMainSite.google_gl,
+      google_hl: currentMainSite.google_hl,
+      semrush_database: currentMainSite.semrush_database,
+      is_main: false,
+    }
     setEditing(site)
     setForm(formFromSite(site))
   }
 
+  function openManualBusinessOnboarding() {
+    setBusinessOnboarding(blankBusinessOnboarding())
+  }
+
+  function openBusinessDiscovery() {
+    setBusinessDiscoveryOpen(true)
+    setBusinessDiscoverySiteId('')
+    setBusinessDiscoveryResult(null)
+    setBusinessConfirmation({ business_id: '', market: '', language_code: 'en', target_url: '', strategy_enabled: false })
+  }
+
+  async function runBusinessDiscovery(siteId: string) {
+    if (!siteId || businessDiscoveryRunning) return
+    setBusinessDiscoverySiteId(siteId)
+    setBusinessDiscoveryResult(null)
+    setBusinessDiscoveryRunning(true)
+    try {
+      const result = await discoverSiteBusiness(siteId)
+      setBusinessDiscoveryResult(result)
+      const currentSite = (sites.data || []).find((site) => site.id === siteId)
+      const suggestedId = siteKeyFromBusinessId(String(currentSite?.site_key || result.site.site_key).replace(/-shopify$/i, ''))
+      setBusinessConfirmation({
+        business_id: suggestedId,
+        market: currentSite?.market || '',
+        language_code: currentSite?.language_code || 'en',
+        target_url: result.candidate_targets[0]?.url || '',
+        strategy_enabled: false,
+      })
+    } catch (error) {
+      window.alert(error instanceof Error ? error.message : '站点扫描或 AI 分析失败')
+    } finally {
+      setBusinessDiscoveryRunning(false)
+    }
+  }
+
+  async function confirmDiscoveredBusiness() {
+    if (!businessDiscoveryResult || !businessDiscoverySiteId || businessConfirming) return
+    const currentSite = (sites.data || []).find((site) => site.id === businessDiscoverySiteId)
+    const businessId = businessConfirmation.business_id.trim()
+    if (!currentSite || !/^[a-z0-9][a-z0-9_-]{1,63}$/i.test(businessId)) {
+      window.alert('请确认业务 ID（2–64 位字母、数字、- 或 _）。')
+      return
+    }
+    if (businessConfirmation.strategy_enabled && !businessConfirmation.market.trim()) {
+      window.alert('启用策略前请填写目标市场，例如 US、DE。')
+      return
+    }
+    const selectedTarget = businessDiscoveryResult.candidate_targets.find((item) => item.url === businessConfirmation.target_url)
+    const draftPolicy = businessDiscoveryResult.knowledge_profile.generation_policy || {}
+    if (businessConfirmation.strategy_enabled && !selectedTarget) {
+      window.alert('商业站启用策略前，请先确认一个候选承接页。')
+      return
+    }
+    if (businessConfirmation.strategy_enabled && ['regulated', 'ymyl'].includes(String(draftPolicy.risk_level)) && !(draftPolicy.allowed_sources || []).length) {
+      window.alert('高风险业务需先补充已批准的可靠来源，当前不能启用策略。')
+      return
+    }
+    const hasApprovedSources = (draftPolicy.allowed_sources || []).length > 0
+    const canConfirmProfile = Boolean(selectedTarget) && (!['regulated', 'ymyl'].includes(String(draftPolicy.risk_level)) || hasApprovedSources)
+    const profile = {
+      ...businessDiscoveryResult.knowledge_profile,
+      status: canConfirmProfile ? 'confirmed' as const : 'draft' as const,
+      conversion_targets: selectedTarget ? [selectedTarget.url] : [],
+      verified_assets: selectedTarget ? [{ ...selectedTarget, facts: selectedTarget.facts }] : [],
+    }
+    const policy = profile.generation_policy || {}
+    const siteRole = policy.site_role || (currentSite.site_type === 'shopify' ? 'commercial' : 'editorial')
+    setBusinessConfirming(true)
+    try {
+      await upsertSite({
+        site_key: currentSite.site_key,
+        name: currentSite.name,
+        site_type: currentSite.site_type,
+        domain: currentSite.domain,
+        base_url: currentSite.base_url,
+        api_base_url: currentSite.api_base_url,
+        market: businessConfirmation.market.trim().toUpperCase(),
+        language_code: businessConfirmation.language_code.trim().toLowerCase(),
+        google_gl: businessConfirmation.market.trim().toLowerCase(),
+        google_hl: businessConfirmation.language_code.trim().toLowerCase(),
+        semrush_database: businessConfirmation.market.trim().toLowerCase(),
+        content_role: siteRole,
+        content_scope: profile.in_scope_topics?.join('、') || currentSite.content_scope || '',
+        business_id: businessId,
+        is_main: siteRole !== 'editorial',
+        strategy_enabled: businessConfirmation.strategy_enabled,
+        allow_external_links: currentSite.allow_external_links,
+        status: currentSite.status,
+        notes: `${currentSite.notes || ''}\n由已有站点扫描创建业务：${businessId}`.trim(),
+      })
+      await saveSiteKnowledge(currentSite.id, profile)
+      setBusinessDiscoveryOpen(false)
+      setRefreshKey((key) => key + 1)
+      refreshBusinessScope()
+      window.alert(businessConfirmation.strategy_enabled ? '业务已确认并启用策略。请先做一篇文章干跑。' : (canConfirmProfile ? 'AI 资料卡已确认，业务保持未启用状态。请先做一篇文章干跑。' : '业务已创建为草案。高风险业务需补充经过核验的官方来源后，才可确认资料卡并生成文章。'))
+    } catch (error) {
+      window.alert(error instanceof Error ? error.message : '确认业务失败')
+    } finally {
+      setBusinessConfirming(false)
+    }
+  }
+
+  async function saveBusinessOnboarding() {
+    if (!businessOnboarding || businessOnboardingSaving) return
+    const form = businessOnboarding
+    const businessName = form.business_name.trim()
+    const rawBaseUrl = form.base_url.trim()
+    let baseUrl = ''
+    try {
+      baseUrl = new URL(rawBaseUrl.includes('://') ? rawBaseUrl : `https://${rawBaseUrl}`).origin
+    } catch {
+      window.alert('请填写可访问的主站网址，例如 https://example.com。')
+      return
+    }
+    const businessId = businessIdFromSite(businessName, baseUrl)
+    if (!businessName || !/^[a-z0-9][a-z0-9_-]{1,63}$/i.test(businessId)) {
+      window.alert('请填写业务名称，并使用带英文域名的主站网址。')
+      return
+    }
+    const siteRole = ['shopify', 'main'].includes(form.site_type) ? 'commercial' : 'editorial'
+    const siteKey = `${businessId}-${form.site_type}`
+    if ((sites.data || []).some((site) => site.site_key === siteKey)) {
+      window.alert('该主站已存在。请在站点列表中编辑已有站点，不会覆盖它的配置。')
+      return
+    }
+    setBusinessOnboardingSaving(true)
+    try {
+      const saved = await upsertSite({
+        site_key: siteKey,
+        name: businessName,
+        site_type: form.site_type,
+        domain: baseUrl,
+        base_url: baseUrl,
+        content_role: siteRole,
+        content_scope: '',
+        business_id: businessId,
+        is_main: siteRole === 'commercial',
+        strategy_enabled: false,
+        notes: `由简化新增业务入口创建；业务名称：${businessName}；等待产品/分类接口同步与 AI 资料卡生成。`,
+      })
+      setBusinessOnboarding(null)
+      setRefreshKey((key) => key + 1)
+      refreshBusinessScope()
+      window.alert(`业务草案已创建（${saved.business_id || businessId}）。下一步接入产品/分类接口；同步完成后再由 AI 生成资料卡并确认策略。`)
+    } catch (error) {
+      window.alert(error instanceof Error ? error.message : '新增业务失败')
+    } finally {
+      setBusinessOnboardingSaving(false)
+    }
+  }
+
   async function saveEditor() {
     if (!form || saving) return
+    const scopedBusinessId = form.business_id || businessId
+    const derivedSiteKey = form.site_key.trim() || businessIdFromSite(form.name, form.base_url)
+    if (!scopedBusinessId || !currentMainSite && !isBusinessMainForm(form)) {
+      window.alert('请先选择一个已有主站的业务；附属站点不能脱离业务主站保存。')
+      return
+    }
+    if (!/^[a-z0-9][a-z0-9_-]{1,63}$/i.test(derivedSiteKey)) {
+      window.alert('请填写有效的公开站点网址，系统会据此生成站点标识。')
+      return
+    }
     setSaving(true)
     try {
-      const credentials = form.connector_type === 'wordpress'
-        ? { connector_type: form.connector_type, username: form.username, applicationPassword: form.applicationPassword }
-        : { connector_type: form.connector_type, openApiKey: form.openApiKey, tokenA: form.tokenA, tokenB: form.tokenB }
-      const api_config = Object.fromEntries(Object.entries({ ...credentials, articlesPath: form.articlesPath, publishPath: form.publishPath }).filter(([, value]) => value))
-      await upsertSite({ ...form, api_config })
+      const connectorType = form.site_type === 'shopify' ? 'shopify' : form.connector_type
+      const normalizedForm = { ...form, site_key: derivedSiteKey, business_id: scopedBusinessId, is_main: isBusinessMainForm(form), connector_type: connectorType }
+      const credentials = connectorType === 'wordpress'
+        ? { connector_type: connectorType, username: form.username, applicationPassword: form.applicationPassword }
+        : { connector_type: connectorType, openApiKey: form.openApiKey, tokenA: form.tokenA, tokenB: form.tokenB }
+      const articlePaths = articlePathsForForm(normalizedForm)
+      const api_config = Object.fromEntries(Object.entries({ ...credentials, articlesPath: articlePaths.articlesPath, publishPath: articlePaths.publishPath }).filter(([, value]) => value))
+      await upsertSite({ ...normalizedForm, api_config })
       setEditing(null)
       setForm(null)
       setRefreshKey((key) => key + 1)
+      refreshBusinessScope()
     } catch (error) {
       window.alert(error instanceof Error ? error.message : '站点配置保存失败')
     } finally {
@@ -251,6 +513,7 @@ export function SitesPage() {
       setTestResults((items) => { const next = { ...items }; delete next[site.id]; return next })
       setConnectorResults((items) => { const next = { ...items }; delete next[site.id]; return next })
       setRefreshKey((key) => key + 1)
+      refreshBusinessScope()
     } catch (error) {
       window.alert(error instanceof Error ? error.message : '删除站点失败')
     } finally {
@@ -306,6 +569,11 @@ export function SitesPage() {
 
   async function saveKnowledge(confirmed: boolean) {
     if (!knowledgeEditing || knowledgeSaving) return
+    const policy = knowledgeEditing.profile.generation_policy || {}
+    if (confirmed && ['regulated', 'ymyl'].includes(String(policy.risk_level)) && !(policy.allowed_sources || []).length) {
+      window.alert('高风险业务请先在“生文安全规则”中填写已核验的可靠来源，再确认使用。')
+      return
+    }
     setKnowledgeSaving(knowledgeEditing.site.id)
     try {
       await saveSiteKnowledge(knowledgeEditing.site.id, {
@@ -352,11 +620,11 @@ export function SitesPage() {
         <div className="kpi-row">
           <div className="kpi kpi--gold">
             <div className="kpi__head">
-              <span className="kpi__label">活跃站点</span>
+              <span className="kpi__label">当前业务站点</span>
               <span className="msr kpi__icon kpi__icon--gold">apartment</span>
             </div>
-            <div className="kpi__value">{sites.data?.length ?? 0}</div>
-            <div className="kpi__delta">当前配置</div>
+            <div className="kpi__value">{businessId ? displaySites.length : '—'}</div>
+            <div className="kpi__delta">{businessId || '请先选择业务'}</div>
           </div>
           <div className="kpi kpi--blue">
             <div className="kpi__head">
@@ -386,11 +654,15 @@ export function SitesPage() {
 
         <div className="card">
           <div className="card__title">
-            <span>站点列表</span>
+            <span>站点列表 {businessId ? `· ${businessId}` : ''}</span>
             <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-              <button className="btn btn--primary btn--xs" type="button" onClick={openNewSite}>
+              <button className="btn btn--primary btn--xs" type="button" onClick={openManualBusinessOnboarding}>
+                <span className="msr">add_business</span>
+                新增业务
+              </button>
+              <button className="btn btn--primary btn--xs" type="button" onClick={openNewSite} disabled={!businessId || !currentMainSite}>
                 <span className="msr">add</span>
-                新增站点
+                新增当前业务站点
               </button>
               <span className="chip">
                 <span className="msr">expand_more</span>
@@ -430,16 +702,17 @@ export function SitesPage() {
               </div>
             </div>
           </div>
+          <p style={{ color: 'var(--ink-500)', fontSize: 12, margin: '0 0 14px' }}>{businessId ? `仅展示业务“${businessId}”的主站和附属站点。新增站点会自动归入该主站所属业务。` : '请先在顶部选择业务；未选择业务时不展示或新增站点。'}</p>
 
           <DataGuard
             loading={sites.loading}
             error={sites.error}
-            empty={!sites.data || sites.data.length === 0}
-            emptyTitle="暂无站点"
-            emptyHint="通过 /api/v1/sites 添加站点后会展示在此"
+            empty={!businessId || displaySites.length === 0}
+            emptyTitle={businessId ? '当前业务暂无站点' : '请先选择业务'}
+            emptyHint={businessId ? '请先确认该业务的主站；附属站点只能归入已有业务主站。' : '从顶部“当前业务”选择业务后查看站点。'}
           >
             <div className="site-grid">
-              {(sites.data ?? []).map((s) => {
+              {displaySites.map((s) => {
                 const tone = TYPE_TONE[s.site_type] ?? 'blue'
                 const role = roleKey(s.content_role)
                 const prio = PRIORITY_META[role]
@@ -512,7 +785,8 @@ export function SitesPage() {
                         {connectorResults[s.id].error && <div className="site-diagnostics__error">错误：{connectorResults[s.id].error}</div>}
                       </div>
                     )}
-                    {(s.is_main || s.site_type === 'main') && (
+                    {isBusinessMain(s) && isOemAppsUrl(s.api_base_url || '') && <SiteOemAppsConnectorCard site={s} />}
+                    {isBusinessMain(s) && (
                       <SiteIndexScanCard
                         profile={s.knowledge_profile}
                         result={indexScanResults[s.id]}
@@ -585,9 +859,9 @@ export function SitesPage() {
                 )
               })}
               <div className="site-card site-card--placeholder">
-                <button className="btn btn--ghost btn--xs" type="button" onClick={openNewSite}><span className="msr">add_circle</span>新增站点</button>
+                <button className="btn btn--ghost btn--xs" type="button" onClick={openNewSite} disabled={!businessId || !currentMainSite}><span className="msr">add_circle</span>新增当前业务站点</button>
                 <span className="site-add__title">站点接入占位</span>
-                <span className="site-add__hint">配置 API、鉴权和文章路径后即可检测</span>
+                <span className="site-add__hint">会自动归入当前业务；配置连接信息后即可检测</span>
               </div>
             </div>
           </DataGuard>
@@ -599,7 +873,7 @@ export function SitesPage() {
         <div className="ai-card">
           <div className="card__title">站点知识进度</div>
           <div className="ai-list">
-            {(sites.data || []).map((site) => {
+            {displaySites.map((site) => {
               const profile = site.knowledge_profile
               return (
                 <div className="ai-list__item" key={site.id}>
@@ -637,7 +911,154 @@ export function SitesPage() {
           onClose={() => setKnowledgeEditing(null)}
         />
       )}
+      {businessOnboarding && (
+        <BusinessOnboardingEditor
+          form={businessOnboarding}
+          saving={businessOnboardingSaving}
+          onChange={(key, value) => setBusinessOnboarding((current) => current ? { ...current, [key]: value } : current)}
+          onSave={() => void saveBusinessOnboarding()}
+          onClose={() => setBusinessOnboarding(null)}
+        />
+      )}
+      {businessDiscoveryOpen && (
+        <BusinessDiscoveryEditor
+          sites={(sites.data || []).filter((site) => !site.business_id)}
+          selectedSiteId={businessDiscoverySiteId}
+          result={businessDiscoveryResult}
+          scanning={businessDiscoveryRunning}
+          confirmation={businessConfirmation}
+          confirming={businessConfirming}
+          onDiscover={(siteId) => void runBusinessDiscovery(siteId)}
+          onConfirmationChange={(key, value) => setBusinessConfirmation((current) => ({ ...current, [key]: value }))}
+          onConfirm={() => void confirmDiscoveredBusiness()}
+          onManual={() => { setBusinessDiscoveryOpen(false); openManualBusinessOnboarding() }}
+          onClose={() => setBusinessDiscoveryOpen(false)}
+        />
+      )}
     </>
+  )
+}
+
+function BusinessDiscoveryEditor({
+  sites,
+  selectedSiteId,
+  result,
+  scanning,
+  confirmation,
+  confirming,
+  onDiscover,
+  onConfirmationChange,
+  onConfirm,
+  onManual,
+  onClose,
+}: {
+  sites: Site[]
+  selectedSiteId: string
+  result: BusinessDiscoveryResult | null
+  scanning: boolean
+  confirmation: BusinessConfirmation
+  confirming: boolean
+  onDiscover: (siteId: string) => void
+  onConfirmationChange: (key: keyof BusinessConfirmation, value: string | boolean) => void
+  onConfirm: () => void
+  onManual: () => void
+  onClose: () => void
+}) {
+  const profile = result?.knowledge_profile
+  const policy = profile?.generation_policy
+  const field = (key: keyof Pick<BusinessConfirmation, 'business_id' | 'market' | 'language_code'>, label: string, hint?: string) => (
+    <label style={{ display: 'grid', gap: 5, fontSize: 12 }}>
+      <span>{label}</span>
+      <input className="input" value={String(confirmation[key] ?? '')} onChange={(event) => onConfirmationChange(key, event.target.value)} />
+      {hint && <span style={{ color: 'var(--ink-400)', fontSize: 10.5 }}>{hint}</span>}
+    </label>
+  )
+  return (
+    <div style={{ position: 'fixed', inset: 0, zIndex: 22, background: 'rgba(23,22,20,.35)', display: 'grid', placeItems: 'center', padding: 24 }}>
+      <div className="card" style={{ width: 'min(760px, 100%)', maxHeight: '90vh', overflow: 'auto' }}>
+        <div className="card__title"><span>从已有站点新增业务</span><button className="icon-btn" type="button" onClick={onClose}>close</button></div>
+        <p style={{ color: 'var(--ink-500)', fontSize: 12, lineHeight: 1.65, marginTop: 8 }}>系统会读取公开 sitemap、站内页面和已导入文章，再由 AI 生成一份待确认资料卡。预览不会写入业务资料、发布文章或自动启用策略。</p>
+        <div style={{ display: 'grid', gap: 8, marginTop: 14 }}>
+          {!sites.length && <div className="agent-empty">没有未归属业务的站点。已有站点可先解除原业务归属，或使用手动创建。</div>}
+          {sites.map((site) => (
+            <button key={site.id} type="button" className={`btn ${selectedSiteId === site.id ? 'btn--primary' : 'btn--ghost'}`} style={{ justifyContent: 'flex-start', textAlign: 'left' }} onClick={() => onDiscover(site.id)} disabled={scanning}>
+              <span className="msr">{site.site_type === 'shopify' ? 'storefront' : 'language'}</span>
+              {scanning && selectedSiteId === site.id ? '正在扫描并分析…' : `${site.name} · ${site.site_type} · ${site.base_url || site.domain}`}
+            </button>
+          ))}
+        </div>
+        {result && profile && (
+          <>
+            <div className="site-diagnostics site-diagnostics--ok" style={{ marginTop: 16 }}>
+              <div className="site-diagnostics__head"><strong>扫描完成</strong><span className="tag tag--green">草案</span></div>
+              <div className="site-diagnostics__grid">
+                <DiagnosticItem label="发现 URL" value={`${result.scan.indexed_urls} 个；实际扫描 ${result.scan.scanned_urls} 个`} />
+                <DiagnosticItem label="既有文章 / 产品记录" value={`${result.evidence.existing_posts} / ${result.evidence.product_records}`} />
+                <DiagnosticItem label="页面问题" value={`${result.scan.issues} 个`} />
+                <DiagnosticItem label="风险等级" value={policy?.risk_level || '待确认'} />
+              </div>
+            </div>
+            <div style={{ display: 'grid', gap: 7, marginTop: 14, fontSize: 12, lineHeight: 1.6 }}>
+              <div><strong>AI 定位：</strong>{profile.positioning || '未识别'}</div>
+              <div><strong>受众：</strong>{profile.audience || '未识别'}</div>
+              <div><strong>建议主题：</strong>{profile.in_scope_topics?.join('、') || '未识别'}</div>
+              <div><strong>产品/服务线索：</strong>{profile.products?.join('、') || result.scan.product_hints.join('、') || '未识别'}</div>
+              <div style={{ color: 'var(--ink-500)' }}>{result.recommended_next_step}</div>
+            </div>
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginTop: 16 }}>
+              {field('business_id', '业务 ID *', '已根据站点 Key 预填，可修改')}
+              {field('market', '目标市场', '仅在启用关键词策略时必填，例如 US')}
+              {field('language_code', '语言代码', '例如 en / de / zh')}
+              <label style={{ display: 'flex', alignItems: 'flex-start', gap: 8, fontSize: 12, paddingTop: 20 }}><input type="checkbox" checked={confirmation.strategy_enabled} onChange={(event) => onConfirmationChange('strategy_enabled', event.target.checked)} /><span>我已核对资料卡，立即启用策略。</span></label>
+            </div>
+            {result.candidate_targets.length > 0 && <label style={{ display: 'grid', gap: 5, fontSize: 12, marginTop: 12 }}><span>候选承接页</span><select className="input" value={confirmation.target_url} onChange={(event) => onConfirmationChange('target_url', event.target.value)}>{result.candidate_targets.map((target) => <option value={target.url} key={target.url}>{target.type} · {target.title || target.url}</option>)}</select><span style={{ color: 'var(--ink-400)', fontSize: 10.5 }}>来自公开页面的标题和 H1；选择即确认它可作为文章内链承接页。医疗效果、安全或治疗说法仍必须有批准来源。</span></label>}
+          </>
+        )}
+        <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8, marginTop: 20 }}><button className="btn btn--ghost" type="button" onClick={onManual}>手动创建</button><div style={{ display: 'flex', gap: 8 }}><button className="btn btn--ghost" type="button" onClick={onClose}>取消</button>{result && <button className="btn btn--primary" type="button" onClick={onConfirm} disabled={confirming}>{confirming ? '确认中…' : (['regulated', 'ymyl'].includes(String(policy?.risk_level)) && !(policy?.allowed_sources || []).length ? '保存业务草案' : '确认业务资料卡')}</button>}</div></div>
+      </div>
+    </div>
+  )
+}
+
+function BusinessOnboardingEditor({
+  form,
+  saving,
+  onChange,
+  onSave,
+  onClose,
+}: {
+  form: BusinessOnboardingForm
+  saving: boolean
+  onChange: (key: keyof BusinessOnboardingForm, value: string | boolean) => void
+  onSave: () => void
+  onClose: () => void
+}) {
+  const field = (key: keyof BusinessOnboardingForm, label: string, hint?: string, type = 'text') => (
+    <label style={{ display: 'grid', gap: 5, fontSize: 12 }}>
+      <span>{label}</span>
+      <input className="input" type={type} value={String(form[key] ?? '')} onChange={(event) => onChange(key, event.target.value)} />
+      {hint && <span style={{ color: 'var(--ink-400)', fontSize: 10.5 }}>{hint}</span>}
+    </label>
+  )
+  return (
+    <div style={{ position: 'fixed', inset: 0, zIndex: 22, background: 'rgba(23,22,20,.35)', display: 'grid', placeItems: 'center', padding: 24 }}>
+      <div className="card" style={{ width: 'min(760px, 100%)', maxHeight: '90vh', overflow: 'auto' }}>
+        <div className="card__title"><span>新增业务</span><button className="icon-btn" type="button" onClick={onClose}>close</button></div>
+        <p style={{ color: 'var(--ink-500)', fontSize: 12, lineHeight: 1.65, marginTop: 8 }}>先创建业务草案。产品和分类接口同步完成后，AI 会自动生成定位、受众、主题与内容安全规则；此处不会扫描 sitemap，也不会启用策略。</p>
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginTop: 14 }}>
+          {field('business_name', '业务名称 *', '例如 HealthyOxy；系统会根据主站域名自动生成内部业务标识')}
+          <label style={{ display: 'grid', gap: 5, fontSize: 12 }}><span>主站类型</span><select className="input" value={form.site_type} onChange={(event) => onChange('site_type', event.target.value)}><option value="shopify">Shopify 商业主站</option><option value="main">其他商业主站</option><option value="wp">WordPress 内容站</option><option value="blog">博客站</option><option value="other">其他</option></select></label>
+          <div style={{ gridColumn: '1 / -1' }}>{field('base_url', '主站网址 *', '例如 https://example.com；用于后续关联产品与分类接口')}</div>
+        </div>
+        <div style={{ marginTop: 14, padding: 12, border: '1px solid var(--border)', borderRadius: 10, background: 'var(--paper-100)', fontSize: 12, lineHeight: 1.65, color: 'var(--ink-500)' }}>
+          <strong style={{ color: 'var(--ink-700)' }}>创建后会做什么</strong>
+          <div>1. 接入并同步产品、分类和产品页数据</div>
+          <div>2. AI 生成业务资料卡与内容边界</div>
+          <div>3. 你确认资料卡后，才可以启用关键词和文章策略</div>
+        </div>
+        <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 20 }}><button className="btn btn--ghost" type="button" onClick={onClose}>取消</button><button className="btn btn--primary" type="button" onClick={onSave} disabled={saving}>{saving ? '创建中…' : '创建业务草案'}</button></div>
+      </div>
+    </div>
   )
 }
 
@@ -656,6 +1077,10 @@ function SiteEditor({
   onSave: () => void
   onClose: () => void
 }) {
+  const [advancedOpen, setAdvancedOpen] = useState(false)
+  const isWordPress = form.connector_type === 'wordpress'
+  const isShopify = form.connector_type === 'shopify' || form.site_type === 'shopify'
+  const articlePaths = articlePathsForForm(form)
   const field = (key: keyof SiteForm, label: string, type = 'text') => (
     <label style={{ display: 'grid', gap: 5, fontSize: 12 }}>
       <span>{label}</span>
@@ -668,36 +1093,153 @@ function SiteEditor({
         <div className="card__title"><span>编辑站点配置：{form.name}</span><button className="icon-btn" type="button" onClick={onClose}>close</button></div>
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginTop: 14 }}>
           {field('name', '站点名称')}
-          {field('site_key', '站点 Key')}
-          <label style={{ display: 'grid', gap: 5, fontSize: 12 }}><span>站点类型</span><select className="input" value={form.site_type} onChange={(event) => onChange('site_type', event.target.value)}><option value="main">主站</option><option value="blog">博客</option><option value="wp">WordPress</option><option value="other">其他</option></select></label>
-          <label style={{ display: 'grid', gap: 5, fontSize: 12 }}><span>连接器类型</span><select className="input" value={form.connector_type} onChange={(event) => onChange('connector_type', event.target.value)}><option value="custom_openapi">Custom OpenAPI</option><option value="wordpress">WordPress REST</option></select></label>
-          {field('domain', '域名，例如 https://example.com')}
-          {field('base_url', '站点基础 URL')}
-          {field('api_base_url', '文章 API 基础地址')}
-          {field('articlesPath', '读取文章路径，例如 /articles')}
-          {field('publishPath', '发布文章路径，例如 /articles/save')}
-          {field('market', '市场，例如 US / DE')}
-          {field('language_code', '语言，例如 en / de')}
-          {field('google_gl', 'Google 国家参数，例如 us')}
-          {field('google_hl', 'Google 语言参数，例如 en')}
-          {field('semrush_database', 'Semrush 数据库，例如 us')}
-          {field('content_role', '内容角色')}
-          {field('content_scope', '内容范围，例如产品、教程、评测')}
-          {field('business_id', '所属业务 ID')}
+          <label style={{ display: 'grid', gap: 5, fontSize: 12 }}><span>站点类型</span><select className="input" value={form.site_type} onChange={(event) => onChange('site_type', event.target.value)}>{isBusinessMainForm(form) && <><option value="main">商业主站</option><option value="shopify">Shopify 商业主站</option></>}<option value="blog">博客</option><option value="wp">WordPress</option><option value="other">其他</option></select></label>
+          {field('base_url', '公开站点网址')}
+          <div style={{ display: 'grid', gap: 5, fontSize: 12 }}><span>所属业务</span><div className="input" style={{ display: 'flex', alignItems: 'center', color: 'var(--ink-500)' }}>{form.business_id || '未选择业务'}</div></div>
           <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12 }}>
             <input type="checkbox" checked={form.strategy_enabled} onChange={(event) => onChange('strategy_enabled', event.target.checked)} />
             <span>参与所属业务的策略扫描与规划</span>
           </label>
-          {field('notes', '备注')}
         </div>
-        <div style={{ marginTop: 18, fontWeight: 700, fontSize: 13 }}>鉴权配置</div>
-        <div style={{ marginTop: 6, color: 'var(--ink-500)', fontSize: 12 }}>当前已保存字段：{configuredKeys.length ? configuredKeys.join('、') : '未检测或未配置'}</div>
-        <div style={{ marginTop: 6, color: 'var(--ink-500)', fontSize: 12 }}>已保存的密钥不会回显；留空表示保留原配置，填写新值后替换。</div>
-        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginTop: 10 }}>
-          {form.connector_type === 'wordpress' ? <>{field('username', 'WordPress 用户名')}{field('applicationPassword', 'Application Password', 'password')}</> : <>{field('openApiKey', 'OpenAPI Key', 'password')}{field('tokenA', 'Token A', 'password')}{field('tokenB', 'Token B', 'password')}</>}
+        <div style={{ marginTop: 18, fontWeight: 700, fontSize: 13 }}>文章连接</div>
+        {isShopify ? (
+          <div style={{ marginTop: 6, color: 'var(--ink-500)', fontSize: 12 }}>Shopify 由已安装的应用授权连接；无需在这里填写文章接口地址或 Token。</div>
+        ) : (
+          <>
+            <div style={{ marginTop: 6, color: 'var(--ink-500)', fontSize: 12 }}>已保存的密钥不会回显；留空表示保留原配置，填写新值后替换。</div>
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginTop: 10 }}>
+              {isWordPress ? <>{field('username', 'WordPress 用户名')}{field('applicationPassword', 'Application Password', 'password')}</> : <>{field('api_base_url', '文章接口地址')}{field('tokenA', '站点 Token', 'password')}</>}
+            </div>
+            {articlePaths.isPreset && <div style={{ marginTop: 8, color: 'var(--ink-500)', fontSize: 12 }}>已识别为 OEMApps：文章读取和发布均使用 <code>/posts</code>，仅 Token 因站点而异，无需手填路径。</div>}
+          </>
+        )}
+        <div style={{ marginTop: 16 }}>
+          <button className="btn btn--ghost btn--xs" type="button" onClick={() => setAdvancedOpen((value) => !value)}>{advancedOpen ? '收起高级配置' : '高级配置'}</button>
         </div>
+        {advancedOpen && <>
+          <div style={{ marginTop: 8, color: 'var(--ink-500)', fontSize: 12 }}>通常不需要修改。站点 Key、市场/语种和内容边界会由业务归属、产品接口和 AI 资料卡补全。</div>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginTop: 10 }}>
+            {field('site_key', '站点 Key')}
+            <label style={{ display: 'grid', gap: 5, fontSize: 12 }}><span>连接器类型</span><select className="input" value={form.connector_type} onChange={(event) => onChange('connector_type', event.target.value)}><option value="custom_openapi">Custom OpenAPI</option><option value="wordpress">WordPress REST</option><option value="shopify">Shopify Admin</option></select></label>
+            {field('domain', '技术域名（通常无需修改）')}
+            {!isShopify && !isWordPress && field('openApiKey', 'OpenAPI Key（旧协议更新用）', 'password')}
+            {!isShopify && !isWordPress && field('tokenB', '备用站点 Token', 'password')}
+            {!articlePaths.isPreset && !isShopify && <>{field('articlesPath', '读取文章路径')}{field('publishPath', '发布文章路径')}</>}
+            {field('market', '市场，例如 US / DE')}
+            {field('language_code', '语言，例如 en / de')}
+            {field('google_gl', 'Google 国家参数，例如 us')}
+            {field('google_hl', 'Google 语言参数，例如 en')}
+            {field('semrush_database', 'Semrush 数据库，例如 us')}
+            {field('content_role', '内容角色')}
+            {field('content_scope', '内容范围')}
+            {field('notes', '备注')}
+          </div>
+          <div style={{ marginTop: 10, color: 'var(--ink-500)', fontSize: 12 }}>当前已保存字段：{configuredKeys.length ? configuredKeys.join('、') : '未检测或未配置'}</div>
+        </>}
         <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 20 }}><button className="btn btn--ghost" type="button" onClick={onClose}>取消</button><button className="btn btn--primary" type="button" onClick={onSave} disabled={saving}>{saving ? '保存中…' : '保存配置'}</button></div>
       </div>
+    </div>
+  )
+}
+
+function SiteOemAppsConnectorCard({ site }: { site: Site }) {
+  const [connector, setConnector] = useState<CustomConnector | null>(null)
+  const [token, setToken] = useState('')
+  const [loading, setLoading] = useState(true)
+  const [action, setAction] = useState<'verify' | 'sync' | null>(null)
+  const [message, setMessage] = useState('')
+
+  async function refreshConnector() {
+    const result = await listCustomConnectors(site.id)
+    setConnector(result.items.find((item) => item.config?.adapter === 'oemapps') || null)
+  }
+
+  useEffect(() => {
+    let cancelled = false
+    setLoading(true)
+    setConnector(null)
+    setMessage('')
+    void listCustomConnectors(site.id)
+      .then((result) => {
+        if (!cancelled) setConnector(result.items.find((item) => item.config?.adapter === 'oemapps') || null)
+      })
+      .catch((error) => {
+        if (!cancelled) setMessage(error instanceof Error ? `无法读取商品连接器：${error.message}` : '无法读取商品连接器')
+      })
+      .finally(() => { if (!cancelled) setLoading(false) })
+    return () => { cancelled = true }
+  }, [site.id])
+
+  async function verifyAndActivate() {
+    const trimmedToken = token.trim()
+    if (!connector && !trimmedToken) {
+      window.alert('请填写 OEMApps 站点 Token。它只会加密保存到专用商品连接器，不会写入文章接口配置。')
+      return
+    }
+    setAction('verify')
+    setMessage('')
+    try {
+      const saved = trimmedToken ? await configureOemAppsConnector(site.id, trimmedToken) : connector
+      if (!saved) throw new Error('未找到商品连接器')
+      const tested = await testCustomConnector(saved.id)
+      if (!tested.ok) throw new Error(tested.errors?.join('；') || '商品映射验证未通过')
+      const active = await activateCustomConnector(saved.id)
+      setConnector(active)
+      setToken('')
+      setMessage(`已验证并启用：可读取 ${tested.mapped_items ?? tested.total_items ?? 0} 个商品样本。下一步可同步商品与分类。`)
+    } catch (error) {
+      setMessage(error instanceof Error ? `验证失败：${error.message}` : '验证失败')
+      void refreshConnector().catch(() => undefined)
+    } finally {
+      setAction(null)
+    }
+  }
+
+  async function syncCatalog() {
+    if (!connector || connector.status !== 'active') return
+    setAction('sync')
+    setMessage('')
+    try {
+      const products = await syncCustomConnectorProducts(connector.id)
+      const collections = await syncOemAppsCollections(connector.id)
+      setMessage(`同步完成：商品 ${products.items_upserted} 个，分类 ${collections.collections_upserted} 个。`)
+    } catch (error) {
+      setMessage(error instanceof Error ? `同步失败：${error.message}` : '同步失败')
+    } finally {
+      setAction(null)
+    }
+  }
+
+  const status = connector?.status || '未接入'
+  const tone = status === 'active' ? 'green' : status === 'verified' ? 'gold' : status === '未接入' ? 'blue' : 'pink'
+  const canSync = connector?.status === 'active'
+  return (
+    <div style={{ background: 'var(--paper-100)', border: '1px solid var(--border)', borderRadius: 12, padding: 12, marginBottom: 12 }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8 }}>
+        <strong style={{ fontSize: 12 }}>OEMApps 商品与分类连接器</strong>
+        <span className={`tag tag--${tone}`}>{loading ? '读取中' : status === 'active' ? '已启用' : status}</span>
+      </div>
+      <div style={{ color: 'var(--ink-500)', fontSize: 11, lineHeight: 1.55, marginTop: 6 }}>
+        专供 ExDivo、Avinoti 这类 OEMApps 主站。商品 Token 与文章接口独立加密保存；验证通过后才允许同步，不会向站点写入任何内容。
+      </div>
+      {!loading && (
+        <>
+          {connector && <div style={{ color: 'var(--ink-400)', fontSize: 10.5, marginTop: 7 }}>连接器：{connector.name} · 当前版本 v{connector.current_version}{connector.verified_at ? ' · 已验证' : ''}</div>}
+          <label style={{ display: 'grid', gap: 5, fontSize: 11, marginTop: 10 }}>
+            <span>{connector ? '替换 OEMApps Token（留空则仅重新验证）' : 'OEMApps 站点 Token'}</span>
+            <input className="input" type="password" autoComplete="new-password" value={token} onChange={(event) => setToken(event.target.value)} placeholder={connector ? '可选：填写后会替换旧 Token' : '粘贴站点 Token'} disabled={action !== null} />
+          </label>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 7, marginTop: 10 }}>
+            <button className="btn btn--primary btn--xs" type="button" onClick={() => void verifyAndActivate()} disabled={action !== null}>
+              <span className="msr">{action === 'verify' ? 'progress_activity' : 'verified_user'}</span>{action === 'verify' ? '验证中…' : connector ? '重新验证并启用' : '保存并验证'}
+            </button>
+            {canSync && <button className="btn btn--ghost btn--xs" type="button" onClick={() => void syncCatalog()} disabled={action !== null}>
+              <span className="msr">{action === 'sync' ? 'progress_activity' : 'inventory_2'}</span>{action === 'sync' ? '同步中…' : '同步商品与分类'}
+            </button>}
+          </div>
+        </>
+      )}
+      {message && <div style={{ color: message.includes('失败') || message.includes('无法') ? '#a14a3c' : '#5c6e33', fontSize: 11, lineHeight: 1.55, marginTop: 9 }}>{message}</div>}
     </div>
   )
 }
@@ -842,6 +1384,8 @@ function KnowledgeEditor({
   onConfirm: () => void
   onClose: () => void
 }) {
+  const policy = profile.generation_policy || {}
+  const updatePolicy = (patch: Partial<NonNullable<SiteKnowledgeProfile['generation_policy']>>) => onChange({ ...profile, generation_policy: { ...policy, ...patch } })
   const textField = (key: 'positioning' | 'audience' | 'tone', label: string) => (
     <label style={{ display: 'grid', gap: 5, fontSize: 12 }}><span>{label}</span><textarea className="input" rows={2} value={profile[key]} onChange={(event) => onChange({ ...profile, [key]: event.target.value })} /></label>
   )
@@ -864,6 +1408,13 @@ function KnowledgeEditor({
           {listField('conversion_goals', '转化目标')}
           {listField('editorial_rules', '编辑规则')}
         </div>
+        <div style={{ marginTop: 18, fontWeight: 700, fontSize: 13 }}>生文安全规则</div>
+        <p style={{ color: 'var(--ink-500)', fontSize: 11, lineHeight: 1.55, marginTop: 6 }}>健康、金融和法律等业务必须保留受监管/高风险等级，并添加与目标市场匹配的官方或专业来源；系统会在缺来源时阻止生成。</p>
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginTop: 10 }}>
+          <label style={{ display: 'grid', gap: 5, fontSize: 12 }}><span>站点角色</span><select className="input" value={policy.site_role || ''} onChange={(event) => updatePolicy({ site_role: event.target.value })}><option value="">由站点类型判断</option><option value="commercial">商业主站</option><option value="local_service">本地服务站</option><option value="editorial">内容站</option></select></label>
+          <label style={{ display: 'grid', gap: 5, fontSize: 12 }}><span>风险等级</span><select className="input" value={policy.risk_level || 'standard'} onChange={(event) => updatePolicy({ risk_level: event.target.value })}><option value="low">低</option><option value="standard">标准</option><option value="regulated">受监管</option><option value="ymyl">高风险（医疗/金融/法律）</option></select></label>
+        </div>
+        <label style={{ display: 'grid', gap: 5, fontSize: 12, marginTop: 12 }}><span>已核验的允许来源（一行一个 URL）</span><textarea className="input" rows={3} value={(policy.allowed_sources || []).map((item) => item.url).filter(Boolean).join('\n')} onChange={(event) => updatePolicy({ allowed_sources: splitLines(event.target.value).filter((url) => /^https:\/\//i.test(url)).map((url) => ({ url, label: url, source_type: 'approved' })) })} /><span style={{ color: 'var(--ink-400)', fontSize: 10.5 }}>只填写适用于当前目标市场、且已由你核验的来源；不要把搜索结果或竞品页面当作来源。</span></label>
         {profile.evidence.length > 0 && <div style={{ marginTop: 14, color: 'var(--ink-500)', fontSize: 11 }}>数据依据：{profile.evidence.map((item) => item.fact).filter(Boolean).join('；')}</div>}
         <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 20 }}><button className="btn btn--ghost" type="button" onClick={onClose}>取消</button><button className="btn btn--ghost" type="button" onClick={onSave} disabled={saving}>保存草稿</button><button className="btn btn--primary" type="button" onClick={onConfirm} disabled={saving}>{saving ? '保存中…' : '确认并用于策略'}</button></div>
       </div>

@@ -67,6 +67,20 @@ knowledge/frontend/dist/
 
 # ---- Local logs ----
 *.log
+logs/
+outputs/
+TXT/
+# Imported business keyword workbooks stay local; test fixtures belong under tests/.
+/*.xlsx
+
+# ---- Generated article assets (kept outside source control) ----
+assets/
+
+# ---- Local social executor runtime ----
+social-executor/node_modules/
+social-executor/artifacts/
+# This file contains placeholders only and is needed to configure the executor.
+!social-executor/.env.example
 
 # ---- IDE / OS ----
 .vscode/

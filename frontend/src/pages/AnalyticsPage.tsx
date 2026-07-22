@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { DataGuard, StateBlock } from '@/components/StateBlock'
+import { useBusinessScope } from '@/businessScope'
 import { triggerAnalyticsSync, useAnalyticsOverview } from '@/hooks/useData'
 
 function asNumber(value: number | string | null | undefined) {
@@ -28,6 +29,7 @@ function formatDuration(value: number | string | null | undefined) {
 }
 
 export function AnalyticsPage() {
+  const { businessId, businessSites } = useBusinessScope()
   const [siteId, setSiteId] = useState<string>()
   const [refreshKey, setRefreshKey] = useState(0)
   const [syncing, setSyncing] = useState(false)
@@ -36,15 +38,16 @@ export function AnalyticsPage() {
   const data = overview.data
 
   useEffect(() => {
-    if (!siteId && data?.selectedSiteId) setSiteId(data.selectedSiteId)
-  }, [data?.selectedSiteId, siteId])
+    if (!businessSites.some((site) => site.id === siteId)) setSiteId(businessSites[0]?.id)
+  }, [businessId, businessSites, siteId])
 
-  const sites = data?.sites ?? []
+  const sites = (data?.sites ?? []).filter((site) => businessSites.some((businessSite) => businessSite.id === site.id))
   const dashboard = data?.dashboard
   const gscTrend = dashboard?.gsc7dTrend ?? []
   const ga4Trend = dashboard?.ga47dTrend ?? []
   const channelTotal = (data?.channels ?? []).reduce((sum, item) => sum + asNumber(item.sessions), 0)
-  const activeSiteId = data?.selectedSiteId || siteId
+  const activeSiteId = siteId
+  const isCurrentBusinessData = Boolean(siteId && data?.selectedSiteId === siteId)
 
   async function handleSync() {
     if (!activeSiteId || syncing) return
@@ -74,7 +77,7 @@ export function AnalyticsPage() {
           <label className="select-control">
             <span>当前站点</span>
             <select
-              value={data?.selectedSiteId || ''}
+              value={siteId || ''}
               onChange={(event) => {
                 setSiteId(event.target.value || undefined)
                 setSyncMessage(undefined)
@@ -103,8 +106,8 @@ export function AnalyticsPage() {
         </div>
       </div>
 
-      <DataGuard loading={overview.loading} error={overview.error} empty={!data} emptyTitle="暂无数据分析数据">
-        {data && (
+      <DataGuard loading={overview.loading} error={overview.error} empty={!isCurrentBusinessData} emptyTitle="当前业务暂无数据分析数据">
+        {data && isCurrentBusinessData && (
           <>
             <div className="hero-grid">
               <Kpi icon="ads_click" tone="gold" label="GSC 点击 28 天" value={formatNumber(dashboard?.gsc28d?.clicks)} sub={`CTR ${formatPct(dashboard?.gsc28d?.ctr)}`} />

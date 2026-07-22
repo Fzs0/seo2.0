@@ -15,6 +15,23 @@ POLICY_VERSION = "strategy_policy_v1"
 CHECKPOINT_DAYS = (7, 14, 28, 56, 90)
 
 
+def resolve_strategy_target_url(strategy: dict[str, Any]) -> str | None:
+    """Return a known page URL for a strategy, never a connector placeholder."""
+    evidence = strategy.get("evidence") or {}
+    candidates = (
+        strategy.get("target_url"),
+        strategy.get("url"),
+        (evidence.get("site_content") or {}).get("published_url"),
+        (evidence.get("content_audit") or {}).get("target_url"),
+        (evidence.get("content_audit") or {}).get("url"),
+    )
+    return next((str(value).strip() for value in candidates if _is_page_url(value)), None)
+
+
+def _is_page_url(value: Any) -> bool:
+    return isinstance(value, str) and str(value).strip().startswith(("https://", "http://", "/"))
+
+
 def _hash(parts: list[Any]) -> str:
     value = "|".join(str(part or "").strip().lower() for part in parts)
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
@@ -246,15 +263,7 @@ async def ensure_effect(
     identity = {key: strategy.get(key) for key in ("scope_key", "strategy_fingerprint", "evidence_fingerprint", "policy_version")}
     if not all(identity.values()):
         raise ValueError("策略缺少生命周期指纹，请重新生成并审核策略")
-    evidence = strategy.get("evidence") or {}
-    target_url = (
-        strategy.get("target_url")
-        or strategy.get("url")
-        or (evidence.get("site_content") or {}).get("published_url")
-        or (evidence.get("content_audit") or {}).get("target_url")
-        or (evidence.get("content_audit") or {}).get("url")
-        or None
-    )
+    target_url = resolve_strategy_target_url(strategy)
     baseline = await capture_metrics(
         session,
         site_id=site_id,
@@ -340,7 +349,8 @@ async def mark_effect_published(
         )
     ).mappings().first()
     published_at = (article or {}).get("published_at") or datetime.now(timezone.utc)
-    url = target_url or (article or {}).get("published_url") or None
+    effect_target_url = ((article or {}).get("effect_payload") or {}).get("target_url")
+    url = next((str(value).strip() for value in (target_url, (article or {}).get("published_url"), effect_target_url) if _is_page_url(value)), None)
     cooldown_until = published_at + timedelta(days=28) if action == "update_article" else None
     next_due = published_at + timedelta(days=CHECKPOINT_DAYS[0])
     baseline = dict(((article or {}).get("effect_payload") or {}).get("baseline") or {})
@@ -375,6 +385,63 @@ async def mark_effect_published(
             "patch": json.dumps(patch, ensure_ascii=False),
         },
     )
+
+
+async def backfill_missing_effect_target_urls(session: AsyncSession, *, business_id: str) -> int:
+    """Repair legacy effect records when their completed execution retained a known page URL.
+
+    This is deliberately conservative: only a syntactically valid page URL from
+    the original strategy evidence or persisted article can repair a record.
+    Connector placeholders are never copied into effect measurement.
+    """
+    rows = await session.execute(
+        text(
+            """
+            SELECT effect.id::text AS id, effect.target_url, effect.payload,
+                   execution.payload->'strategy' AS strategy,
+                   article.published_url AS article_url
+              FROM seo_agent.tasks effect
+              LEFT JOIN seo_agent.tasks execution
+                ON execution.id::text = effect.payload->>'execution_task_id'
+              LEFT JOIN seo_agent.articles article ON article.id = effect.article_id
+             WHERE effect.task_type = 'review' AND effect.status <> 'canceled'
+               AND effect.payload->>'kind' = 'strategy_effect'
+               AND effect.payload->>'business_id' = :business_id
+               AND effect.payload ? 'published_at'
+               AND NULLIF(trim(COALESCE(effect.target_url, effect.payload->>'target_url', '')), '') IS NULL
+            """
+        ),
+        {"business_id": business_id},
+    )
+    repaired = 0
+    for row in rows.mappings().all():
+        strategy = dict(row["strategy"] or {})
+        target_url = resolve_strategy_target_url(strategy)
+        if not target_url and _is_page_url(row["article_url"]):
+            target_url = str(row["article_url"]).strip()
+        if not target_url:
+            continue
+        patch = {
+            "target_url": target_url,
+            "baseline_note": "初始基线创建时未绑定目标 URL；其中的 0 值不能作为可靠的更新前对比。",
+        }
+        await session.execute(
+            text(
+                """
+                UPDATE seo_agent.tasks
+                   SET target_url = :target_url,
+                       payload = payload || CAST(:patch AS jsonb),
+                       updated_at = now()
+                 WHERE id = CAST(:id AS uuid)
+                   AND NULLIF(trim(COALESCE(target_url, payload->>'target_url', '')), '') IS NULL
+                """
+            ),
+            {"id": row["id"], "target_url": target_url, "patch": json.dumps(patch, ensure_ascii=False)},
+        )
+        repaired += 1
+    if repaired:
+        await session.commit()
+    return repaired
 
 
 async def _is_contaminated(session: AsyncSession, *, site_id: str, article_id: str | None, target_url: str | None, published_at: datetime) -> bool:
@@ -523,6 +590,7 @@ __all__ = [
     "CHECKPOINT_DAYS",
     "POLICY_VERSION",
     "cancel_unpublished_effect",
+    "backfill_missing_effect_target_urls",
     "capture_metrics",
     "classify_outcome",
     "ensure_effect",
@@ -531,5 +599,6 @@ __all__ = [
     "mark_effect_published",
     "metric_delta",
     "process_due_effects",
+    "resolve_strategy_target_url",
     "strategy_identity",
 ]

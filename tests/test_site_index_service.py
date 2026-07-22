@@ -3,7 +3,7 @@ import gzip
 import pytest
 
 from app.services import site_index_service
-from app.services.site_index_service import _decode_index_content, _merge_pages, _merge_urls
+from app.services.site_index_service import _decode_index_content, _merge_pages, _merge_urls, _unique_urls
 
 
 def test_decode_gzip_index_content():
@@ -83,3 +83,10 @@ def test_merge_urls_keeps_full_index_inventory():
         "https://exdivo.com/products/one",
         "https://exdivo.com/products/two",
     ]
+
+
+def test_unique_urls_accepts_only_explicit_allowed_hosts():
+    assert _unique_urls(
+        ["https://store.example/products/one", "https://other.example/products/two"],
+        {"store.example"},
+    ) == ["https://store.example/products/one"]

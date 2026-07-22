@@ -40,6 +40,7 @@ async def build_brief_with_optional_ai(body: dict[str, Any]) -> dict[str, Any]:
     keyword = body.get("keyword")
     project = body.get("project") or {}
     ai_stage = body.get("aiStage") or {}
+    generation_context = body.get("generationContext") or body.get("generation_context") or {}
     stage_name = "brief_generation"
 
     local = build_brief(keyword, project) if keyword else {"error": "missing-keyword"}
@@ -56,14 +57,24 @@ async def build_brief_with_optional_ai(body: dict[str, Any]) -> dict[str, Any]:
         }
 
     cache_key = hashlib.md5(
-        json.dumps({"k": keyword, "p": project, "ai": ai_stage}, sort_keys=True, default=str).encode()
+        json.dumps(
+            {
+                "k": keyword,
+                "p": project,
+                "ai": ai_stage,
+                "contextVersion": generation_context.get("context_version"),
+                "contextHash": generation_context.get("context_hash"),
+            },
+            sort_keys=True,
+            default=str,
+        ).encode()
     ).hexdigest()
     cache = get_brief_cache()
     cached = cache.get(cache_key)
     if cached:
         return {**cached, "aiMeta": {**cached.get("aiMeta", {}), "cached": True}}
 
-    ai_result = await generate_ai_content(stage="brief_generation", prompt=_build_ai_prompt(keyword, project, local))
+    ai_result = await generate_ai_content(stage="brief_generation", prompt=_build_ai_prompt(keyword, project, local, generation_context))
     enhanced = (ai_result.get("content") or "").strip()
     if not enhanced or ai_result.get("status"):
         return {
@@ -83,7 +94,9 @@ async def build_brief_with_optional_ai(body: dict[str, Any]) -> dict[str, Any]:
     return payload
 
 
-def _build_ai_prompt(keyword: dict[str, Any], project: dict[str, Any], local: dict[str, Any]) -> str:
+def _build_ai_prompt(
+    keyword: dict[str, Any], project: dict[str, Any], local: dict[str, Any], generation_context: dict[str, Any] | None = None
+) -> str:
     store = get_store()
     standard_subset = {
         "articleBriefTemplate": store.get("articleBriefTemplate"),
@@ -101,12 +114,21 @@ def _build_ai_prompt(keyword: dict[str, Any], project: dict[str, Any], local: di
         "- Do not fabricate Google rankings, traffic, SERP checks, competitor data, product specs, prices, legal claims, health claims, or URLs.",
         "- If evidence is missing, add it to `## Evidence Needed` instead of guessing.",
         "- If a target asset is not marked `existing`, do not approve clickable internal links to it.",
+        "- The frozen generation context below is the source of truth for site role, positioning, target asset, linking policy, sources and forbidden claims.",
         "",
         f"# Locale\n{locale_instruction(locale_for_project(project))}",
         "",
         "# Project And Keyword Data",
         json.dumps(
-            {"project": project, "keyword": keyword, "locale": local.get("locale"), "targetAsset": local.get("targetAsset"), "imagePlan": local.get("imagePlan"), "standard": standard_subset},
+            {
+                "project": project,
+                "keyword": keyword,
+                "locale": local.get("locale"),
+                "targetAsset": local.get("targetAsset"),
+                "imagePlan": local.get("imagePlan"),
+                "generationContext": generation_context or {},
+                "standard": standard_subset,
+            },
             default=str,
             ensure_ascii=False,
             indent=2,

@@ -30,6 +30,8 @@ async def scan_site_index(
     filename: str = "sitemap.xml",
     *,
     replace: bool = True,
+    persist: bool = True,
+    additional_allowed_hosts: set[str] | None = None,
 ) -> dict[str, Any]:
     if len(content) > MAX_INDEX_BYTES:
         raise ValueError("索引文件不能超过 5 MB")
@@ -44,10 +46,11 @@ async def scan_site_index(
         raise ValueError("site not found")
     site = dict(site)
     base_url = _base_url(site)
+    allowed_hosts = {host for host in {_hostname(base_url), *(additional_allowed_hosts or set())} if host}
     urls, nested = _parse_index(source, base_url)
     fetched_sitemaps = 0
     for sitemap_url in nested[:MAX_SITEMAPS]:
-        if not _same_host(sitemap_url, base_url):
+        if _hostname(sitemap_url) not in allowed_hosts:
             continue
         try:
             nested_content = await request_bytes(
@@ -63,7 +66,7 @@ async def scan_site_index(
         more_urls, _ = _parse_index(_decode_index_content(nested_content, sitemap_url)[0], base_url)
         urls.extend(more_urls)
         fetched_sitemaps += 1
-    urls = _unique_urls(urls, base_url)
+    urls = _unique_urls(urls, allowed_hosts)
     pages = await _scan_pages(urls[:MAX_SCAN_URLS])
     profile = site.get("knowledge_profile") if isinstance(site.get("knowledge_profile"), dict) else {}
     existing_index = profile.get("index_scan") if isinstance(profile.get("index_scan"), dict) else {}
@@ -106,7 +109,7 @@ async def scan_site_index(
             {"source": "site_index", "fact": f"索引文件 {filename}，发现 {len(urls)} 个 URL，已扫描 {len(pages)} 个页面，更新方式：{'覆盖' if replace else '合并'}"},
         ],
     }
-    saved = await save_site_knowledge(session, site_id, profile)
+    saved = await save_site_knowledge(session, site_id, profile) if persist else profile
     return {
         "site_id": site_id,
         "site_name": site["name"],
@@ -289,15 +292,19 @@ def _resolve(value: str, base_url: str) -> str:
 
 
 def _same_host(url: str, base_url: str) -> bool:
-    return urlsplit(url).hostname == urlsplit(base_url).hostname
+    return _hostname(url) == _hostname(base_url)
 
 
-def _unique_urls(values: list[str], base_url: str) -> list[str]:
+def _hostname(url: str) -> str:
+    return str(urlsplit(url).hostname or "").casefold()
+
+
+def _unique_urls(values: list[str], allowed_hosts: set[str]) -> list[str]:
     result: list[str] = []
     seen: set[str] = set()
     for value in values:
         url = value.strip()
-        if not url or not _same_host(url, base_url):
+        if not url or _hostname(url) not in allowed_hosts:
             continue
         normalized = url.split("#", 1)[0].rstrip("/") or url
         if normalized not in seen:

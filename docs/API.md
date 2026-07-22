@@ -235,7 +235,8 @@
 - 内容：`slug`、`target_url/targetUrl`、`status`、`language_code/languageCode`、`market`、`brief_md/briefMd`、`prompt_text/promptText`、`content_md/contentMd`、`content_html/contentHtml`、`article_parts/articleParts`。
 - SEO：`meta_title/metaTitle`、`meta_description/metaDescription`、`primary_keyword/primaryKeyword`、`secondary_keywords/secondaryKeywords`。
 - 计划与检查：`internal_link_plan/internalLinkPlan`、`image_plan/imagePlan`、`references_plan/referencesPlan`、`qa_checklist/qaChecklist`。
-- 生成元数据：`generation_provider/generationProvider`、`generation_model/generationModel`、`raw_ai_response/rawAiResponse`。
+- 生成元数据：`generation_provider/generationProvider` 必须保存实际模型厂商，`generation_model/generationModel` 必须保存厂商返回或实际请求配置的精确模型 ID；禁止把 `openai-compatible` 等接口协议写成厂商。`raw_ai_response/rawAiResponse.generation_provenance` 同时记录请求模型、实际模型及其来源。
+- Codex 人工生成内容必须同时写入 `generated_by=Codex`、`content_source=codex_manual`、实际模型厂商和当前运行时可确认的精确模型 ID；Agent 名称 `Codex` 不能充当厂商或模型名。无法确认时必须记为 `unknown`，禁止猜测。
 
 ## 4. 知识服务接口
 

@@ -1,5 +1,5 @@
 {
-  "version": "0.2.5",
+  "version": "0.2.8",
   "name": "Independent Site Google SEO Workflow Standard",
   "positioning": {
     "defaultProject": {
@@ -720,35 +720,68 @@
   },
   "articleOutputFormat": {
     "name": "WordPress Import Markdown",
-    "purpose": "文章必须按可脚本化导入 WordPress 的 Markdown 块格式输出；顶部 SEO 字段用于回填 Rank Math，正文用于转换 Gutenberg 区块，不能把正文、SEO 字段、图片位置和内链建议混在一起。",
+    "purpose": "生成链路使用 YAML frontmatter 承载 title 和 meta_description；发布器在上传前读取并剥离它，正文再转换 Gutenberg 区块。图片计划和内链计划由独立字段传递，不能混入正文。",
     "sourceExample": "How to Vape Properly.md",
-    "forbidYamlFrontmatter": true,
+    "forbidYamlFrontmatter": false,
     "requiredOrder": [
-      "## Title",
-      "## Meta Title",
-      "## Meta Description",
-      "## URL Slug",
-      "## Primary Keyword: {primaryKeyword}",
-      "## Secondary Keywords: {secondaryKeywords}",
-      "## Last Updated",
+      "YAML frontmatter: title, meta_description",
       "# {H1}",
       "正文",
-      "## References（仅触发时输出）",
-      "## Image Placement Map",
-      "## Internal Link Suggestions（需要时输出）",
-      "## Evidence Needed（缺少真实证据时输出）",
-      "## Content QA Checklist"
+      "## References（仅在正文出现高风险事实且有允许来源时输出）"
     ],
     "rules": [
-      "不要输出 YAML frontmatter，不要用 --- 包裹元数据。",
-      "正文前必须先输出 Title、Meta Title、Meta Description、URL Slug、Primary Keyword、Secondary Keywords、Last Updated；这些字段会被上传脚本映射到 WP 标题、Slug、Excerpt 和 Rank Math 的 title、description、focus keyword。",
+      "正文必须以 YAML frontmatter 开始，且只使用 title、meta_description 两个键；发布器会在远端发布前剥离它，不改变远端可见正文格式。",
+      "不要在正文中重复输出 Title、Meta Title、Meta Description、URL Slug、Primary Keyword、Secondary Keywords 或 Last Updated 标题块。它们由文章记录与发布器映射到 WP 标题、Slug、Excerpt 和 Rank Math。",
       "正文从 H1 开始，H1 前不放解释性废话。",
       "Meta Description 建议 140-160 个英文字符，直接可放入 WP SEO 插件。",
-      "URL Slug 使用英文小写短横线格式。",
       "References 是触发式模块，不触发时不要输出 References 标题。",
-      "Image Placement Map 必须独立成块，写清楚用途、文件名、插入位置、目的和 alt。",
-      "Internal Link Suggestions 必须独立成块；只有 existing 资产才能在正文内生成可点击链接。",
-      "Content QA Checklist 必须独立成块，用来给上传前脚本或人工检查。"
+      "图片计划、内链计划和 QA 清单由独立字段保存；只有 existing 资产才能在正文内生成可点击链接。"
+    ]
+  },
+  "articleGenerationContext": {
+    "version": "1.1.0",
+    "purpose": "生成前冻结同一份站点角色、事实、SERP 和链接上下文，供 Brief、大纲、正文和 QA 共用；不改变发布器消费的 Markdown/HTML/Meta/slug 字段。",
+    "main": {
+      "requires": ["verified_target_asset", "verified_product_or_category_facts", "approved_conversion_url"],
+      "linkPolicy": "文章服务明确的商业承接页；产品规格、价格、库存、配送、限制和合规信息只能使用已确认资料。",
+      "defaultModules": ["contextual_internal_link"]
+    },
+    "content": {
+      "requires": ["site_positioning", "audience_or_topic_scope", "user_question", "serp_gap_or_allowed_sources"],
+      "linkPolicy": "不强制产品页或购买 CTA；跨站链接仅限站点策略和已批准链接计划允许的自然链接。",
+      "defaultModules": []
+    },
+    "defaultGenerationPolicy": {
+      "business_type": "general",
+      "risk_level": "standard",
+      "keyword_triggers": {
+        "vape": ["vape", "vaping", "e-cigarette", "ecig"]
+      },
+      "claim_terms": ["health", "medical", "safe", "safety", "legal", "law", "underage", "battery", "dispose", "recycle", "financial", "investment", "tax", "loan", "mortgage", "insurance"],
+      "allowed_sources": [],
+      "required_modules": [],
+      "forbidden_claims": [],
+      "generic_opening_patterns": []
+    },
+    "sitePolicyContract": {
+      "purpose": "每个新业务在确认站点知识画像时声明 generation_policy；缺少适用来源的高风险主题一律转人工，不以旧行业词表猜测。",
+      "fields": ["business_type", "site_role", "risk_level", "keyword_triggers", "claim_terms", "allowed_sources", "forbidden_claims", "required_modules", "metadata_length"],
+      "siteRoles": ["commercial", "editorial", "local_service"],
+      "riskLevels": ["low", "standard", "regulated", "ymyl"]
+    },
+    "searchInclusionRules": [
+      "先按 SERP 和搜索意图决定页面类型；交易型查询应优先由产品、服务或分类页承接，不把所有词强写成文章。",
+      "每篇文章必须服务已定义站点受众和主题范围，并给出比搜索结果摘要更多的具体信息、步骤、证据或分析。",
+      "标题、H1、Meta Description 和首段要准确描述同一内容，不夸大、不承诺未确认结果，也不堆砌关键词。",
+      "使用清晰的层级标题和可独立理解的段落；FAQ、表格、图片、CTA 只在用户意图或素材卡要求时加入。",
+      "Google 没有偏好的固定字数；以完整回答用户问题和避免空泛重复为准，不为凑长度批量生成相似页面。",
+      "发布后另行确认 HTTP 200、可抓取、无 noindex、canonical、sitemap 和站点结构；正文生成本身不能保证收录或排名。"
+    ],
+    "qualityGates": [
+      "素材卡指定的用户问题必须被正文回答。",
+      "高风险健康、安全、法规、年龄、电池和处置主张必须有素材卡允许来源，缺失则进入人工处理。",
+      "FAQ、CTA、表格、图片和引用只在素材卡要求时输出。",
+      "检测到常见通用开场白时不通过质量检查。"
     ]
   },
   "references": {
@@ -821,6 +854,8 @@
     "集合页词不要硬写成博客文章。",
     "主站博客可以承接商业前教育词。",
     "博客站文章只做自然上下文内链，不硬塞购买按钮。",
+    "生成前必须冻结文章素材卡；Brief、大纲、正文和 QA 使用相同的素材卡版本和哈希。",
+    "主站缺少已确认商业承接页时不生成正式草稿；内容站不因没有产品页而被强制加入 CTA。",
     "同一目标 URL 在同一篇文章里不要重复使用完全相同的内部链接锚文本；如果不能自然变化，就减少链接次数。",
     "不编造医学、法规、官方数据。",
     "不是每篇文章都需要 References。"

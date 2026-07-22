@@ -201,6 +201,87 @@ async def publish_article(
     )
 
 
+async def sync_article_seo_metadata(
+    session: AsyncSession,
+    *,
+    article_id: str,
+    actor: str = "article_metadata_sync",
+) -> dict[str, Any]:
+    """Synchronize Shopify search metadata without regenerating or replacing article body."""
+    article = (
+        await session.execute(
+            text(
+                "SELECT id, site_id, title, slug, target_url, status, meta_title, meta_description, "
+                "published_post_id, published_url FROM seo_agent.articles "
+                "WHERE id = CAST(:id AS uuid) FOR UPDATE"
+            ),
+            {"id": article_id},
+        )
+    ).mappings().first()
+    if not article:
+        raise PublishError(f"article id={article_id} not found")
+    if not article["site_id"] or not article["published_post_id"]:
+        raise PublishError("article has not been published to a remote post")
+    if not (str(article["meta_title"] or "").strip() or str(article["meta_description"] or "").strip()):
+        raise PublishError("article has no SEO title or meta description to sync")
+
+    site = (
+        await session.execute(
+            text(
+                "SELECT id, site_key, name, site_type, domain, base_url, api_base_url, status, api_config, "
+                "content_role, market, language_code FROM seo_agent.sites WHERE id = CAST(:id AS uuid)"
+            ),
+            {"id": article["site_id"]},
+        )
+    ).mappings().first()
+    if not site:
+        raise PublishError(f"site id={article['site_id']} not found")
+    if site["status"] != "active":
+        raise PublishError(f"site id={article['site_id']} is not active (status={site['status']})")
+    if str(site["site_type"] or "").casefold() not in {"shopify", "shopify_admin"}:
+        raise PublishError("SEO metadata sync is currently available only for Shopify articles")
+
+    req = PublishRequest(
+        title=article["title"] or article["slug"] or "untitled",
+        slug=article["slug"] or f"article-{article['id']}",
+        content_md="",
+        meta_title=article["meta_title"] or article["title"] or "",
+        meta_description=article["meta_description"] or "",
+        status="publish",
+    )
+    publisher = publisher_for_site(dict(site), dry_run=False)
+    try:
+        result = await publisher.sync_seo_metadata(str(article["published_post_id"]), req)
+    except Exception as error:  # noqa: BLE001 - remote failures need an audit task
+        result = PublishResult(ok=False, dry_run=False, error=str(error))
+
+    decision = {
+        "adapter": publisher.__class__.__name__,
+        "ok": result.ok,
+        "dry_run": False,
+        "action": "sync_seo_metadata",
+        "content_changed": False,
+    }
+    task_id = await _save_seo_metadata_sync_task(
+        session,
+        article_id=str(article["id"]),
+        site_id=str(site["id"]),
+        site_key=str(site["site_key"]),
+        target_url=result.url or article["published_url"] or article["target_url"] or "",
+        actor=actor,
+        result=result,
+        decision=decision,
+    )
+    await session.commit()
+    return _response(
+        result,
+        str(article["id"]),
+        str(site["id"]),
+        task_id=task_id,
+        action="sync_seo_metadata",
+    )
+
+
 async def _approved_execution(session: AsyncSession, task_id: Any, site_id: Any) -> dict[str, Any] | None:
     if not task_id:
         return None
@@ -275,6 +356,47 @@ async def _save_publish_task(
                     },
                     ensure_ascii=False,
                 ),
+                "decision": json.dumps(decision, ensure_ascii=False),
+                "error_message": result.error,
+            },
+        )
+    ).mappings().first()
+    return row["id"] if row else None
+
+
+async def _save_seo_metadata_sync_task(
+    session: AsyncSession,
+    *,
+    article_id: str,
+    site_id: str,
+    site_key: str,
+    target_url: str,
+    actor: str,
+    result: PublishResult,
+    decision: dict[str, Any],
+) -> Any:
+    row = (
+        await session.execute(
+            text(
+                """
+                INSERT INTO seo_agent.tasks
+                  (task_type, status, priority, site_id, keyword_id, article_id, target_url, title,
+                   payload, decision, error_message, run_after, started_at, finished_at)
+                VALUES
+                  ('publish', :status, 'P2', CAST(:site_id AS uuid),
+                   (SELECT keyword_id FROM seo_agent.articles WHERE id = CAST(:article_id AS uuid)),
+                   CAST(:article_id AS uuid), :target_url, :title,
+                   CAST(:payload AS jsonb), CAST(:decision AS jsonb), :error_message, now(), now(), now())
+                RETURNING id
+                """
+            ),
+            {
+                "status": "done" if result.ok else "failed",
+                "site_id": site_id,
+                "article_id": article_id,
+                "target_url": target_url,
+                "title": f"sync SEO metadata article {article_id} -> {site_key}",
+                "payload": json.dumps({"actor": actor, "action": "sync_seo_metadata", "content_changed": False}, ensure_ascii=False),
                 "decision": json.dumps(decision, ensure_ascii=False),
                 "error_message": result.error,
             },
@@ -380,4 +502,4 @@ def _locale_token(value: Any) -> str:
     return str(value or "").strip().lower().split("/", 1)[0].strip()
 
 
-__all__ = ["PublishError", "publish_article", "get_publish_task"]
+__all__ = ["PublishError", "publish_article", "sync_article_seo_metadata", "get_publish_task"]

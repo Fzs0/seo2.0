@@ -36,6 +36,18 @@ export interface SiteKnowledgeProfile {
   updated_at?: string
   site_mode?: string
   core_pages?: Array<{ url: string; page_type?: string; title?: string; h1?: string }>
+  services?: string[]
+  verified_assets?: Array<{ url: string; title?: string; type?: string; facts?: string[] }>
+  generation_policy?: {
+    business_type?: string
+    site_role?: 'main' | 'commercial' | 'local_service' | 'service' | 'content' | 'editorial' | 'blog' | string
+    risk_level?: 'low' | 'standard' | 'regulated' | 'ymyl' | string
+    keyword_triggers?: Record<string, string[]>
+    claim_terms?: string[]
+    allowed_sources?: Array<{ url: string; label?: string; source_type?: string }>
+    forbidden_claims?: string[]
+    required_modules?: string[]
+  }
   index_scan?: {
     filename: string
     files?: Array<{ filename: string; source?: string; compressed?: boolean; indexed_urls?: number; scanned_urls?: number }>
@@ -240,9 +252,11 @@ export interface StrategyEffect {
   target_url: string | null
   strategy_fingerprint: string
   baseline: Record<string, unknown> | null
+  baseline_note?: string | null
   checkpoints: Array<Record<string, unknown>>
   outcome: Record<string, unknown> | StrategyEffectStatus | null
   cooldown_until: string | null
+  published_at?: string | null
   next_check_at: string | null
   created_at: string
   updated_at: string

@@ -53,6 +53,44 @@ def test_strategy_identity_targets_page_for_update_and_intent_for_new() -> None:
     assert update == service.strategy_identity("business", **common, action="update_article")
 
 
+def test_update_strategy_resolves_the_existing_article_url_from_site_evidence() -> None:
+    assert service.resolve_strategy_target_url({
+        "strategy_type": "update_article",
+        "evidence": {"site_content": {"published_url": "https://example.com/original-article"}},
+    }) == "https://example.com/original-article"
+
+
+@pytest.mark.asyncio
+async def test_backfill_missing_effect_url_uses_historical_execution_evidence() -> None:
+    writes: list[dict] = []
+
+    class Session:
+        committed = False
+
+        async def execute(self, statement, params=None):
+            sql = str(statement)
+            if "FROM seo_agent.tasks effect" in sql:
+                return Result([{
+                    "id": "effect-id",
+                    "target_url": None,
+                    "payload": {"baseline": {"metric_scope": {"gsc": "query", "ga4": "site"}}},
+                    "strategy": {"evidence": {"site_content": {"published_url": "https://example.com/original-article"}}},
+                    "article_url": None,
+                }])
+            if sql.lstrip().startswith("UPDATE seo_agent.tasks"):
+                writes.append(params or {})
+            return Result()
+
+        async def commit(self):
+            self.committed = True
+
+    repaired = await service.backfill_missing_effect_target_urls(Session(), business_id="business")  # type: ignore[arg-type]
+
+    assert repaired == 1
+    assert writes[0]["target_url"] == "https://example.com/original-article"
+    assert "初始基线创建时未绑定目标 URL" in json.loads(writes[0]["patch"])["baseline_note"]
+
+
 def test_outcome_waits_until_day_28_and_contamination_wins() -> None:
     snapshot = {"gsc": {"impressions": 300}}
     positive = {"clicks": 0.3, "avg_position": 0.2, "conversions": 0.4}
@@ -213,6 +251,33 @@ async def test_published_update_sets_7_day_check_and_28_day_cooldown() -> None:
     assert patch["next_checkpoint"]["day"] == 7
     assert datetime.fromisoformat(patch["next_checkpoint"]["due_at"]) == published_at + timedelta(days=7)
     assert datetime.fromisoformat(patch["cooldown_until"]) == published_at + timedelta(days=28)
+
+
+@pytest.mark.asyncio
+async def test_published_update_keeps_existing_page_url_when_connector_returns_placeholder() -> None:
+    writes: list[dict] = []
+
+    class Session:
+        async def execute(self, statement, params=None):
+            if str(statement).lstrip().startswith("SELECT published_url"):
+                return Result([{
+                    "published_url": "",
+                    "published_at": datetime(2026, 7, 21, tzinfo=timezone.utc),
+                    "effect_payload": {"target_url": "https://example.com/original-article"},
+                }])
+            writes.append(params or {})
+            return Result()
+
+    await service.mark_effect_published(
+        Session(),  # type: ignore[arg-type]
+        execution_task_id="execution",
+        article_id="article",
+        target_url="待确认",
+        action="update_article",
+    )
+
+    patch = json.loads(writes[0]["patch"])
+    assert patch["target_url"] == "https://example.com/original-article"
 
 
 @pytest.mark.asyncio

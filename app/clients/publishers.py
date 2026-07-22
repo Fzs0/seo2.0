@@ -71,6 +71,9 @@ class PublisherBase:
     async def update(self, post_id: str, req: PublishRequest) -> PublishResult:
         return PublishResult(ok=False, dry_run=self.dry_run, error=f"connector {self.connector_type} does not support update_article")
 
+    async def sync_seo_metadata(self, post_id: str, req: PublishRequest) -> PublishResult:
+        return PublishResult(ok=False, dry_run=self.dry_run, error=f"connector {self.connector_type} does not support sync_seo_metadata")
+
     async def get_article(self, post_id: str) -> dict[str, Any] | None:
         raise ExternalCallError(f"connector {self.connector_type} does not support get_article")
 
@@ -134,8 +137,15 @@ class PublisherBase:
         if is_wordpress and base_url and not str(base_url).startswith(("http://", "https://")):
             base_url = f"https://{base_url}"
         base_url = str(base_url).rstrip("/")
-        article_path = cfg.get("articlesPath") or ("/wp-json/wp/v2/posts" if is_wordpress else "/posts")
-        publish_path = cfg.get("publishPath") or ("/wp-json/wp/v2/posts" if is_wordpress else "/posts/batch")
+        if is_wordpress:
+            article_path, publish_path = (
+                cfg.get("articlesPath") or "/wp-json/wp/v2/posts",
+                cfg.get("publishPath") or "/wp-json/wp/v2/posts",
+            )
+        elif isinstance(self, OpenAPIPublisher):
+            article_path, publish_path = self._article_paths()
+        else:
+            article_path, publish_path = cfg.get("articlesPath") or "/posts", cfg.get("publishPath") or "/posts/batch"
         endpoint = _join_endpoint(base_url, article_path)
         publish_endpoint = _join_endpoint(base_url, publish_path)
         auth_keys = ["username", "applicationPassword"] if is_wordpress else ["openApiKey", "tokenA", "tokenB"]
@@ -275,12 +285,31 @@ class OpenAPIPublisher(PublisherBase):
     connector_type = "custom_openapi"
     capabilities = ("read_articles", "get_article", "find_article_by_slug", "publish_article", "update_article")
 
+    def _is_oemapps(self) -> bool:
+        raw = str(self.site.get("api_base_url") or "").strip()
+        host = urlsplit(raw if "://" in raw else f"//{raw}").hostname or ""
+        return host.casefold() == "openapi.oemapps.com"
+
+    def _article_paths(self) -> tuple[str, str]:
+        """Resolve the documented article protocol for the selected site.
+
+        OEMApps self-hosted sites share the fixed ``/posts`` contract.  Earlier
+        versions of the form supplied generic ``/articles`` defaults, so accept
+        those stale values but do not send requests to an endpoint the platform
+        does not implement.  Other custom APIs retain their explicit paths.
+        """
+        cfg = self.site.get("api_config") or {}
+        if self._is_oemapps():
+            return "/posts", "/posts"
+        return str(cfg.get("articlesPath") or "/posts"), str(cfg.get("publishPath") or "/posts/batch")
+
     async def read_articles(self, limit: int = 1) -> list[dict[str, Any]]:
         api_base = (self.site.get("api_base_url") or self.site.get("base_url") or "").rstrip("/")
         headers = self._auth_headers()
         if not api_base or not headers:
             raise ExternalCallError("site post connector missing api_base_url or auth")
-        endpoint = _join_endpoint(api_base, (self.site.get("api_config") or {}).get("articlesPath") or "/posts")
+        article_path, _ = self._article_paths()
+        endpoint = _join_endpoint(api_base, article_path)
         wanted = min(max(limit, 1), 200)
         collected: list[dict[str, Any]] = []
         page = 1
@@ -307,7 +336,7 @@ class OpenAPIPublisher(PublisherBase):
         headers = self._auth_headers()
         if not api_base or not headers:
             raise ExternalCallError("site post connector missing api_base_url or auth")
-        path = str((self.site.get("api_config") or {}).get("articlesPath") or "/posts").rstrip("/")
+        path = self._article_paths()[0].rstrip("/")
         try:
             data = await request_json(
                 "GET",
@@ -371,32 +400,42 @@ class OpenAPIPublisher(PublisherBase):
             return self._dry_response(req)
         api_base = str(self.site.get("api_base_url") or self.site.get("base_url") or "").rstrip("/")
         api_key = str((self.site.get("api_config") or {}).get("openApiKey") or "")
-        if not api_base or not api_key:
-            return PublishResult(ok=False, dry_run=False, error="site post connector missing api_base_url or openApiKey")
+        if self._is_oemapps():
+            headers = self._auth_headers()
+            if not api_base or not headers:
+                return PublishResult(ok=False, dry_run=False, error="OEMApps article connector missing api_base_url or site token")
+        else:
+            if not api_base or not api_key:
+                return PublishResult(ok=False, dry_run=False, error="site post connector missing api_base_url or openApiKey")
+            headers = {"Authorization": f"Bearer {api_key}"}
         content_md, _ = strip_markdown_frontmatter(req.content_md)
-        body: dict[str, Any] = {
-            "title": req.title,
-            "content_md": content_md,
-            "format": "markdown",
-            "status": "published" if req.status in {"publish", "published"} else "draft",
-        }
-        if req.excerpt or req.meta_description:
-            body["excerpt"] = req.excerpt or req.meta_description
-        if req.image_cover_url:
-            body["cover_url"] = req.image_cover_url
+        if self._is_oemapps():
+            body = self._oemapps_article_body(req, content_md)
+        else:
+            body = {
+                "title": req.title,
+                "content_md": content_md,
+                "format": "markdown",
+                "status": "published" if req.status in {"publish", "published"} else "draft",
+            }
+            if req.excerpt or req.meta_description:
+                body["excerpt"] = req.excerpt or req.meta_description
+            if req.image_cover_url:
+                body["cover_url"] = req.image_cover_url
         try:
             data = await request_json(
                 "PUT",
-                _join_endpoint(api_base, f"/posts/{quote(str(post_id), safe='')}"),
+                _join_endpoint(api_base, f"{self._article_paths()[0].rstrip('/')}/{quote(str(post_id), safe='')}"),
                 client_label="connector_openapi_update",
-                headers={"Authorization": f"Bearer {api_key}"},
+                headers=headers,
                 json=body,
                 timeout=60,
             )
         except ExternalCallError as error:
             return PublishResult(ok=False, dry_run=False, error=str(error), raw={"body_sent": body})
-        remote_id = str(data.get("id") or post_id)
-        slug = str(data.get("slug") or req.slug)
+        item = _openapi_item(data) or data
+        remote_id = str(item.get("id") or data.get("data") or post_id)
+        slug = str(item.get("handle") or item.get("slug") or req.slug)
         return PublishResult(ok=True, dry_run=False, post_id=remote_id, url=self._public_article_url(slug, remote_id), raw=data)
 
     def _public_article_url(self, slug: str, post_id: str) -> str | None:
@@ -423,7 +462,10 @@ class OpenAPIPublisher(PublisherBase):
         cfg = self.site.get("api_config") or {}
         # 真实协议字段不确定（每个 OpenAPI 实现不同），这里按最常见的字段名
         content_md, _ = strip_markdown_frontmatter(req.content_md)
-        body = {
+        if self._is_oemapps():
+            body = self._oemapps_article_body(req, content_md)
+        else:
+            body = {
             "items": [{
                 "title": req.title,
                 "slug": req.slug,
@@ -435,12 +477,24 @@ class OpenAPIPublisher(PublisherBase):
                 "cover_url": req.image_cover_url or "",
                 "category_id": int(req.category_id) if str(req.category_id or "").isdigit() else None,
             }],
-        }
+            }
 
         try:
-            data = await post_json(_join_endpoint(api_base.rstrip('/'), cfg.get("publishPath") or "/posts/batch"), headers, body)
+            data = await post_json(_join_endpoint(api_base.rstrip('/'), self._article_paths()[1]), headers, body)
         except ExternalCallError as e:
             return PublishResult(ok=False, dry_run=False, error=str(e), raw={"body_sent": body})
+
+        if self._is_oemapps():
+            if data.get("code") != 0 or not data.get("data"):
+                return PublishResult(ok=False, dry_run=False, error=str(data.get("msg") or "OEMApps did not create the article"), raw=data)
+            post_id = str(data["data"])
+            return PublishResult(
+                ok=True,
+                dry_run=False,
+                post_id=post_id,
+                url=self._public_article_url(req.slug, post_id),
+                raw=data,
+            )
 
         created = data.get("created") if isinstance(data, dict) else None
         if not isinstance(created, list) or not created:
@@ -461,6 +515,28 @@ class OpenAPIPublisher(PublisherBase):
             url=url,
             raw=data,
         )
+
+    def _oemapps_article_body(self, req: PublishRequest, content_md: str) -> dict[str, Any]:
+        """Map the shared OEMApps article contract; only the site token varies."""
+        description = req.meta_description or req.excerpt
+        body: dict[str, Any] = {
+            "title": req.title,
+            "handle": req.slug,
+            "content": oemapps_html_from_markdown(content_md),
+            "status": 1 if req.status in {"publish", "published"} else 0,
+            "descript": description,
+            "meta_title": req.meta_title or req.title,
+            "meta_descript": description,
+            "meta_keywords": [req.primary_keyword] if req.primary_keyword else [],
+            "author_name": req.author or (self.site.get("api_config") or {}).get("defaultAuthor") or "admin",
+            "related_product_ids": [],
+            "is_top": 0,
+        }
+        if req.image_cover_url:
+            body["src"] = req.image_cover_url
+        if str(req.category_id or "").isdigit():
+            body["news_id"] = int(str(req.category_id))
+        return body
 
 
 class WordPressPublisher(PublisherBase):
@@ -630,7 +706,7 @@ class ShopifyPublisher(PublisherBase):
     """Shopify Admin GraphQL connector using the client credentials grant."""
 
     connector_type = "shopify"
-    capabilities = ("read_articles", "publish_article")
+    capabilities = ("read_articles", "get_article", "publish_article", "update_article", "sync_seo_metadata")
 
     async def read_articles(self, limit: int = 1) -> list[dict[str, Any]]:
         first = min(max(limit, 1), 50)
@@ -646,6 +722,20 @@ class ShopifyPublisher(PublisherBase):
         )
         return data.get("articles", {}).get("nodes", [])
 
+    async def get_article(self, post_id: str) -> dict[str, Any] | None:
+        data = await self._graphql(
+            """
+            query Article($id: ID!) {
+              article(id: $id) { id title handle body summary isPublished }
+            }
+            """,
+            {"id": post_id},
+        )
+        article = data.get("article")
+        if not isinstance(article, dict) or not article.get("id"):
+            return None
+        return {**article, "url": self._article_url(str(article.get("handle") or ""))}
+
     async def publish(self, req: PublishRequest) -> PublishResult:
         if self.dry_run:
             return self._dry_response(req)
@@ -654,14 +744,15 @@ class ShopifyPublisher(PublisherBase):
         article: dict[str, Any] = {
             "title": req.title,
             "handle": req.slug,
-            "body": markdown_to_gutenberg(content),
+            "body": shopify_body_from_markdown(content, req.title),
             "summary": req.excerpt or req.meta_description,
             "author": {"name": self._config("author") or "SEO Workbench"},
             "isPublished": req.status in {"publish", "published"},
         }
-        blog_id = self._config("blogId", "blog_id")
-        if blog_id:
-            article["blogId"] = blog_id
+        seo_metafields = _shopify_seo_metafields(req)
+        if seo_metafields:
+            article["metafields"] = seo_metafields
+        article["blogId"] = await self._blog_id_for_publish()
 
         try:
             data = await self._graphql(
@@ -693,6 +784,109 @@ class ShopifyPublisher(PublisherBase):
             post_id=str(created["id"]),
             url=self._article_url(created.get("handle") or req.slug),
             raw=data,
+        )
+
+    async def update(self, post_id: str, req: PublishRequest) -> PublishResult:
+        if self.dry_run:
+            return self._dry_response(req)
+
+        content, _ = strip_markdown_frontmatter(req.content_md)
+        article = {
+            "title": req.title,
+            "handle": req.slug,
+            "body": shopify_body_from_markdown(content, req.title),
+            "summary": req.excerpt or req.meta_description,
+            "isPublished": req.status in {"publish", "published"},
+        }
+        seo_metafields = _shopify_seo_metafields(req)
+        if seo_metafields:
+            article["metafields"] = seo_metafields
+        try:
+            data = await self._graphql(
+                """
+                mutation UpdateArticle($id: ID!, $article: ArticleUpdateInput!) {
+                  articleUpdate(id: $id, article: $article) {
+                    article { id title handle }
+                    userErrors { field message }
+                  }
+                }
+                """,
+                {"id": post_id, "article": article},
+            )
+        except ExternalCallError as e:
+            return PublishResult(ok=False, dry_run=False, error=str(e), raw={"id": post_id, "article": article})
+
+        result = data.get("articleUpdate", {})
+        errors = result.get("userErrors") or []
+        if errors:
+            detail = "; ".join(str(error.get("message") or error) for error in errors)
+            return PublishResult(ok=False, dry_run=False, error=detail, raw=data)
+        updated = result.get("article") or {}
+        if not updated.get("id"):
+            return PublishResult(ok=False, dry_run=False, error="Shopify did not return the updated article", raw=data)
+        return PublishResult(
+            ok=True,
+            dry_run=False,
+            post_id=str(updated["id"]),
+            url=self._article_url(str(updated.get("handle") or req.slug)),
+            raw=data,
+        )
+
+    async def sync_seo_metadata(self, post_id: str, req: PublishRequest) -> PublishResult:
+        if self.dry_run:
+            return self._dry_response(req)
+        metafields = _shopify_seo_metafields(req)
+        if not metafields:
+            return PublishResult(ok=False, dry_run=False, error="article has no SEO title or meta description to sync")
+        try:
+            data = await self._graphql(
+                """
+                mutation UpdateArticleSeo($id: ID!, $article: ArticleUpdateInput!) {
+                  articleUpdate(id: $id, article: $article) {
+                    article { id title handle }
+                    userErrors { field message }
+                  }
+                }
+                """,
+                {"id": post_id, "article": {"metafields": metafields}},
+            )
+        except ExternalCallError as e:
+            return PublishResult(ok=False, dry_run=False, error=str(e), raw={"id": post_id, "metafields": metafields})
+        result = data.get("articleUpdate", {})
+        errors = result.get("userErrors") or []
+        if errors:
+            detail = "; ".join(str(error.get("message") or error) for error in errors)
+            return PublishResult(ok=False, dry_run=False, error=detail, raw=data)
+        updated = result.get("article") or {}
+        if not updated.get("id"):
+            return PublishResult(ok=False, dry_run=False, error="Shopify did not return the updated article", raw=data)
+        return PublishResult(
+            ok=True,
+            dry_run=False,
+            post_id=str(updated["id"]),
+            url=self._article_url(str(updated.get("handle") or req.slug)),
+            raw=data,
+        )
+
+    async def _blog_id_for_publish(self) -> str:
+        configured_id = str(self._config("blogId", "blog_id") or "").strip()
+        if configured_id:
+            return configured_id
+
+        expected_handle = str(self._config("blogHandle", "blog_handle") or "news").strip().casefold()
+        data = await self._graphql(
+            """
+            query Blogs($first: Int!) {
+              blogs(first: $first) { nodes { id handle } }
+            }
+            """,
+            {"first": 250},
+        )
+        for blog in data.get("blogs", {}).get("nodes", []):
+            if str(blog.get("handle") or "").casefold() == expected_handle and blog.get("id"):
+                return str(blog["id"])
+        raise ExternalCallError(
+            f"Shopify cannot find blog handle '{expected_handle}'. Configure api_config.blogId or create the blog first."
         )
 
     def connection_info(self) -> dict[str, Any]:
@@ -851,6 +1045,61 @@ def markdown_to_gutenberg(source: str) -> str:
             index += 1
         blocks.append(_wp_block("paragraph", f"<p>{_wp_inline(' '.join(paragraph))}</p>"))
     return "\n\n".join(blocks)
+
+
+def oemapps_html_from_markdown(source: str) -> str:
+    """Render generated Markdown as HTML accepted by the OEMApps ``content`` field."""
+    rendered = markdown_to_gutenberg(source)
+    return re.sub(r"<!--\s*/?wp:[\s\S]*?-->", "", rendered).strip()
+
+
+def shopify_body_from_markdown(source: str, article_title: str) -> str:
+    """Prepare an article body for Shopify, whose article title is stored separately.
+
+    Shopify renders ``Article.title`` outside ``Article.body``.  The generator's
+    leading Markdown H1 is therefore redundant on Shopify and must not create a
+    second document H1.  A non-title H1 is demoted as well, so subsections cannot
+    introduce a competing page-level heading.
+    """
+    title_key = _heading_key(article_title)
+    removed_title = False
+    normalized_lines: list[str] = []
+    for line in (source or "").replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        heading = re.match(r"^(\s*)#\s+(.+?)\s*#*\s*$", line)
+        if not heading:
+            normalized_lines.append(line)
+            continue
+        heading_text = heading.group(2)
+        if not removed_title and title_key and _heading_key(heading_text) == title_key:
+            removed_title = True
+            continue
+        normalized_lines.append(f"{heading.group(1)}## {heading_text}")
+
+    body = markdown_to_gutenberg("\n".join(normalized_lines))
+    # Preserve compatibility with a previously generated Gutenberg body that is
+    # sent back through the connector, while still enforcing Shopify's no-H1 body rule.
+    body = re.sub(r"<h1\b([^>]*)>", r"<h2\1>", body, flags=re.I)
+    return re.sub(r"</h1\s*>", "</h2>", body, flags=re.I)
+
+
+def _heading_key(value: str) -> str:
+    plain = re.sub(r"<[^>]+>", " ", str(value or ""))
+    return re.sub(r"[^\w]+", "", plain, flags=re.UNICODE).casefold()
+
+
+def _shopify_seo_metafields(req: PublishRequest) -> list[dict[str, str]]:
+    """Map generated SEO values to Shopify's built-in article SEO metafields."""
+    fields: list[dict[str, str]] = []
+    for key, value in (("title_tag", req.meta_title), ("description_tag", req.meta_description)):
+        text = str(value or "").strip()
+        if text:
+            fields.append({
+                "namespace": "global",
+                "key": key,
+                "type": "single_line_text_field",
+                "value": text,
+            })
+    return fields
 
 
 def _wp_block(name: str, content: str, attrs: str = "") -> str:

@@ -19,6 +19,7 @@ from app.services.strategy_effect_service import (
     ensure_effect,
     load_scope_locks,
     mark_effect_published,
+    resolve_strategy_target_url,
     strategy_identity,
 )
 
@@ -957,15 +958,17 @@ async def review_strategy(session: AsyncSession, *, task_id: str, approved: bool
         if decision.get("strategy_type") == "hold" or decision.get("priority") == "Hold":
             raise ValueError("Hold 策略必须先补齐诊断证据，不能批准执行")
         execution_type = "new_article" if decision.get("strategy_type") == "new_article" else "update_article"
+        target_url = resolve_strategy_target_url(decision)
+        execution_strategy = {**decision, **({"target_url": target_url} if target_url else {})}
         execution = await session.execute(
             text(
                 """
                 INSERT INTO seo_agent.tasks
                   (task_type, status, priority, score, site_id, keyword_id, post_id, article_id,
-                   title, payload, required_data, decision, logs)
+                   title, target_url, payload, required_data, decision, logs)
                 VALUES
                   (:task_type, 'queued', :priority, :score, :site_id, :keyword_id, :post_id, :article_id,
-                   :title, CAST(:payload AS jsonb), :required_data, CAST(:decision AS jsonb),
+                   :title, :target_url, CAST(:payload AS jsonb), :required_data, CAST(:decision AS jsonb),
                    jsonb_build_array(jsonb_build_object('stage', 'queued', 'message', '人工审核通过，已进入待执行队列', 'at', now())))
                 RETURNING id
                 """
@@ -979,9 +982,10 @@ async def review_strategy(session: AsyncSession, *, task_id: str, approved: bool
                 "post_id": row["post_id"],
                 "article_id": row["article_id"],
                 "title": f"执行策略：{row['title']}",
+                "target_url": target_url,
                 "payload": json.dumps({
                     "strategy_task_id": str(task_id),
-                    "strategy": decision,
+                    "strategy": execution_strategy,
                     "scope_key": decision.get("scope_key"),
                     "strategy_fingerprint": decision.get("strategy_fingerprint"),
                     "evidence_fingerprint": decision.get("evidence_fingerprint"),

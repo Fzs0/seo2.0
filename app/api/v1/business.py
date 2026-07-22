@@ -16,11 +16,14 @@ from app.clients.publishers import connector_for_site
 from app.clients.serpapi import fetch_google_serp
 from app.core.database import get_db
 from app.services.article_service import (
+    articles_kpi,
+    articles_monthly_stats,
+    articles_timeseries,
     get_article,
     list_articles,
     save_article,
 )
-from app.services.publish_service import get_publish_task, publish_article
+from app.services.publish_service import get_publish_task, publish_article, sync_article_seo_metadata
 from app.services.publish_service import PublishError as PublishServiceError
 from app.services.product_service import (
     get_product,
@@ -36,6 +39,7 @@ from app.services.site_service import (
     upsert_site,
 )
 from app.services.site_knowledge_service import generate_site_knowledge, save_site_knowledge
+from app.services.business_discovery_service import discover_business_from_site
 from app.services.site_index_service import scan_site_index
 from app.services.main_site_content_service import get_main_site_content_plan
 from app.services.site_config_service import sync_sites_from_config
@@ -107,6 +111,9 @@ class SiteKnowledgeBody(BaseModel):
     core_pages: list[dict[str, Any]] = Field(default_factory=list)
     index_scan: dict[str, Any] = Field(default_factory=dict)
     evidence: list[dict[str, Any]] = Field(default_factory=list)
+    services: list[str] = Field(default_factory=list)
+    verified_assets: list[dict[str, Any]] = Field(default_factory=list)
+    generation_policy: dict[str, Any] = Field(default_factory=dict)
     generated_at: str | None = None
     updated_at: str | None = None
 
@@ -152,6 +159,15 @@ async def generate_site_knowledge_route(site_id: str, session: AsyncSession = De
         return await generate_site_knowledge(session, site_id)
     except ValueError as error:
         raise HTTPException(status_code=404, detail=str(error)) from error
+
+
+@router.post("/sites/{site_id}/business-discovery")
+async def discover_site_business_route(site_id: str, session: AsyncSession = Depends(get_db)) -> dict[str, Any]:
+    """Create a draft profile from public site evidence; never enables or publishes."""
+    try:
+        return await discover_business_from_site(session, site_id)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
 
 
 @router.post("/sites/{site_id}/knowledge")
@@ -207,6 +223,7 @@ async def delete_site_route(site_id: str, session: AsyncSession = Depends(get_db
 
 @router.get("/keywords")
 async def list_keywords_route(
+    business_id: str | None = None,
     status: str | None = None,
     priority: str | None = None,
     assigned_site_id: str | None = None,
@@ -222,6 +239,7 @@ async def list_keywords_route(
 ) -> dict[str, Any]:
     return await list_keywords(
         session,
+        business_id=business_id,
         status=status,
         priority=priority,
         assigned_site_id=assigned_site_id,
@@ -329,12 +347,57 @@ async def list_articles_route(
     )
 
 
+@router.get("/articles/stats/monthly")
+async def articles_monthly_stats_route(
+    site_id: str | None = None,
+    months: int = Query(12, ge=1, le=36),
+    session: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    return await articles_monthly_stats(session, site_id=site_id, months=months)
+
+
+@router.get("/articles/stats/kpi")
+async def articles_kpi_route(
+    site_id: str | None = None,
+    date_field: str = Query("created_at", pattern="^(created_at|published_at)$"),
+    session: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    return await articles_kpi(session, site_id=site_id, date_field=date_field)
+
+
+@router.get("/articles/stats/timeseries")
+async def articles_timeseries_route(
+    start: str = Query(..., description="开始日期 YYYY-MM-DD"),
+    end: str = Query(..., description="结束日期 YYYY-MM-DD"),
+    site_id: str | None = None,
+    granularity: str = Query("auto", pattern="^(auto|day|week|month)$"),
+    date_field: str = Query("created_at", pattern="^(created_at|published_at)$"),
+    session: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    return await articles_timeseries(
+        session,
+        site_id=site_id,
+        start=start,
+        end=end,
+        granularity=granularity,
+        date_field=date_field,
+    )
+
+
 @router.get("/articles/{article_id}")
 async def get_article_route(article_id: str, session: AsyncSession = Depends(get_db)) -> dict[str, Any]:
     a = await get_article(session, article_id)
     if not a:
         raise HTTPException(status_code=404, detail="article not found")
     return a
+
+
+@router.post("/articles/{article_id}/sync-seo-metadata")
+async def sync_article_seo_metadata_route(article_id: str, session: AsyncSession = Depends(get_db)) -> dict[str, Any]:
+    try:
+        return await sync_article_seo_metadata(session, article_id=article_id)
+    except PublishServiceError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
 
 
 # ---------- /api/v1/posts: 外部站点已存在文章 ----------

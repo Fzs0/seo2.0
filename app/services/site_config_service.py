@@ -64,7 +64,7 @@ def _api_config(s: dict[str, Any], site_type: str) -> dict[str, Any]:
         return {"username": s.get("username"), "applicationPassword": s.get("applicationPassword")}
     config = {"openApiKey": s.get("openApiKey"), "tokenA": s.get("tokenA"), "tokenB": s.get("tokenB")}
     if site_type == "blog":
-        config.update({"connector_type": "custom_openapi", "articlesPath": "/posts", "publishPath": "/posts/batch"})
+        config.update({"connector_type": "custom_openapi", "articlesPath": "/posts", "publishPath": "/posts"})
     if s.get("articleUrlPath"):
         config["articleUrlPath"] = s["articleUrlPath"]
     return config

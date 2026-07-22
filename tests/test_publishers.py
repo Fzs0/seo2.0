@@ -152,6 +152,119 @@ async def test_openapi_publisher_reads_posts_with_documented_protocol(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_oemapps_article_connector_ignores_legacy_articles_defaults(monkeypatch):
+    """Regression: the old form saved /articles, but OEMApps implements /posts."""
+    called: dict[str, object] = {}
+
+    async def fake_request_json(method: str, url: str, **kwargs):
+        called.update(method=method, url=url, headers=kwargs.get('headers'))
+        return {'items': [{'id': 1, 'title': 'Hello'}]}
+
+    monkeypatch.setattr('app.clients.publishers.request_json', fake_request_json)
+    publisher = OpenAPIPublisher(
+        {
+            'site_type': 'main',
+            'api_base_url': 'https://openapi.oemapps.com',
+            'api_config': {'tokenA': 'site-token', 'articlesPath': '/articles', 'publishPath': '/articles/save'},
+        },
+        dry_run=True,
+    )
+
+    result = await publisher.read_articles(limit=1)
+    info = publisher.connection_info()
+
+    assert result == [{'id': 1, 'title': 'Hello'}]
+    assert called == {'method': 'GET', 'url': 'https://openapi.oemapps.com/posts', 'headers': {'token': 'site-token'}}
+    assert info['config']['articles_path'] == '/posts'
+    assert info['config']['publish_path'] == '/posts'
+
+
+@pytest.mark.asyncio
+async def test_oemapps_sites_share_single_article_publish_adapter(monkeypatch):
+    calls: list[dict[str, object]] = []
+
+    async def fake_request_json(method: str, url: str, **kwargs):
+        calls.append({'method': method, 'url': url, 'headers': kwargs.get('headers'), 'json': kwargs.get('json')})
+        return {'code': 0, 'msg': 'success', 'data': str(100 + len(calls))}
+
+    monkeypatch.setattr('app.clients.publishers.request_json', fake_request_json)
+    request = PublishRequest(
+        title='SEO Guide',
+        slug='seo-guide',
+        content_md='# SEO Guide\n\nUseful **content**.',
+        meta_title='SEO Guide Title',
+        meta_description='SEO guide description',
+        primary_keyword='seo guide',
+        author='Editorial Team',
+        category_id='4275',
+        image_cover_url='https://cdn.example.com/cover.jpg',
+        status='publish',
+    )
+
+    for token_key, token_value in [('tokenA', 'exdivo-token'), ('tokenB', 'avinoti-token')]:
+        publisher = OpenAPIPublisher(
+            {
+                'site_type': 'main',
+                'api_base_url': 'https://openapi.oemapps.com',
+                'api_config': {token_key: token_value, 'publishPath': '/posts/batch'},
+            },
+            dry_run=False,
+        )
+        result = await publisher.publish(request)
+        assert result.ok is True
+
+    assert [call['url'] for call in calls] == [
+        'https://openapi.oemapps.com/posts',
+        'https://openapi.oemapps.com/posts',
+    ]
+    assert [call['headers'] for call in calls] == [
+        {'token': 'exdivo-token'},
+        {'token': 'avinoti-token'},
+    ]
+    payload = calls[0]['json']
+    assert payload == {
+        'title': 'SEO Guide',
+        'handle': 'seo-guide',
+        'content': '<h1>SEO Guide</h1>\n\n<p>Useful <strong>content</strong>.</p>',
+        'status': 1,
+        'descript': 'SEO guide description',
+        'meta_title': 'SEO Guide Title',
+        'meta_descript': 'SEO guide description',
+        'meta_keywords': ['seo guide'],
+        'author_name': 'Editorial Team',
+        'related_product_ids': [],
+        'is_top': 0,
+        'src': 'https://cdn.example.com/cover.jpg',
+        'news_id': 4275,
+    }
+
+
+@pytest.mark.asyncio
+async def test_oemapps_article_update_uses_site_token(monkeypatch):
+    called: dict[str, object] = {}
+
+    async def fake_request_json(method: str, url: str, **kwargs):
+        called.update(method=method, url=url, headers=kwargs.get('headers'), json=kwargs.get('json'))
+        return {'code': 0, 'msg': 'success', 'data': {'id': 7, 'handle': 'updated'}}
+
+    monkeypatch.setattr('app.clients.publishers.request_json', fake_request_json)
+    publisher = OpenAPIPublisher(
+        {'site_type': 'main', 'api_base_url': 'https://openapi.oemapps.com', 'api_config': {'tokenB': 'site-token'}},
+        dry_run=False,
+    )
+
+    result = await publisher.update('7', PublishRequest(title='Updated', slug='updated', content_md='# Updated', status='publish'))
+
+    assert result.ok is True
+    assert called['method'] == 'PUT'
+    assert called['url'] == 'https://openapi.oemapps.com/posts/7'
+    assert called['headers'] == {'token': 'site-token'}
+    assert called['json']['handle'] == 'updated'
+    assert called['json']['status'] == 1
+    assert called['json']['content'] == '<h1>Updated</h1>'
+
+
+@pytest.mark.asyncio
 async def test_openapi_publisher_gets_one_post_and_finds_slug(monkeypatch):
     calls: list[tuple[str, str, dict]] = []
 
@@ -338,13 +451,81 @@ async def test_wordpress_publisher_gets_id_and_finds_slug(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_shopify_update_remains_explicitly_unsupported():
-    publisher = ShopifyPublisher({'domain': 'example.myshopify.com'}, dry_run=False)
+async def test_shopify_publisher_updates_and_reads_an_existing_article(monkeypatch):
+    called: list[tuple[str, str, dict]] = []
+    monkeypatch.setattr('app.clients.publishers._SHOPIFY_TOKEN_CACHE', {})
+    monkeypatch.setattr(
+        'app.clients.publishers.get_settings',
+        lambda: type('Settings', (), {'shopify_client_id': 'client-id', 'shopify_client_secret': 'client-secret', 'shopify_api_version': '2026-07'})(),
+    )
 
-    result = await publisher.update('gid://shopify/Article/1', PublishRequest(title='Hello', slug='hello', content_md='# Body'))
+    async def fake_request_json(method: str, url: str, **kwargs):
+        called.append((method, url, kwargs))
+        if url.endswith('/admin/oauth/access_token'):
+            return {'access_token': 'shpat_test', 'expires_in': 3600, 'scope': 'read_content,write_content'}
+        query = kwargs['json']['query']
+        if 'mutation UpdateArticle' in query:
+            assert kwargs['json']['variables']['id'] == 'gid://shopify/Article/1'
+            assert kwargs['json']['variables']['article']['title'] == 'Updated'
+            return {'data': {'articleUpdate': {'article': {'id': 'gid://shopify/Article/1', 'title': 'Updated', 'handle': 'hello'}, 'userErrors': []}}}
+        return {'data': {'article': {'id': 'gid://shopify/Article/1', 'title': 'Updated', 'handle': 'hello', 'isPublished': True}}}
 
-    assert result.ok is False
-    assert result.error == 'connector shopify does not support update_article'
+    monkeypatch.setattr('app.clients.publishers.request_json', fake_request_json)
+    publisher = ShopifyPublisher({'domain': 'example.myshopify.com', 'api_config': {'connector_type': 'shopify', 'blogHandle': 'news'}}, dry_run=False)
+
+    result = await publisher.update('gid://shopify/Article/1', PublishRequest(
+        title='Updated',
+        slug='hello',
+        content_md='# Body',
+        meta_title='Updated search title',
+        meta_description='Updated search description',
+        status='publish',
+    ))
+    remote = await publisher.get_article('gid://shopify/Article/1')
+
+    assert result.ok is True
+    assert result.post_id == 'gid://shopify/Article/1'
+    assert result.url == 'https://example.myshopify.com/blogs/news/hello'
+    assert remote == {'id': 'gid://shopify/Article/1', 'title': 'Updated', 'handle': 'hello', 'isPublished': True, 'url': 'https://example.myshopify.com/blogs/news/hello'}
+    assert 'mutation UpdateArticle' in called[1][2]['json']['query']
+    assert called[1][2]['json']['variables']['article']['metafields'] == [
+        {'namespace': 'global', 'key': 'title_tag', 'type': 'single_line_text_field', 'value': 'Updated search title'},
+        {'namespace': 'global', 'key': 'description_tag', 'type': 'single_line_text_field', 'value': 'Updated search description'},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_shopify_publisher_syncs_only_seo_metafields(monkeypatch):
+    called: list[tuple[str, str, dict]] = []
+    monkeypatch.setattr('app.clients.publishers._SHOPIFY_TOKEN_CACHE', {})
+    monkeypatch.setattr(
+        'app.clients.publishers.get_settings',
+        lambda: type('Settings', (), {'shopify_client_id': 'client-id', 'shopify_client_secret': 'client-secret', 'shopify_api_version': '2026-07'})(),
+    )
+
+    async def fake_request_json(method: str, url: str, **kwargs):
+        called.append((method, url, kwargs))
+        if url.endswith('/admin/oauth/access_token'):
+            return {'access_token': 'shpat_test', 'expires_in': 3600, 'scope': 'write_content'}
+        return {'data': {'articleUpdate': {'article': {'id': 'gid://shopify/Article/1', 'title': 'Hello', 'handle': 'hello'}, 'userErrors': []}}}
+
+    monkeypatch.setattr('app.clients.publishers.request_json', fake_request_json)
+    publisher = ShopifyPublisher({'domain': 'example.myshopify.com', 'api_config': {'connector_type': 'shopify', 'blogHandle': 'news'}}, dry_run=False)
+
+    result = await publisher.sync_seo_metadata('gid://shopify/Article/1', PublishRequest(
+        title='Hello', slug='hello', content_md='# This must not be sent', meta_title='Search title', meta_description='Search description', status='publish',
+    ))
+
+    assert result.ok is True
+    request = called[1][2]['json']
+    assert 'mutation UpdateArticleSeo' in request['query']
+    assert request['variables'] == {
+        'id': 'gid://shopify/Article/1',
+        'article': {'metafields': [
+            {'namespace': 'global', 'key': 'title_tag', 'type': 'single_line_text_field', 'value': 'Search title'},
+            {'namespace': 'global', 'key': 'description_tag', 'type': 'single_line_text_field', 'value': 'Search description'},
+        ]},
+    }
 
 
 @pytest.mark.asyncio
@@ -366,7 +547,14 @@ async def test_shopify_publisher_uses_client_credentials_and_publishes(monkeypat
     monkeypatch.setattr('app.clients.publishers.request_json', fake_request_json)
     publisher = ShopifyPublisher({'domain': 'example.myshopify.com', 'api_config': {'connector_type': 'shopify', 'blogId': 'gid://shopify/Blog/1'}}, dry_run=False)
 
-    result = await publisher.publish(PublishRequest(title='Hello', slug='hello', content_md='# Body', status='publish'))
+    result = await publisher.publish(PublishRequest(
+        title='Hello',
+        slug='hello',
+        content_md='# Hello\n\n## Body',
+        meta_title='Search title',
+        meta_description='Search description',
+        status='publish',
+    ))
 
     assert result.ok is True
     assert result.post_id == 'gid://shopify/Article/1'
@@ -374,6 +562,42 @@ async def test_shopify_publisher_uses_client_credentials_and_publishes(monkeypat
     assert called[1][1] == 'https://example.myshopify.com/admin/api/2026-07/graphql.json'
     assert called[1][2]['headers']['X-Shopify-Access-Token'] == 'shpat_test'
     assert called[1][2]['json']['variables']['article']['blogId'] == 'gid://shopify/Blog/1'
+    body = called[1][2]['json']['variables']['article']['body']
+    assert '<h1>' not in body
+    assert '<h2>Body</h2>' in body
+    assert '>Hello<' not in body
+    assert called[1][2]['json']['variables']['article']['metafields'] == [
+        {'namespace': 'global', 'key': 'title_tag', 'type': 'single_line_text_field', 'value': 'Search title'},
+        {'namespace': 'global', 'key': 'description_tag', 'type': 'single_line_text_field', 'value': 'Search description'},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_shopify_publisher_resolves_the_configured_blog_handle_before_creating(monkeypatch):
+    called: list[tuple[str, str, dict]] = []
+    monkeypatch.setattr('app.clients.publishers._SHOPIFY_TOKEN_CACHE', {})
+    monkeypatch.setattr(
+        'app.clients.publishers.get_settings',
+        lambda: type('Settings', (), {'shopify_client_id': 'client-id', 'shopify_client_secret': 'client-secret', 'shopify_api_version': '2026-07'})(),
+    )
+
+    async def fake_request_json(method: str, url: str, **kwargs):
+        called.append((method, url, kwargs))
+        if url.endswith('/admin/oauth/access_token'):
+            return {'access_token': 'shpat_test', 'expires_in': 3600, 'scope': 'read_content,write_content'}
+        query = kwargs['json']['query']
+        if 'query Blogs' in query:
+            return {'data': {'blogs': {'nodes': [{'id': 'gid://shopify/Blog/9', 'handle': 'guides'}]}}}
+        return {'data': {'articleCreate': {'article': {'id': 'gid://shopify/Article/1', 'handle': 'hello'}, 'userErrors': []}}}
+
+    monkeypatch.setattr('app.clients.publishers.request_json', fake_request_json)
+    publisher = ShopifyPublisher({'domain': 'example.myshopify.com', 'api_config': {'connector_type': 'shopify', 'blogHandle': 'guides'}}, dry_run=False)
+
+    result = await publisher.publish(PublishRequest(title='Hello', slug='hello', content_md='Body', status='publish'))
+
+    assert result.ok is True
+    assert 'query Blogs' in called[1][2]['json']['query']
+    assert called[2][2]['json']['variables']['article']['blogId'] == 'gid://shopify/Blog/9'
 
 
 def test_shopify_connector_is_selected_for_shopify_site():

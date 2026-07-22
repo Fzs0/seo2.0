@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from app.engine.csv import normalize_imported_keywords
 from app.engine.keyword_preflight import preflight_keyword
-from app.services.keyword_service import import_and_analyze_csv, importable_keywords, import_summary
+from app.services.keyword_service import import_and_analyze_csv, import_and_analyze_file, importable_keywords, import_summary
 
 
 def test_preflight_normalizes_intent_and_query_shape(rule_payload):
@@ -65,6 +65,25 @@ def test_selected_market_supplies_missing_database_before_preflight(rule_payload
     assert rows[0]["preflightStatus"] == "ready"
 
 
+def test_site_keyword_table_keeps_existing_page_context_for_the_normal_analysis_flow(rule_payload):
+    rows = import_and_analyze_file(
+        {
+            "filename": "site-keywords.csv",
+            "contentText": "url,title,description,keyword,keyword type,volume,keyword difficulty,intent\n"
+                           "https://shop.example/products/oxygen,Home Oxygen,Portable concentrator,portable oxygen concentrator,recommended,170,27,informational, transactional\n",
+        },
+        {"businessId": "oxygen", "market": "US / English"},
+    )
+
+    assert rows[0]["source"] == "import"
+    assert rows[0]["targetAsset"] == "https://shop.example/products/oxygen"
+    assert rows[0]["assetStatus"] == "existing"
+    assert rows[0]["raw"]["title"] == "Home Oxygen"
+    assert rows[0]["raw"]["description"] == "Portable concentrator"
+    assert rows[0]["scopeStatus"] == "needs_review"
+    assert importable_keywords(rows) == rows
+
+
 def test_import_pool_excludes_invalid_hold_and_out_of_scope_rows(rule_payload):
     rows = [
         {"keyword": "good keyword", "preflightStatus": "ready", "scopeStatus": "relevant", "priority": "P2", "status": "imported"},
@@ -79,3 +98,18 @@ def test_import_pool_excludes_invalid_hold_and_out_of_scope_rows(rule_payload):
     assert [row["keyword"] for row in accepted] == ["good keyword"]
     assert summary["accepted"] == 1
     assert summary["rejected"] == 3
+
+
+def test_site_keyword_table_can_defer_missing_scope_and_intent_to_ai(rule_payload):
+    rows = [{
+        "keyword": "portable oxygen concentrator",
+        "source": "import",
+        "allowUnresolvedScope": True,
+        "preflightStatus": "needs_review",
+        "preflightReason": "意图缺失或无法标准化",
+        "scopeStatus": "needs_review",
+        "priority": "P2",
+        "status": "imported",
+    }]
+
+    assert importable_keywords(rows) == rows

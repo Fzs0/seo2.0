@@ -21,9 +21,10 @@ class Result:
 
 
 class Session:
-    def __init__(self, *, article: dict[str, Any] | None = None, approval: dict[str, Any] | None = None) -> None:
+    def __init__(self, *, article: dict[str, Any] | None = None, approval: dict[str, Any] | None = None, site: dict[str, Any] | None = None) -> None:
         self.article = article or _article()
         self.approval = approval if approval is not None else _approval()
+        self.site = site or _site()
         self.inserts: list[dict[str, Any]] = []
         self.article_updates: list[dict[str, Any]] = []
         self.commits = 0
@@ -40,7 +41,7 @@ class Session:
         if "FROM seo_agent.articles WHERE" in sql:
             return Result(self.article)
         if "FROM seo_agent.sites WHERE" in sql:
-            return Result(_site())
+            return Result(self.site)
         if "FROM seo_agent.tasks execution" in sql:
             return Result(self.approval)
         raise AssertionError(f"unexpected SQL: {sql}")
@@ -53,6 +54,7 @@ class Publisher:
     def __init__(self) -> None:
         self.published = 0
         self.updated: list[str] = []
+        self.seo_synced: list[tuple[str, Any]] = []
         self.gets: list[str] = []
         self.found: dict[str, Any] | None = None
         self.remote: dict[str, Any] | None = _remote()
@@ -64,6 +66,10 @@ class Publisher:
     async def update(self, post_id: str, req: Any) -> PublishResult:
         self.updated.append(post_id)
         return PublishResult(ok=True, dry_run=req.status == "draft", post_id=None if req.status == "draft" else post_id)
+
+    async def sync_seo_metadata(self, post_id: str, req: Any) -> PublishResult:
+        self.seo_synced.append((post_id, req))
+        return PublishResult(ok=True, dry_run=False, post_id=post_id, url="https://example.com/hello/")
 
     async def get_article(self, post_id: str) -> dict[str, Any] | None:
         self.gets.append(post_id)
@@ -96,7 +102,7 @@ def _article(**changes: Any) -> dict[str, Any]:
     }
 
 
-def _site() -> dict[str, Any]:
+def _site(**changes: Any) -> dict[str, Any]:
     return {
         "id": "site-id",
         "site_key": "site",
@@ -110,6 +116,7 @@ def _site() -> dict[str, Any]:
         "content_role": "blog",
         "market": "US",
         "language_code": "en",
+        **changes,
     }
 
 
@@ -232,3 +239,28 @@ async def test_update_uses_approved_remote_id_and_verifies_by_id(monkeypatch: py
     assert result["action"] == "update"
     assert publisher.updated == ["17"]
     assert publisher.gets == ["17"]
+
+
+@pytest.mark.asyncio
+async def test_sync_seo_metadata_updates_only_the_published_shopify_article(monkeypatch: pytest.MonkeyPatch) -> None:
+    session = Session(
+        article=_article(
+            status="published",
+            published_post_id="gid://shopify/Article/17",
+            published_url="https://example.myshopify.com/blogs/news/hello",
+        ),
+        site=_site(site_type="shopify", domain="example.myshopify.com"),
+    )
+    publisher = Publisher()
+    monkeypatch.setattr(publish_service, "publisher_for_site", lambda *_args, **_kwargs: publisher)
+
+    result = await publish_service.sync_article_seo_metadata(session, article_id="article-id")
+
+    assert result["ok"] is True
+    assert result["action"] == "sync_seo_metadata"
+    assert publisher.seo_synced and publisher.seo_synced[0][0] == "gid://shopify/Article/17"
+    assert publisher.seo_synced[0][1].content_md == ""
+    assert publisher.seo_synced[0][1].meta_description == "Description"
+    assert publisher.updated == []
+    assert session.article_updates == []
+    assert json.loads(session.inserts[0]["decision"])["action"] == "sync_seo_metadata"

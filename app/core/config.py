@@ -36,6 +36,7 @@ class Settings(BaseSettings):
     # 日志
     log_level: str = "INFO"
     log_json: bool = True
+    log_file: str = "logs/seo-workbench.jsonl"
 
     # 规则引擎
     rule_auto_reload_seconds: int = 60
@@ -43,12 +44,15 @@ class Settings(BaseSettings):
     # AI provider
     ai_keyword_analysis_base_url: str = ""
     ai_keyword_analysis_key: str = ""
+    ai_keyword_analysis_provider: str = ""
     ai_keyword_analysis_model: str = "deepseek-chat"
     ai_brief_generation_base_url: str = ""
     ai_brief_generation_key: str = ""
+    ai_brief_generation_provider: str = ""
     ai_brief_generation_model: str = "deepseek-chat"
     ai_article_generation_base_url: str = ""
     ai_article_generation_key: str = ""
+    ai_article_generation_provider: str = ""
     ai_article_generation_model: str = "deepseek-chat"
 
     # SerpApi
@@ -66,8 +70,10 @@ class Settings(BaseSettings):
     # 外部 HTTP
     http_timeout_seconds: int = 30
     http_retry_max: int = 3
-    ai_timeout_seconds: int = 90
     connector_secret_key: str = ""
+    social_executor_url: str = "http://127.0.0.1:4317"
+    social_executor_shared_secret: str = ""
+    ai_timeout_seconds: int = 90
     ai_retry_max: int = 2
 
     # Shopify Admin API（自有店铺 Client Credentials Grant）

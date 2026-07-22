@@ -8,6 +8,7 @@ import { SitesPage } from '@/pages/SitesPage'
 import { AnalyticsPage } from '@/pages/AnalyticsPage'
 import { MainSiteContentPage } from '@/pages/MainSiteContentPage'
 import { useAutomationStatus } from '@/hooks/useData'
+import { BusinessScopeProvider, useBusinessScope } from '@/businessScope'
 
 type PageId =
   | 'content'
@@ -27,10 +28,15 @@ function todayLabel() {
 }
 
 export default function App() {
+  return <BusinessScopeProvider><AppShell /></BusinessScopeProvider>
+}
+
+function AppShell() {
   const [page, setPage] = useState<PageId>('content')
   const [notifications, setNotifications] = useState<Array<{ id: string; title: string; detail?: string; time: string }>>([])
   const [taskRefreshKey, setTaskRefreshKey] = useState(0)
-  const execution = useAutomationStatus(taskRefreshKey)
+  const { businessId, businessIds, setBusinessId } = useBusinessScope()
+  const execution = useAutomationStatus(taskRefreshKey, businessId || undefined)
   const seenTasks = useRef<Set<string> | null>(null)
 
   function notify(title: string, detail?: string) {
@@ -82,7 +88,7 @@ export default function App() {
     <div className="app-shell">
       <Sidebar currentPage={page} onNavigate={(id) => setPage(id as PageId)} />
       <div className="app-main">
-        <Topbar dateLabel={todayLabel()} notifications={notifications} />
+        <Topbar dateLabel={todayLabel()} notifications={notifications} businessId={businessId} businessIds={businessIds} onBusinessChange={setBusinessId} />
         <main className="app-content">{pageNode}</main>
       </div>
     </div>

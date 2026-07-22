@@ -12,10 +12,18 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.clients.ai_provider import generate_ai_content
 
 
-async def generate_site_knowledge(session: AsyncSession, site_id: str) -> dict[str, Any]:
+async def generate_site_knowledge(
+    session: AsyncSession,
+    site_id: str,
+    *,
+    profile_override: dict[str, Any] | None = None,
+    persist: bool = True,
+) -> dict[str, Any]:
     site = await _load_site(session, site_id)
     if not site:
         raise ValueError("site not found")
+    if profile_override is not None:
+        site = {**site, "knowledge_profile": profile_override}
 
     posts = await _load_posts(session, site_id)
     keywords = await _load_keywords(session, site_id)
@@ -33,7 +41,8 @@ async def generate_site_knowledge(session: AsyncSession, site_id: str) -> dict[s
 
     profile = _normalize_profile({**existing_profile, **profile, "status": "draft", "evidence": evidence})
     profile["generated_at"] = datetime.now(timezone.utc).isoformat()
-    await save_site_knowledge(session, site_id, profile)
+    if persist:
+        await save_site_knowledge(session, site_id, profile)
     return {
         "site_id": site_id,
         "knowledge_profile": profile,
@@ -150,7 +159,8 @@ def _build_prompt(site: dict[str, Any], posts: list[dict[str, Any]], keywords: l
     return """你是站点内容规划师。根据输入事实，为这个站点生成一个可供 SEO 和内容团队执行的知识画像。
 只使用输入中出现的事实；数据不足时明确保留空数组或写“待确认”，不要臆造产品、品牌和受众。
 返回且只返回 JSON 对象，不要 Markdown，字段必须包含：
-site_mode（站点模式）、positioning（站点定位）、audience（目标受众）、products（产品或服务）、in_scope_topics（应该持续写的主题）、out_of_scope_topics（暂不应该写的主题）、content_types（适合的内容类型）、tone（写作语气）、conversion_goals（转化目标）、conversion_targets（转化页面）、internal_link_rules（内链规则）、restricted_topics（限制主题）、editorial_rules（编辑规则）。
+site_mode（站点模式）、positioning（站点定位）、audience（目标受众）、products（产品或服务）、in_scope_topics（应该持续写的主题）、out_of_scope_topics（暂不应该写的主题）、content_types（适合的内容类型）、tone（写作语气）、conversion_goals（转化目标）、conversion_targets（转化页面）、internal_link_rules（内链规则）、restricted_topics（限制主题）、editorial_rules（编辑规则）、generation_policy（生文政策）。
+generation_policy 必须是对象，至少包含 business_type、risk_level（low/standard/regulated/ymyl）、keyword_triggers（高风险主题到关键词数组）、claim_terms（需要来源的声明词）、allowed_sources（允许来源对象数组，含 url/label）、forbidden_claims（不可生成的声明）。数据不足时保留空数组，不要臆造来源或合规结论。
 如果这是主站，必须区分商业页面和文章：文章负责获取和解释搜索需求，产品页/分类页负责承接转化；根据扫描到的核心页面提出内链方向。
 已分配关键词不是站点定位或内容范围的权威证据，不得用它扩展 in_scope_topics。
 不要返回 confidence 或任何分数。""" + "\n\n输入事实：\n" + json.dumps(payload, ensure_ascii=False, default=str)
@@ -192,6 +202,14 @@ def _fallback_profile(site: dict[str, Any], posts: list[dict[str, Any]], keyword
         "conversion_targets": [item.get("url") for item in (site.get("knowledge_profile") or {}).get("core_pages", []) if item.get("page_type") in {"product", "category", "service"} and item.get("url")] if isinstance(site.get("knowledge_profile"), dict) else [],
         "internal_link_rules": ["文章优先链接到相关产品页或分类页"] if site.get("is_main") else [],
         "editorial_rules": [],
+        "generation_policy": {
+            "business_type": "general",
+            "risk_level": "standard",
+            "keyword_triggers": {},
+            "claim_terms": [],
+            "allowed_sources": [],
+            "forbidden_claims": [],
+        },
     }
 
 
@@ -230,6 +248,9 @@ def _normalize_profile(profile: dict[str, Any]) -> dict[str, Any]:
         "core_pages": [item for item in profile.get("core_pages", []) if isinstance(item, dict)][:80] if isinstance(profile.get("core_pages"), list) else [],
         "index_scan": profile.get("index_scan") if isinstance(profile.get("index_scan"), dict) else {},
         "evidence": [item for item in profile.get("evidence", []) if isinstance(item, dict)][:20] if isinstance(profile.get("evidence"), list) else [],
+        "services": _list(profile.get("services")),
+        "verified_assets": [item for item in profile.get("verified_assets", []) if isinstance(item, dict)][:80] if isinstance(profile.get("verified_assets"), list) else [],
+        "generation_policy": _normalize_generation_policy(profile.get("generation_policy")),
     }
     for key in ("generated_at", "updated_at"):
         if profile.get(key):
@@ -240,6 +261,31 @@ def _normalize_profile(profile: dict[str, Any]) -> dict[str, Any]:
 def _plain_text(value: Any) -> str:
     value = re.sub(r"<script[\s\S]*?</script>|<style[\s\S]*?</style>", " ", str(value or ""), flags=re.I)
     return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", value)).strip()
+
+
+def _normalize_generation_policy(value: Any) -> dict[str, Any]:
+    policy = value if isinstance(value, dict) else {}
+    triggers = policy.get("keyword_triggers") if isinstance(policy.get("keyword_triggers"), dict) else {}
+    normalized_triggers = {str(key): _list(items) for key, items in triggers.items() if _list(items)}
+    sources = []
+    for item in policy.get("allowed_sources") or []:
+        if isinstance(item, str) and item.startswith(("http://", "https://")):
+            sources.append({"url": item, "label": item})
+        elif isinstance(item, dict) and item.get("url"):
+            sources.append({"url": str(item["url"]), "label": str(item.get("label") or item.get("title") or item["url"]), "source_type": str(item.get("source_type") or "approved")})
+    return {
+        "business_type": _string(policy.get("business_type")) or "general",
+        "site_role": _string(policy.get("site_role")) if _string(policy.get("site_role")) in {"main", "commercial", "local_service", "service", "content", "editorial", "blog"} else "",
+        "risk_level": _string(policy.get("risk_level")) if _string(policy.get("risk_level")) in {"low", "standard", "regulated", "ymyl"} else "standard",
+        "keyword_triggers": normalized_triggers,
+        "claim_terms": _list(policy.get("claim_terms")),
+        "allowed_sources": sources[:20],
+        "forbidden_claims": _list(policy.get("forbidden_claims")),
+        "required_modules": _list(policy.get("required_modules")),
+        "generic_opening_patterns": _list(policy.get("generic_opening_patterns")),
+        "faq_heading_patterns": _list(policy.get("faq_heading_patterns")),
+        "metadata_length": policy.get("metadata_length") if isinstance(policy.get("metadata_length"), dict) else {},
+    }
 
 
 def _list(value: Any) -> list[str]:

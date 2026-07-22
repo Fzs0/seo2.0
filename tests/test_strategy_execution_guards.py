@@ -104,7 +104,7 @@ async def test_keywordless_update_uses_ephemeral_context_without_keyword_writes(
     assert result["status"] == "done"
     assert saved["keyword_id"] is None
     assert saved["primary_keyword"] == "existing topic"
-    assert not session.calls
+    assert all("UPDATE seo_agent.keywords" not in sql for sql, _ in session.calls)
 
 
 @pytest.mark.asyncio
@@ -322,6 +322,10 @@ def test_keyword_analysis_runs_once_per_validated_page_cluster() -> None:
     for source in (load_source, count_source):
         assert "cluster_role IN ('pillar', 'standalone')" in source
         assert "('validated', 'provisional')" in source
+        assert "source <> 'semrush_strategy_builder'" in source
+    assert "imported_page_url" in load_source
+    assert "imported_page_title" in load_source
+    assert "imported_page_description" in load_source
     assert "WHERE business_id = :business_id AND topic_cluster_id = :topic_cluster_id" in save_source
     assert "classify_keyword" not in save_source
     assert "topic_cluster = COALESCE" not in save_source

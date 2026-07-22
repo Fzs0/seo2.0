@@ -147,6 +147,7 @@ export interface KeywordPage {
 }
 
 export interface KeywordFilters {
+  businessId?: string
   aiAnalyzed?: string
   intent?: string
   serpFeature?: string
@@ -159,6 +160,7 @@ export function useKeywordPage(refreshKey = 0, page = 1, pageSize = 100, filters
     const offset = Math.max(0, page - 1) * pageSize
     setState({ data: null, loading: true, error: null })
     const params = new URLSearchParams({ limit: String(pageSize), offset: String(offset) })
+    if (filters.businessId) params.set('business_id', filters.businessId)
     if (filters.aiAnalyzed) params.set('ai_analyzed', filters.aiAnalyzed)
     if (filters.intent) params.set('intent', filters.intent)
     if (filters.serpFeature) params.set('serp_feature', filters.serpFeature)
@@ -166,7 +168,7 @@ export function useKeywordPage(refreshKey = 0, page = 1, pageSize = 100, filters
       .then((result) => { if (!controller.signal.aborted) setState({ data: result, loading: false, error: null }) })
       .catch((error) => { if (!controller.signal.aborted) setState({ data: null, loading: false, error: error instanceof Error ? error.message : '无法加载关键词' }) })
     return () => controller.abort()
-  }, [refreshKey, page, pageSize, filters.aiAnalyzed, filters.intent, filters.serpFeature])
+  }, [refreshKey, page, pageSize, filters.businessId, filters.aiAnalyzed, filters.intent, filters.serpFeature])
   return state
 }
 
@@ -192,6 +194,170 @@ export function useArticles(refreshKey = 0, siteId?: string): AsyncState<Article
   return state
 }
 
+export interface ArticlePage {
+  items: Article[]
+  total: number
+  limit: number
+  offset: number
+}
+
+export interface ArticleFilters {
+  siteId?: string
+  status?: string
+}
+
+export function useArticlePage(
+  refreshKey = 0,
+  page = 1,
+  pageSize = 20,
+  filters: ArticleFilters = {},
+): AsyncState<ArticlePage> {
+  const [state, setState] = useState<AsyncState<ArticlePage>>({ data: null, loading: true, error: null })
+  useEffect(() => {
+    const controller = new AbortController()
+    const offset = Math.max(0, page - 1) * pageSize
+    setState({ data: null, loading: true, error: null })
+    const params = new URLSearchParams({ limit: String(pageSize), offset: String(offset) })
+    if (filters.siteId) params.set('site_id', filters.siteId)
+    if (filters.status) params.set('status', filters.status)
+    void getJson<ArticlePage>(`/api/v1/articles?${params.toString()}`, controller.signal)
+      .then((result) => { if (!controller.signal.aborted) setState({ data: result, loading: false, error: null }) })
+      .catch((error) => {
+        if (!controller.signal.aborted) {
+          setState({ data: null, loading: false, error: error instanceof Error ? error.message : '无法加载文章' })
+        }
+      })
+    return () => controller.abort()
+  }, [refreshKey, page, pageSize, filters.siteId, filters.status])
+  return state
+}
+
+export interface ArticleMonthlyBucket {
+  site_id: string | null
+  site_name: string
+  by_month: Record<string, number>
+}
+
+export interface ArticleMonthlyStats {
+  months: string[]
+  totals: Record<string, number>
+  by_site: ArticleMonthlyBucket[]
+  total_articles: number
+  generated_at: string
+  months_window: number
+}
+
+export function useArticleMonthlyStats(
+  refreshKey = 0,
+  months = 12,
+  siteId?: string,
+): AsyncState<ArticleMonthlyStats> {
+  const [state, setState] = useState<AsyncState<ArticleMonthlyStats>>({ data: null, loading: true, error: null })
+  useEffect(() => {
+    const controller = new AbortController()
+    setState({ data: null, loading: true, error: null })
+    const params = new URLSearchParams({ months: String(months) })
+    if (siteId) params.set('site_id', siteId)
+    void getJson<ArticleMonthlyStats>(`/api/v1/articles/stats/monthly?${params.toString()}`, controller.signal)
+      .then((result) => { if (!controller.signal.aborted) setState({ data: result, loading: false, error: null }) })
+      .catch((error) => {
+        if (!controller.signal.aborted) {
+          setState({ data: null, loading: false, error: error instanceof Error ? error.message : '无法加载月度统计' })
+        }
+      })
+    return () => controller.abort()
+  }, [refreshKey, months, siteId])
+  return state
+}
+
+export type DateField = 'created_at' | 'published_at'
+
+export interface ArticleKpi {
+  total: number
+  today: number
+  this_week: number
+  this_month: number
+  last_7_days: number
+  last_30_days: number
+  last_month: number
+  date_field: DateField
+  generated_at: string
+}
+
+export function useArticleKpi(refreshKey = 0, siteId?: string, dateField: DateField = 'created_at'): AsyncState<ArticleKpi> {
+  const [state, setState] = useState<AsyncState<ArticleKpi>>({ data: null, loading: true, error: null })
+  useEffect(() => {
+    const controller = new AbortController()
+    setState({ data: null, loading: true, error: null })
+    const params = new URLSearchParams({ date_field: dateField })
+    if (siteId) params.set('site_id', siteId)
+    void getJson<ArticleKpi>(`/api/v1/articles/stats/kpi?${params.toString()}`, controller.signal)
+      .then((result) => { if (!controller.signal.aborted) setState({ data: result, loading: false, error: null }) })
+      .catch((error) => {
+        if (!controller.signal.aborted) {
+          setState({ data: null, loading: false, error: error instanceof Error ? error.message : '无法加载 KPI' })
+        }
+      })
+    return () => controller.abort()
+  }, [refreshKey, siteId, dateField])
+  return state
+}
+
+export type TimeseriesGranularity = 'day' | 'week' | 'month' | 'auto'
+
+export interface TimeseriesBucket {
+  key: string
+  label: string
+  count: number
+}
+
+export interface TimeseriesSite {
+  site_id: string | null
+  site_name: string
+  series: TimeseriesBucket[]
+  total: number
+}
+
+export interface ArticleTimeseries {
+  granularity: TimeseriesGranularity
+  range: { start: string; end: string; days: number }
+  buckets: TimeseriesBucket[]
+  by_site: TimeseriesSite[]
+  total: number
+  date_field: DateField
+  generated_at: string
+}
+
+export function useArticleTimeseries(
+  refreshKey: number,
+  start: string,
+  end: string,
+  granularity: TimeseriesGranularity,
+  siteId?: string,
+  dateField: DateField = 'created_at',
+): AsyncState<ArticleTimeseries> {
+  const [state, setState] = useState<AsyncState<ArticleTimeseries>>({ data: null, loading: true, error: null })
+  useEffect(() => {
+    if (!start || !end) {
+      setState({ data: null, loading: false, error: null })
+      return
+    }
+    const controller = new AbortController()
+    setState({ data: null, loading: true, error: null })
+    const params = new URLSearchParams({ start, end, granularity, date_field: dateField })
+    if (siteId) params.set('site_id', siteId)
+    void getJson<ArticleTimeseries>(`/api/v1/articles/stats/timeseries?${params.toString()}`, controller.signal)
+      .then((result) => { if (!controller.signal.aborted) setState({ data: result, loading: false, error: null }) })
+      .catch((error) => {
+        if (!controller.signal.aborted) {
+          setState({ data: null, loading: false, error: error instanceof Error ? error.message : '无法加载时间序列' })
+        }
+      })
+    return () => controller.abort()
+  }, [refreshKey, start, end, granularity, siteId, dateField])
+  return state
+}
+
 export function getArticleDetail(articleId: string) {
   return getJson<{
     id: string
@@ -204,9 +370,19 @@ export function getArticleDetail(articleId: string) {
     content_html?: string | null
     article_parts?: Record<string, unknown> | null
     qa_checklist?: Array<{ key: string; ok: boolean }> | null
+    generation_provider?: string | null
     generation_model?: string | null
     primary_keyword?: string | null
+    meta_title?: string | null
+    meta_description?: string | null
   }>(`/api/v1/articles/${encodeURIComponent(articleId)}`, new AbortController().signal)
+}
+
+export function syncArticleSeoMetadata(articleId: string) {
+  return postJson<{ ok: boolean; error?: string | null; url?: string | null; task_id?: string | null; action: string }>(
+    `/api/v1/articles/${encodeURIComponent(articleId)}/sync-seo-metadata`,
+    {},
+  )
 }
 
 export function usePosts(refreshKey = 0, siteId?: string): AsyncState<Post[]> {
@@ -708,6 +884,56 @@ export function testSiteConnector(siteId: string) {
   }>(`/api/v1/sites/${encodeURIComponent(siteId)}/connector`, new AbortController().signal)
 }
 
+export interface CustomConnector {
+  id: string
+  site_id: string
+  name: string
+  capability: string
+  status: string
+  current_version: number
+  active_version?: number | null
+  config?: { adapter?: string }
+  configured_secret_names?: string[]
+  verified_at?: string | null
+  updated_at?: string
+}
+
+export function listCustomConnectors(siteId: string) {
+  return getJson<{ items: CustomConnector[]; total: number }>(
+    `/api/v1/connectors?site_id=${encodeURIComponent(siteId)}`,
+    new AbortController().signal,
+  )
+}
+
+export function configureOemAppsConnector(siteId: string, token: string) {
+  return postJson<CustomConnector>('/api/v1/connectors/oemapps', { site_id: siteId, token })
+}
+
+export function testCustomConnector(connectorId: string) {
+  return postJson<{ ok: boolean; total_items?: number; mapped_items?: number; errors?: string[] }>(
+    `/api/v1/connectors/${encodeURIComponent(connectorId)}/test`,
+    {},
+  )
+}
+
+export function activateCustomConnector(connectorId: string) {
+  return postJson<CustomConnector>(`/api/v1/connectors/${encodeURIComponent(connectorId)}/activate`, {})
+}
+
+export function syncCustomConnectorProducts(connectorId: string) {
+  return postJson<{ ok: boolean; items_received: number; items_mapped: number; items_upserted: number; errors?: string[] }>(
+    `/api/v1/connectors/${encodeURIComponent(connectorId)}/sync-products`,
+    {},
+  )
+}
+
+export function syncOemAppsCollections(connectorId: string) {
+  return postJson<{ ok: boolean; collections_received: number; collections_upserted: number; products_scanned: number }>(
+    `/api/v1/connectors/${encodeURIComponent(connectorId)}/sync-collections`,
+    {},
+  )
+}
+
 export function upsertSite(payload: Record<string, unknown>) {
   return postJson<Site>('/api/v1/sites', payload)
 }
@@ -719,6 +945,18 @@ export function generateSiteKnowledge(siteId: string) {
     ai: { status: string; configured: boolean; provider?: string; model?: string }
     sources: { posts: number; keywords: number }
   }>(`/api/v1/sites/${encodeURIComponent(siteId)}/knowledge/generate`, {})
+}
+
+export function discoverSiteBusiness(siteId: string) {
+  return postJson<{
+    site: { id: string; name: string; site_key: string; site_type: string; base_url: string }
+    sitemap_url: string
+    scan: { indexed_urls: number; scanned_urls: number; issues: number; product_hints: string[] }
+    evidence: { existing_posts: number; product_records: number }
+    candidate_targets: Array<{ url: string; type: string; title: string; facts: string[] }>
+    knowledge_profile: SiteKnowledgeProfile
+    recommended_next_step: string
+  }>(`/api/v1/sites/${encodeURIComponent(siteId)}/business-discovery`, {})
 }
 
 export function saveSiteKnowledge(siteId: string, profile: SiteKnowledgeProfile) {
@@ -840,6 +1078,37 @@ export async function previewSemrushStrategyFile(file: File) {
     filename: file.name,
     contentBase64: await fileToBase64(file),
   })
+}
+
+export interface KeywordFileImportPreview {
+  filename: string
+  keywords: Array<{ topicClusterId?: string | null }>
+  saved: number
+  sourceBatchId: string
+  preflightSummary: {
+    total: number
+    accepted: number
+    rejected: number
+    rejectionReasons: Record<string, number>
+  }
+  message: string
+}
+
+async function submitKeywordFile(file: File, businessId: string, market: string, save: boolean) {
+  return postJson<KeywordFileImportPreview>('/api/v1/workflow/import-file', {
+    filename: file.name,
+    contentBase64: await fileToBase64(file),
+    project: { businessId, market },
+    save,
+  })
+}
+
+export function previewKeywordFile(file: File, businessId: string, market: string) {
+  return submitKeywordFile(file, businessId, market, false)
+}
+
+export function importKeywordFile(file: File, businessId: string, market: string) {
+  return submitKeywordFile(file, businessId, market, true)
 }
 
 export async function importSemrushStrategyFile(file: File, businessId: string, market: string) {

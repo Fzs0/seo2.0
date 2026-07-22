@@ -52,7 +52,7 @@ from app.services.automation_service import (
     start_execution,
     stop_execution,
 )
-from app.services.strategy_effect_service import list_effects
+from app.services.strategy_effect_service import backfill_missing_effect_target_urls, list_effects
 from app.services.strategy_service import (
     cancel_strategy,
     clear_strategy_queue,
@@ -66,6 +66,7 @@ from app.services.strategy_service import (
 )
 from app.services.content_audit_service import list_ai_reviews, scan_content
 from app.clients.ai_provider import generate_ai_content, is_stage_configured
+from app.services.article_generation_service import generate_article_pipeline
 
 router = APIRouter()
 logger = structlog.get_logger(__name__)
@@ -493,7 +494,9 @@ async def get_strategy_effects(
     limit: int = 200,
     session: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
-    return {"items": await list_effects(session, business_id=business_id.strip(), limit=limit)}
+    scoped_business_id = business_id.strip()
+    await backfill_missing_effect_target_urls(session, business_id=scoped_business_id)
+    return {"items": await list_effects(session, business_id=scoped_business_id, limit=limit)}
 
 
 @router.get("/workflow/strategies/plan")
@@ -730,6 +733,21 @@ class ArticleGenerateBody(BaseModel):
     keywordId: str
 
 
+class ArticleTestBody(BaseModel):
+    """A disposable article test: no strategy task, article row, publish or effect record."""
+
+    siteId: str = Field(min_length=1)
+    keyword: str = Field(min_length=2, max_length=180)
+    market: str | None = None
+    languageCode: str | None = None
+    pageType: str | None = None
+    briefDirection: str | None = None
+    userQuestion: str | None = None
+    targetAssetUrl: str | None = None
+    internalLinkPlan: list[dict[str, Any]] = Field(default_factory=list)
+    serpContext: dict[str, Any] | None = None
+
+
 @router.post("/workflow/article-generate")
 async def generate_article(body: ArticleGenerateBody, session: AsyncSession = Depends(get_db)) -> dict[str, Any]:
     raise HTTPException(status_code=409, detail="该旧接口已关闭；正式生文必须从今日计划审核执行")
@@ -738,6 +756,36 @@ async def generate_article(body: ArticleGenerateBody, session: AsyncSession = De
 @router.post("/workflow/article-pipeline")
 async def article_pipeline(body: ArticleGenerateBody, session: AsyncSession = Depends(get_db)) -> dict[str, Any]:
     raise HTTPException(status_code=409, detail="该旧接口已关闭；正式生文必须从今日计划审核执行")
+
+
+@router.post("/workflow/article-test")
+async def article_test(body: ArticleTestBody, session: AsyncSession = Depends(get_db)) -> dict[str, Any]:
+    """Generate a reviewable draft without creating any operational SEO data."""
+    strategy = {
+        "strategy_type": "update_article",
+        "strategy_source": "article_test",
+        "briefDirection": body.briefDirection or "Generate a role-aware test article from the frozen context.",
+        "user_question": body.userQuestion or "",
+        "target_asset_url": body.targetAssetUrl or "",
+        "internal_link_plan": body.internalLinkPlan,
+    }
+    result = await generate_article_pipeline(
+        session,
+        None,
+        forced_site_id=body.siteId,
+        approved_strategy=strategy,
+        keyword_context={
+            "id": None,
+            "keyword": body.keyword.strip(),
+            "assigned_site_id": body.siteId,
+            "market": body.market,
+            "language_code": body.languageCode,
+            "page_type": body.pageType,
+        },
+        dry_run=True,
+        serp_override=body.serpContext or {"id": None, "source": "article-test", "organic_results": [], "related_questions": [], "related_searches": []},
+    )
+    return {**result, "testMode": True, "persistence": "none"}
 
 
 @router.post("/workflow/mock-article")

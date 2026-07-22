@@ -24,6 +24,7 @@ export type ArticleResultData = {
   savedTo?: { table?: string; articleId?: string }
   serp?: { id?: string | null; source?: string; status?: string }
   qa?: Array<{ key: string; ok: boolean }>
+  provider?: string
   model?: string
   contentLength?: number
 }
@@ -96,6 +97,7 @@ export function ArticleResultDialog({
   publishing = false,
   publishMessage,
   onPublish,
+  onSyncSeoMetadata,
 }: {
   result: ArticleResultData
   tab?: ResultTab
@@ -107,6 +109,7 @@ export function ArticleResultDialog({
   publishing?: boolean
   publishMessage?: string
   onPublish?: (dryRun: boolean) => Promise<void>
+  onSyncSeoMetadata?: () => Promise<void>
 }) {
   const [localTab, setLocalTab] = useState<ResultTab>('article')
   const activeTab = tab || localTab
@@ -184,7 +187,7 @@ export function ArticleResultDialog({
             <div className="article-dialog__info-grid">
               <InfoItem label="保存位置" value={`${result.savedTo?.table || 'seo_agent.articles'} / ${result.savedTo?.articleId || result.article?.id || '未知'}`} />
               <InfoItem label="Brief 来源" value={result.brief?.aiEnhanced ? 'AI 增强' : '已保存 Brief'} />
-              <InfoItem label="生成模型" value={result.model || '未返回'} />
+              <InfoItem label="模型厂商 / 模型" value={`${result.provider || 'unknown'} / ${result.model || 'unknown'}`} />
               <InfoItem label="SERP 状态" value={`${result.serp?.source || '未使用'} · ${result.serp?.status || '未知'}`} />
               <InfoItem label="QA 结果" value={`${passedQa}/${result.qa?.length || 0} 项通过`} />
               <InfoItem label="文章状态" value={result.article?.status || '未知'} />
@@ -194,6 +197,11 @@ export function ArticleResultDialog({
         </div>
 
         <div className="article-dialog__foot">
+          {onSyncSeoMetadata && (
+            <button className="btn btn--primary btn--seo-metadata-sync" type="button" disabled={publishing} title="只同步页面标题与元描述，不会改动正文或调用 AI" onClick={() => void onSyncSeoMetadata()}>
+              {publishing ? '同步中…' : '同步 SEO 元数据'}
+            </button>
+          )}
           {onPublish && (
             <>
               <span className="article-dialog__target-site">目标站点：{publishSites.find((site) => site.id === targetSiteId)?.name || '未分配'}</span>

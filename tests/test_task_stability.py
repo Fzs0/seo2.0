@@ -33,6 +33,48 @@ async def test_ai_requests_use_ai_specific_limits(monkeypatch: pytest.MonkeyPatc
 
 
 @pytest.mark.asyncio
+async def test_ai_provenance_uses_vendor_and_response_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def request_json(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        return {
+            "model": "deepseek-v4-pro-202607",
+            "choices": [{"message": {"content": "ok"}}],
+        }
+
+    monkeypatch.setattr(ai_provider, "is_stage_configured", lambda stage: True)
+    monkeypatch.setattr(ai_provider, "request_json", request_json)
+    monkeypatch.setattr(ai_provider._settings, "ai_article_generation_base_url", "https://api.openai-proxy.org/v1")
+    monkeypatch.setattr(ai_provider._settings, "ai_article_generation_provider", "deepseek")
+    monkeypatch.setattr(ai_provider._settings, "ai_article_generation_model", "deepseek-v4-pro")
+
+    result = await ai_provider.generate_ai_content(stage="article_generation", prompt="test")
+
+    assert result["provider"] == "deepseek"
+    assert result["providerSource"] == "configuration"
+    assert result["requestedModel"] == "deepseek-v4-pro"
+    assert result["model"] == "deepseek-v4-pro-202607"
+    assert result["modelSource"] == "response"
+
+
+@pytest.mark.asyncio
+async def test_ai_provenance_infers_vendor_instead_of_protocol_name(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def request_json(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        return {"choices": [{"message": {"content": "ok"}}]}
+
+    monkeypatch.setattr(ai_provider, "is_stage_configured", lambda stage: True)
+    monkeypatch.setattr(ai_provider, "request_json", request_json)
+    monkeypatch.setattr(ai_provider._settings, "ai_article_generation_base_url", "https://proxy.example/v1")
+    monkeypatch.setattr(ai_provider._settings, "ai_article_generation_provider", "")
+    monkeypatch.setattr(ai_provider._settings, "ai_article_generation_model", "gpt-5.1-2026-06-01")
+
+    result = await ai_provider.generate_ai_content(stage="article_generation", prompt="test")
+
+    assert result["provider"] == "openai"
+    assert result["providerSource"] == "inference"
+    assert result["model"] == "gpt-5.1-2026-06-01"
+    assert result["modelSource"] == "configuration"
+
+
+@pytest.mark.asyncio
 async def test_ai_failure_keeps_provider_reason(monkeypatch: pytest.MonkeyPatch) -> None:
     async def request_json(*args: Any, **kwargs: Any) -> dict[str, Any]:
         raise ExternalCallError("ai_keyword_analysis 状态码 429")
