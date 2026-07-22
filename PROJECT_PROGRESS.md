@@ -37,6 +37,8 @@
 
 2026-07-21 ExDivo 产品分类接口已接入 OEMApps 适配器：`GET /collections/list`、`GET /collections/{id}` 和完整 `PUT /collections/{id}` 已真实验证。12 个专辑已同步到 `seo_agent.product_collections`，其中 10 个缺 Meta Title、10 个缺 Meta Description，共校验 100 条专辑商品关系。编辑接口使用只有 1 个成员的 `ALIBARBAR` 做同值 PUT，内容和成员保持不变，仅更新时间变化。由于读取接口不暴露成员 `is_top`，正式 SEO 写回要求预览快照、成员数量一致、显式确认 `is_top=0`、单专辑执行、审计和写后回读。
 
+2026-07-22 OEMApps 首页 SEO 接口已接入：`GET/PUT /seoplans` 在 Avinoti 上完成真实同值测试，平台同时容忍响应外壳和纯数据，但适配器固定只提交 `meta_title`、`meta_descript`、`meta_keywords` 三个字段。ExDivo 首页 TDK 已只读同步到 `seo_agent.site_home_seo`，当前 Title、Description、Keywords 均完整。写回接口要求先预览、匹配快照、`confirm=true`、审计和写后回读。
+
 ## 0.1 跨窗口恢复点（2026-07-20）
 
 当前主线已从“先做主站文章”收敛为“先建立主站商业页面归属，再生成支持文章”：

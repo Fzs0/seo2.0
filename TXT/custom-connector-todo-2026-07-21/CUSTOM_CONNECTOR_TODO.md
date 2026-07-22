@@ -66,6 +66,14 @@
 - [x] 分类 SEO 审计：10 个缺 Meta Title，10 个缺 Meta Description。
 - [x] 分类修改已增加预览、快照哈希、成员数量校验、显式 `is_top` 风险确认、审计和回读。
 
+## OEMApps 首页 SEO 接入完成记录（2026-07-22）
+
+- [x] Avinoti `GET /seoplans` 真实读取成功。
+- [x] Avinoti `PUT /seoplans` 使用同值 TDK 测试成功，写后内容一致。
+- [x] 适配器只提交 `meta_title`、`meta_descript`、`meta_keywords`，不回传响应元数据。
+- [x] ExDivo 首页 TDK 已同步到本地首页 SEO 表，SEO 审计无缺失。
+- [x] 首页修改已增加预览、快照哈希、显式确认、前后审计和回读校验。
+
 ## 验收标准
 
 - 获取数量与上游接口一致，分页没有遗漏或重复。

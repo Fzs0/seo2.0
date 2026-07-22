@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.connectors.custom_data import ConnectorConfig, ConnectorError
 from app.connectors.oemapps_collections import OemAppsCollectionError
+from app.connectors.oemapps_home_seo import OemAppsHomeSeoError
 from app.connectors.oemapps_products import OemAppsProductError
 from app.connectors.safe_http import ConnectorHttpError
 from app.connectors.secrets import ConnectorSecretError
@@ -36,6 +37,13 @@ from app.services.oemapps_collection_service import (
     list_synced_collections,
     preview_collection_seo_update,
     sync_oemapps_collections,
+)
+from app.services.oemapps_home_seo_service import (
+    execute_home_seo_update,
+    get_synced_home_seo,
+    list_home_seo_update_runs,
+    preview_home_seo_update,
+    sync_oemapps_home_seo,
 )
 
 
@@ -128,6 +136,17 @@ class OemAppsCollectionSeoExecuteBody(OemAppsCollectionSeoPatch):
         return self.model_dump(
             exclude_unset=True,
             exclude={"expected_snapshot_hash", "confirm_membership_top_reset"},
+        )
+
+
+class OemAppsHomeSeoExecuteBody(OemAppsCollectionSeoPatch):
+    expected_snapshot_hash: str = Field(min_length=64, max_length=64)
+    confirm: bool = False
+
+    def as_patch(self) -> dict[str, Any]:
+        return self.model_dump(
+            exclude_unset=True,
+            exclude={"expected_snapshot_hash", "confirm"},
         )
 
 
@@ -298,6 +317,65 @@ async def collection_seo_update_runs_route(
     session: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
     return await list_collection_update_runs(session, connector_id, limit=limit)
+
+
+@router.post("/{connector_id}/sync-home-seo")
+async def sync_oemapps_home_seo_route(
+    connector_id: str, session: AsyncSession = Depends(get_db)
+) -> dict[str, Any]:
+    try:
+        return await sync_oemapps_home_seo(session, connector_id)
+    except (ValueError, ConnectorSecretError, OemAppsHomeSeoError) as error:
+        raise _bad_request(error) from error
+
+
+@router.get("/{connector_id}/home-seo")
+async def get_oemapps_home_seo_route(
+    connector_id: str, session: AsyncSession = Depends(get_db)
+) -> dict[str, Any]:
+    result = await get_synced_home_seo(session, connector_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail="homepage SEO has not been synchronized")
+    return result
+
+
+@router.post("/{connector_id}/home-seo/update/preview")
+async def preview_oemapps_home_seo_update_route(
+    connector_id: str,
+    body: OemAppsCollectionSeoPatch,
+    session: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    try:
+        return await preview_home_seo_update(session, connector_id, body.as_patch())
+    except (ValueError, ConnectorSecretError, OemAppsHomeSeoError) as error:
+        raise _bad_request(error) from error
+
+
+@router.post("/{connector_id}/home-seo/update/execute")
+async def execute_oemapps_home_seo_update_route(
+    connector_id: str,
+    body: OemAppsHomeSeoExecuteBody,
+    session: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    try:
+        return await execute_home_seo_update(
+            session,
+            connector_id,
+            body.as_patch(),
+            expected_snapshot_hash=body.expected_snapshot_hash,
+            confirm=body.confirm,
+        )
+    except (ValueError, ConnectorSecretError, OemAppsHomeSeoError) as error:
+        raise _bad_request(error) from error
+
+
+@router.get("/{connector_id}/home-seo-update-runs")
+async def home_seo_update_runs_route(
+    connector_id: str,
+    limit: int = Query(50, ge=1, le=200),
+    session: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    return await list_home_seo_update_runs(session, connector_id, limit=limit)
 
 
 @router.post("/{connector_id}/products/{product_id}/seo-update/preview")

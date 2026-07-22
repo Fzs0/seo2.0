@@ -151,6 +151,11 @@
 | POST | `/api/v1/connectors/{connector_id}/collections/{collection_id}/seo-update/preview` | 分类 SEO patch | 实时读取专辑详情并从商品列表反向重建成员；返回 TDK 差异、快照哈希和成员 ID，不写外部站点。 |
 | POST | `/api/v1/connectors/{connector_id}/collections/{collection_id}/seo-update/execute` | 分类 SEO patch、`expected_snapshot_hash`、`confirm_membership_top_reset=true` | 合并完整专辑 PUT Body，写后回读 TDK 和成员关系并保存审计。由于读取接口不返回 `is_top`，必须显式确认提交成员 `is_top=0`。 |
 | GET | `/api/v1/connectors/{connector_id}/collection-seo-update-runs` | `limit?` | 查看专辑 SEO 写回、成员前后快照和验证结果。 |
+| POST | `/api/v1/connectors/{connector_id}/sync-home-seo` | 无 | 从 OEMApps `/seoplans` 同步首页 Meta Title、Meta Description 和 Meta Keywords。 |
+| GET | `/api/v1/connectors/{connector_id}/home-seo` | 无 | 查看已同步的首页 TDK 和 SEO 审计结果。 |
+| POST | `/api/v1/connectors/{connector_id}/home-seo/update/preview` | 首页 SEO patch | 实时读取首页 SEO，返回字段差异和快照哈希，不写外部站点。 |
+| POST | `/api/v1/connectors/{connector_id}/home-seo/update/execute` | 首页 SEO patch、`expected_snapshot_hash`、`confirm=true` | 仅发送三个 SEO 字段到 `/seoplans`，写后回读并保存前后审计。 |
+| GET | `/api/v1/connectors/{connector_id}/home-seo-update-runs` | `limit?` | 查看首页 SEO 写回记录和验证结果。 |
 
 网络保护包括：仅允许 HTTPS 443、逐次校验跳转目标、DNS 解析结果必须全部为公网地址、精确主机白名单、超时和响应大小限制、JSON 内容类型校验。通用自定义连接器保持只读；只有固定域名的 OEMApps 适配器提供显式 SEO 写回，且要求连接器已激活、单商品预览、快照匹配、variant 重建确认、完整审计和写后回读。
 

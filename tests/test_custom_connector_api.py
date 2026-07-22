@@ -50,6 +50,10 @@ def test_openapi_exposes_connector_management_routes() -> None:
         "/api/v1/connectors/{connector_id}/collections/{collection_id}/seo-update/execute"
         in paths
     )
+    assert "/api/v1/connectors/{connector_id}/sync-home-seo" in paths
+    assert "/api/v1/connectors/{connector_id}/home-seo" in paths
+    assert "/api/v1/connectors/{connector_id}/home-seo/update/preview" in paths
+    assert "/api/v1/connectors/{connector_id}/home-seo/update/execute" in paths
 
 
 def test_oemapps_execute_requires_seo_patch_and_explicit_confirmation_field() -> None:
