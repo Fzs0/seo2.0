@@ -108,7 +108,7 @@ async def _periodic_effect_checks(stop_event: asyncio.Event) -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    configure_logging(settings.log_level, settings.log_json)
+    configure_logging(settings.log_level, settings.log_json, settings.log_file)
     logger.info("startup_begin", env=settings.app_env, port=settings.app_port)
 
     store = get_store()
@@ -197,10 +197,12 @@ def create_app() -> FastAPI:
     from app.api.v1.business import router as v1_business_router
     from app.api.v1.connectors import router as v1_connectors_router
     from app.api.v1.endpoints import router as v1_router
+    from app.api.v1.social import router as v1_social_router
 
     app.include_router(v1_router, prefix="/api/v1")
     app.include_router(v1_business_router, prefix="/api/v1")
     app.include_router(v1_connectors_router, prefix="/api/v1")
+    app.include_router(v1_social_router, prefix="/api/v1")
     app.include_router(v1_analytics_router, prefix="/api/v1")
     app.include_router(admin_router, prefix="/admin")
 
