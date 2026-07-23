@@ -1,7 +1,6 @@
 import { useEffect, useState } from 'react'
 import { DataGuard } from '@/components/StateBlock'
-import { searchSerp, useKeywords, type SerpSearchResult } from '@/hooks/useData'
-
+import { searchSerp, useKeywords, type SerpSearchResult } from '@/data/keywords'
 function domainOf(url?: string) {
   if (!url) return '未知域名'
   try {

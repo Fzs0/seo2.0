@@ -309,11 +309,6 @@ def preview_semrush_strategy_rows(rows: list[dict[str, Any]], policy: dict[str, 
     }
 
 
-def preview_semrush_strategy_workbook(buf: bytes, policy: dict[str, Any] | None = None) -> dict[str, Any]:
-    rows = parse_semrush_strategy_rows(xlsx_buffer_to_rows(buf, "Keywords"))
-    return preview_semrush_strategy_rows(rows, policy)
-
-
 def parse_semrush_strategy_payload(payload: dict[str, Any]) -> list[dict[str, Any]]:
     filename = str(payload.get("filename") or "")
     if not filename.casefold().endswith(".xlsx"):

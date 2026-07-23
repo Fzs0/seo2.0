@@ -1,4 +1,4 @@
-"""通用 HTTP 客户端封装：httpx + tenacity + 熔断占位。"""
+"""通用 HTTP 客户端封装：httpx + tenacity。"""
 from __future__ import annotations
 
 import asyncio
@@ -20,10 +20,6 @@ from app.middleware.metrics import external_call_duration_seconds
 
 logger = structlog.get_logger(__name__)
 _settings = get_settings()
-
-
-class CircuitOpen(Exception):
-    """熔断占位（当前永不抛出；预留接口）。"""
 
 
 class ExternalCallError(Exception):

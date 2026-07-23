@@ -1,5 +1,5 @@
 import { createContext, useContext, useEffect, useMemo, useState, type ReactNode } from 'react'
-import { useSites } from '@/hooks/useData'
+import { useSites } from '@/data/sites'
 import type { Site } from '@/types/domain'
 
 type BusinessScopeValue = {

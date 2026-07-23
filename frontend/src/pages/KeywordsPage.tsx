@@ -1,7 +1,22 @@
 import { useEffect, useState } from 'react'
 import { DataGuard } from '@/components/StateBlock'
 import { useBusinessScope } from '@/businessScope'
-import { cancelSemrushStrategyAiAnalysis, getLatestSemrushStrategyAiAnalysis, getSemrushStrategyAiAnalysis, importKeywordFile, importSemrushStrategyFile, previewKeywordFile, previewSemrushStrategyFile, startSemrushStrategyAiAnalysis, useKeywordPage, validateImportedSemrushStrategy, type KeywordFileImportPreview, type KeywordFilters, type SemrushStrategyAiAnalysisRun, type SemrushStrategyPreview } from '@/hooks/useData'
+import {
+  cancelSemrushStrategyAiAnalysis,
+  getLatestSemrushStrategyAiAnalysis,
+  getSemrushStrategyAiAnalysis,
+  importKeywordFile,
+  importSemrushStrategyFile,
+  previewKeywordFile,
+  previewSemrushStrategyFile,
+  startSemrushStrategyAiAnalysis,
+  useKeywordPage,
+  validateImportedSemrushStrategy,
+  type KeywordFileImportPreview,
+  type KeywordFilters,
+  type SemrushStrategyAiAnalysisRun,
+  type SemrushStrategyPreview,
+} from '@/data/keywords'
 import type { Priority } from '@/types/domain'
 
 const INTENT_TAG: Record<string, { label: string; tone: 'pink' | 'gold' | 'blue' | 'green' }> = {

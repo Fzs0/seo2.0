@@ -7,7 +7,7 @@ import { ArticlesPage } from '@/pages/ArticlesPage'
 import { SitesPage } from '@/pages/SitesPage'
 import { AnalyticsPage } from '@/pages/AnalyticsPage'
 import { MainSiteContentPage } from '@/pages/MainSiteContentPage'
-import { useAutomationStatus } from '@/hooks/useData'
+import { useAutomationStatus } from '@/data/automation'
 import { BusinessScopeProvider, useBusinessScope } from '@/businessScope'
 
 type PageId =

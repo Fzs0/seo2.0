@@ -1,7 +1,6 @@
 import { useEffect, useState } from 'react'
 import { useBusinessScope } from '@/businessScope'
-import { useMainSiteContent, useSites } from '@/hooks/useData'
-
+import { useMainSiteContent, useSites } from '@/data/sites'
 const TYPE_LABELS: Record<string, string> = {
   product: '产品页',
   category: '分类页',

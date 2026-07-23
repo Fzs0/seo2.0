@@ -1,7 +1,8 @@
 import { useEffect, useState } from 'react'
 import { Bars, Sparkline } from '@/components/Charts'
 import { DataGuard } from '@/components/StateBlock'
-import { useAnalyticsSources, useDashboard, useSites, useSyncLog } from '@/hooks/useData'
+import { useAnalyticsSources, useDashboard, useSyncLog } from '@/data/analytics'
+import { useSites } from '@/data/sites'
 import type { SyncLogEntry } from '@/types/domain'
 
 const SOURCE_LABEL: Record<SyncLogEntry['source_type'], string> = {

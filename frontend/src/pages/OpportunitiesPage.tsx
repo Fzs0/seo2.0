@@ -1,7 +1,6 @@
 import { useEffect, useState } from 'react'
 import { DataGuard, StateBlock } from '@/components/StateBlock'
-import { useAnalyticsOverview } from '@/hooks/useData'
-
+import { useAnalyticsOverview } from '@/data/analytics'
 function number(value: number | string | null | undefined) {
   const parsed = Number(value ?? 0)
   return Number.isFinite(parsed) ? parsed : 0

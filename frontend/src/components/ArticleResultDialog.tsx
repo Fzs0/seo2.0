@@ -1,5 +1,5 @@
 import { useState, type ReactNode } from 'react'
-import type { PipelineStep } from '@/hooks/useData'
+import type { PipelineStep } from '@/data/articles'
 import type { Site } from '@/types/domain'
 
 export type ArticleResultData = {

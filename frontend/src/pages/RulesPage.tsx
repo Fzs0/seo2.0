@@ -1,6 +1,5 @@
 import { DataGuard } from '@/components/StateBlock'
-import { useStandardRules } from '@/hooks/useData'
-
+import { useStandardRules } from '@/data/contentStrategy'
 export function RulesPage() {
   const rules = useStandardRules()
   const standard = rules.data?.standard

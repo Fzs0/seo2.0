@@ -1,8 +1,7 @@
 import { useEffect, useState } from 'react'
 import { DataGuard, StateBlock } from '@/components/StateBlock'
 import { useBusinessScope } from '@/businessScope'
-import { triggerAnalyticsSync, useAnalyticsOverview } from '@/hooks/useData'
-
+import { triggerAnalyticsSync, useAnalyticsOverview } from '@/data/analytics'
 function asNumber(value: number | string | null | undefined) {
   const n = Number(value ?? 0)
   return Number.isFinite(n) ? n : 0

@@ -9,7 +9,7 @@ import pytest
 from app.clients import ai_provider
 from app.clients.http_client import ExternalCallError
 from app.api.v1 import endpoints
-from app.services import article_generation_service, automation_service, keyword_ai_service, publish_service, strategy_service
+from app.services import article_generation_service, automation_service, keyword_ai_service, publish_service, strategy_execution, strategy_service
 
 
 @pytest.mark.asyncio
@@ -127,9 +127,12 @@ async def test_heartbeat_failure_cancels_owner(monkeypatch: pytest.MonkeyPatch) 
             self.message = message
 
     owner = Owner()
-    monkeypatch.setattr(strategy_service, "SessionLocal", Session)
-
-    await strategy_service._execution_heartbeat("task-id", owner, interval_seconds=0)  # type: ignore[arg-type]
+    await strategy_execution._execution_heartbeat(
+        "task-id",
+        owner,  # type: ignore[arg-type]
+        interval_seconds=0,
+        session_factory=Session,
+    )
 
     assert owner.message == "心跳异常：database unavailable"
 

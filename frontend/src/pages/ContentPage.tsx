@@ -1,5 +1,23 @@
 import { useEffect, useState } from 'react'
-import { cancelSeoStrategy, clearStrategyQueue, executeSeoStrategy, generateSeoStrategies, reviewSeoStrategy, saveStrategyPlan, scanContentAudit, stopSeoStrategy, useAutomationStatus, useSites, useStrategies, useStrategyCandidates, useStrategyEffects, useStrategyPlan, type ContentAuditReport, type StrategyCandidate, type StrategyFilters, type StrategyTask } from '@/hooks/useData'
+import {
+  cancelSeoStrategy,
+  executeSeoStrategy,
+  generateSeoStrategies,
+  reviewSeoStrategy,
+  saveStrategyPlan,
+  scanContentAudit,
+  stopSeoStrategy,
+  useStrategies,
+  useStrategyCandidates,
+  useStrategyEffects,
+  useStrategyPlan,
+  type ContentAuditReport,
+  type StrategyCandidate,
+  type StrategyFilters,
+  type StrategyTask,
+} from '@/data/contentStrategy'
+import { clearStrategyQueue, useAutomationStatus } from '@/data/automation'
+import { useSites } from '@/data/sites'
 import type { StrategyEffect, StrategyEffectStatus } from '@/types/domain'
 import { useBusinessScope } from '@/businessScope'
 

@@ -1,12 +1,9 @@
 import { useEffect, useMemo, useState } from 'react'
 import { DataGuard } from '@/components/StateBlock'
-import {
-  triggerAnalyticsSync,
-  useAnalyticsOverview,
-  useArticles,
-  useKeywords,
-  useSites,
-} from '@/hooks/useData'
+import { triggerAnalyticsSync, useAnalyticsOverview } from '@/data/analytics'
+import { useArticles } from '@/data/articles'
+import { useKeywords } from '@/data/keywords'
+import { useSites } from '@/data/sites'
 import type { GscQuery, Keyword, Site } from '@/types/domain'
 
 export type AgentView = 'command' | 'execution' | 'risk'

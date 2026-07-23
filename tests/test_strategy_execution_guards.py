@@ -6,7 +6,7 @@ import pytest
 from fastapi import HTTPException
 
 from app.api.v1 import endpoints
-from app.services import article_generation_service, automation_service, keyword_ai_service, strategy_service
+from app.services import article_generation_service, automation_service, keyword_ai_service, strategy_execution, strategy_service
 from app.services.article_generation_service import generate_article_pipeline
 
 
@@ -122,6 +122,7 @@ async def test_keywordless_new_article_is_rejected() -> None:
 
 @pytest.mark.asyncio
 async def test_keywordless_update_can_be_reviewed_and_executed(monkeypatch: pytest.MonkeyPatch) -> None:
+    events: list[str] = []
     decision = {
         "business_id": "business-a",
         "strategy_type": "update_article",
@@ -163,6 +164,8 @@ async def test_keywordless_update_can_be_reviewed_and_executed(monkeypatch: pyte
         async def execute(self, statement, params=None):
             sql = str(statement)
             self.calls.append((sql, params or {}))
+            if (params or {}).get("stage") == "publishing":
+                events.append("publishing")
             if "SELECT t.decision, t.site_id" in sql:
                 return _Rows([{
                     "decision": {**decision, "execution_task_id": "execution-id"},
@@ -195,6 +198,7 @@ async def test_keywordless_update_can_be_reviewed_and_executed(monkeypatch: pyte
         return {"status": "done", "article": {"id": "article-id"}}
 
     async def publish(*args, **kwargs):
+        events.append("publish")
         return {"ok": True}
 
     async def effect(*args, **kwargs):
@@ -205,8 +209,8 @@ async def test_keywordless_update_can_be_reviewed_and_executed(monkeypatch: pyte
 
     monkeypatch.setattr(article_generation_service, "generate_article_pipeline", pipeline)
     monkeypatch.setattr("app.services.publish_service.publish_article", publish)
-    monkeypatch.setattr(strategy_service, "ensure_effect", effect)
-    monkeypatch.setattr(strategy_service, "mark_effect_published", published_effect)
+    monkeypatch.setattr(strategy_execution, "ensure_effect", effect)
+    monkeypatch.setattr(strategy_execution, "mark_effect_published", published_effect)
     execute_session = ExecuteSession()
     executed = await strategy_service.execute_strategy(
         execute_session,  # type: ignore[arg-type]
@@ -216,6 +220,7 @@ async def test_keywordless_update_can_be_reviewed_and_executed(monkeypatch: pyte
     )
 
     assert executed["ok"] is True
+    assert events == ["publishing", "publish"]
     assert captured["keyword_id"] is None
     assert captured["keyword_context"] == {
         "id": None,
@@ -226,6 +231,62 @@ async def test_keywordless_update_can_be_reviewed_and_executed(monkeypatch: pyte
         "market": "US",
         "language_code": "en",
     }
+
+
+@pytest.mark.asyncio
+async def test_keywordless_update_missing_query_persists_terminal_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    class Session(_Session):
+        async def execute(self, statement, params=None):
+            sql = str(statement)
+            self.calls.append((sql, params or {}))
+            if "SELECT t.decision, t.site_id" in sql:
+                return _Rows([{
+                    "decision": {"execution_task_id": "execution-id", "business_id": "business-a"},
+                    "site_id": "site-id", "keyword_id": None, "post_id": "post-id",
+                    "site_status": "active", "business_id": "business-a", "strategy_enabled": True,
+                    "task_business_id": "business-a", "candidate_id": "candidate-id", "plan_id": "plan-id",
+                    "analysis_batch_id": "batch-id",
+                }])
+            if "SELECT id, task_type, status, site_id, keyword_id" in sql:
+                return _Rows([{
+                    "id": "execution-id", "task_type": "update_article", "status": "running",
+                    "site_id": "site-id", "keyword_id": None, "post_id": "post-id",
+                    "payload": {"strategy": {"business_id": "business-a"}},
+                }])
+            if "SELECT name, status, business_id" in sql:
+                return _Rows([{
+                    "name": "Site", "status": "active", "business_id": "business-a",
+                    "strategy_enabled": True, "market": "US", "language_code": "en",
+                }])
+            if "SELECT external_id FROM seo_agent.posts" in sql:
+                return _Rows([{"external_id": "remote-id"}])
+            return _Rows([])
+
+    async def valid(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(strategy_execution, "_validate_current_strategy", valid)
+    session = Session()
+
+    result = await strategy_execution.execute_strategy(
+        session,  # type: ignore[arg-type]
+        task_id="review-id",
+        execution_task_id="execution-id",
+        allow_running=True,
+    )
+
+    assert result["status"] == "failed"
+    assert result["error"] == "更新策略缺少查询词"
+    assert session.commits == 1
+    terminal_updates = [
+        params for sql, params in session.calls
+        if "SET status = CAST(:status AS text)" in sql
+    ]
+    assert terminal_updates == [{
+        "id": "execution-id",
+        "status": "failed",
+        "error_message": "更新策略缺少查询词",
+    }]
 
 
 @pytest.mark.asyncio
@@ -255,15 +316,17 @@ async def test_execution_is_blocked_when_current_evidence_validation_fails(monke
     async def invalid(*_args, **_kwargs):
         raise ValueError("冷却期新增")
 
-    monkeypatch.setattr(strategy_service, "_validate_current_strategy", invalid)
+    monkeypatch.setattr(strategy_execution, "_validate_current_strategy", invalid)
+    session = Session()
     result = await strategy_service.execute_strategy(
-        Session(),  # type: ignore[arg-type]
+        session,  # type: ignore[arg-type]
         task_id="strategy",
         allow_running=True,
         execution_task_id="execution",
     )
 
     assert result["status"] == "blocked"
+    assert session.commits == 1
     assert not any("SELECT name, status, business_id" in sql for sql, _ in calls)
     assert any(params.get("status") == "blocked" for _, params in calls)
 

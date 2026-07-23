@@ -11,11 +11,11 @@ import {
   useArticlePage,
   useArticleTimeseries,
   usePosts,
-  useSites,
   type DateField,
   type TimeseriesBucket,
   type TimeseriesGranularity,
-} from '@/hooks/useData'
+} from '@/data/articles'
+import { useSites } from '@/data/sites'
 import { useBusinessScope } from '@/businessScope'
 
 function formatDate(iso?: string | null) {

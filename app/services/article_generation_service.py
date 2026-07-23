@@ -26,12 +26,98 @@ from app.services.site_service import resolve_site_id
 logger = structlog.get_logger(__name__)
 
 
-async def generate_article_from_keyword(session: AsyncSession, keyword_id: str) -> dict[str, Any]:
-    result = await generate_article_pipeline(session, keyword_id)
-    if result.get("status") == "failed":
-        failed = next((s for s in result["steps"] if s["status"] == "failed"), None)
-        raise ValueError((failed or {}).get("message") or "article pipeline failed")
-    return result
+async def generate_legacy_article_preview(
+    *,
+    keyword: dict[str, Any] | None = None,
+    project: dict[str, Any] | None = None,
+    brief: str = "",
+    prompt: str = "",
+) -> dict[str, Any]:
+    """Preserve the legacy mock-article contract behind the article module."""
+    item = keyword or {}
+    project_data = project or {}
+    if is_stage_configured("article_generation"):
+        prompt_text = _legacy_article_prompt(item, project_data, brief, prompt)
+        ai = await generate_ai_content(
+            stage="article_generation",
+            prompt=prompt_text,
+            project=project_data,
+            keyword=item,
+        )
+        return {
+            "content": ai.get("content") or "",
+            "provider": ai.get("provider") or "",
+            "model": ai.get("model") or "",
+            "status": ai.get("status"),
+            "generated": bool(ai.get("content")),
+        }
+
+    asset = {
+        "url": item.get("targetAsset"),
+        "status": item.get("assetStatus") or "planned",
+        "contentAction": item.get("contentAction") or "create_new_article",
+    }
+    refs = reference_plan(item)
+    images = image_plan_for(item)
+    return {
+        "content": _legacy_mock_markdown(item, asset, refs, images),
+        "generated": False,
+        "status": "ai-not-configured",
+    }
+
+
+def _legacy_article_prompt(
+    item: dict[str, Any],
+    project: dict[str, Any],
+    brief: str,
+    prompt: str,
+) -> str:
+    return "\n\n".join(
+        [
+            prompt or "Write an SEO article from the brief.",
+            "Return Markdown only.",
+            "Include: H1, intro, useful H2 sections, FAQ, meta title, meta description.",
+            f"Primary keyword: {item.get('keyword') or ''}",
+            f"Target site/role: {item.get('assignedSite') or item.get('assigned_site_label') or ''}",
+            f"Project: {_json_dumps_compact(project)}",
+            f"Brief: {brief}",
+        ]
+    )
+
+
+def _legacy_mock_markdown(
+    item: dict[str, Any],
+    asset: dict[str, Any],
+    refs: dict[str, Any],
+    images: list[dict[str, str]],
+) -> str:
+    title = (item.get("keyword") or "untitled").title()
+    return "\n".join(
+        [
+            f"## Title\n\n{title}\n",
+            f"## Meta Title\n\n{title}: Practical Guide Before You Decide\n",
+            f"## Meta Description\n\nLearn about {item.get('keyword')} with a clear decision path and SEO-ready structure.\n",
+            f"## URL Slug\n\n{title.lower().replace(' ', '-')}\n",
+            f"## Primary Keyword: {item.get('keyword')}\n",
+            "## Secondary Keywords: (fill)\n",
+            "## Last Updated\n\nToday\n",
+            f"# {title}\n",
+            "Outline by Brief template.\n",
+            *(f"- {image['name']}: {image['position']}" for image in images),
+            *(
+                [f"## References\n\n- {source['name']}: [{source['label']}]({source['url']})" for source in refs.get("sources", [])]
+                if refs.get("triggered")
+                else []
+            ),
+        ]
+    )
+
+
+def _json_dumps_compact(value: Any) -> str:
+    try:
+        return json.dumps(value, ensure_ascii=False, indent=2)
+    except Exception:  # noqa: BLE001
+        return str(value)
 
 
 async def generate_article_pipeline(

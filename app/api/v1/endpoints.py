@@ -25,19 +25,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
 from app.core.database import get_db
-from app.engine.content_plan import (
-    article_brief_template_for,
-    image_plan_for,
-    reference_plan,
-)
 from app.engine.locale import locale_for_project
 from app.engine.loader import get_store
 from app.engine.semrush_strategy import preview_semrush_strategy_payload
-from app.services.brief_service import build_brief_with_optional_ai
+from app.services.brief_service import build_brief_with_optional_ai, build_prompt_preview
 from app.services.executor import upsert_keywords, upsert_sites
 from app.services.keyword_service import (
     analyze_keywords,
-    build_brief,
     import_summary,
     importable_keywords,
     import_and_analyze_csv,
@@ -65,8 +59,7 @@ from app.services.strategy_service import (
     save_strategy_plan,
 )
 from app.services.content_audit_service import list_ai_reviews, scan_content
-from app.clients.ai_provider import generate_ai_content, is_stage_configured
-from app.services.article_generation_service import generate_article_pipeline
+from app.services.article_generation_service import generate_article_pipeline, generate_legacy_article_preview
 
 router = APIRouter()
 logger = structlog.get_logger(__name__)
@@ -663,63 +656,12 @@ async def brief(body: BriefBody) -> dict[str, Any]:
 
 @router.post("/workflow/prompt")
 async def prompt(body: PromptBody) -> dict[str, Any]:
-    from app.engine.locale import locale_for_project
-    from app.engine.content_plan import article_brief_template_for
-
-    project = body.project or {}
-    item = body.keyword or {}
-    brief_text = (body.briefOverride or body.brief or "").strip()
-    if not brief_text:
-        # 退化：用 build_brief 拿 brief
-        local = build_brief(item, project)
-        brief_text = (local.get("brief") or "") if isinstance(local.get("brief"), str) else ""
-    locale = locale_for_project(project)
-    return {
-        "brief": brief_text,
-        "locale": locale,
-        "articleBriefTemplate": article_brief_template_for(item, project),
-        "prompt": _compose_prompt(item, project, brief_text, locale),
-    }
-
-
-def _compose_prompt(item: dict[str, Any], project: dict[str, Any], brief_text: str, locale: dict[str, Any]) -> str:
-    store = get_store()
-    return "\n".join(
-        [
-            "你是 Google SEO 内容策略与文章写作助手。",
-            "",
-            f"主站：{project.get('domain') or ''}",
-            f"目标市场：{project.get('market') or ''}",
-            f"核心产品：{project.get('coreProducts') or ''}",
-            "",
-            "## 关键词 Brief",
-            brief_text,
-            "",
-            "## 文章 Brief 模板模块",
-            json_dumps_compact(store.get("articleBriefTemplate.modules", [])),
-            "",
-            "## 锚文本规则",
-            json_dumps_compact(store.get("anchorTextRules", {})),
-            "",
-            "## 输出格式",
-            json_dumps_compact(store.get("articleOutputFormat", {})),
-            "",
-            "## 引用",
-            json_dumps_compact(reference_plan(item)),
-            "",
-            "## Locale",
-            f"gl={locale.get('googleGl') or 'not-set'} / hl={locale.get('googleHl') or 'not-set'}",
-        ]
+    return build_prompt_preview(
+        keyword=body.keyword,
+        project=body.project,
+        brief_override=body.briefOverride,
+        brief=body.brief,
     )
-
-
-def json_dumps_compact(value: Any) -> str:
-    import json
-
-    try:
-        return json.dumps(value, ensure_ascii=False, indent=2)
-    except Exception:  # noqa: BLE001
-        return str(value)
 
 
 class MockArticleBody(BaseModel):
@@ -748,12 +690,12 @@ class ArticleTestBody(BaseModel):
     serpContext: dict[str, Any] | None = None
 
 
-@router.post("/workflow/article-generate")
+@router.post("/workflow/article-generate", deprecated=True)
 async def generate_article(body: ArticleGenerateBody, session: AsyncSession = Depends(get_db)) -> dict[str, Any]:
     raise HTTPException(status_code=409, detail="该旧接口已关闭；正式生文必须从今日计划审核执行")
 
 
-@router.post("/workflow/article-pipeline")
+@router.post("/workflow/article-pipeline", deprecated=True)
 async def article_pipeline(body: ArticleGenerateBody, session: AsyncSession = Depends(get_db)) -> dict[str, Any]:
     raise HTTPException(status_code=409, detail="该旧接口已关闭；正式生文必须从今日计划审核执行")
 
@@ -790,58 +732,11 @@ async def article_test(body: ArticleTestBody, session: AsyncSession = Depends(ge
 
 @router.post("/workflow/mock-article")
 async def mock_article(body: MockArticleBody) -> dict[str, Any]:
-    item = body.keyword or {}
-    project = body.project or {}
-    if is_stage_configured("article_generation"):
-        prompt_text = _article_prompt(item, project, body.brief or "", body.prompt or "")
-        ai = await generate_ai_content(stage="article_generation", prompt=prompt_text, project=project, keyword=item)
-        return {
-            "content": ai.get("content") or "",
-            "provider": ai.get("provider") or "",
-            "model": ai.get("model") or "",
-            "status": ai.get("status"),
-            "generated": bool(ai.get("content")),
-        }
-    asset = {"url": item.get("targetAsset"), "status": item.get("assetStatus") or "planned", "contentAction": item.get("contentAction") or "create_new_article"}
-    refs = reference_plan(item)
-    images = image_plan_for(item)
-    return {"content": _mock_md(item, asset, refs, images), "generated": False, "status": "ai-not-configured"}
-
-
-def _article_prompt(item: dict[str, Any], project: dict[str, Any], brief: str, prompt: str) -> str:
-    return "\n\n".join(
-        [
-            prompt or "Write an SEO article from the brief.",
-            "Return Markdown only.",
-            "Include: H1, intro, useful H2 sections, FAQ, meta title, meta description.",
-            f"Primary keyword: {item.get('keyword') or ''}",
-            f"Target site/role: {item.get('assignedSite') or item.get('assigned_site_label') or ''}",
-            f"Project: {json_dumps_compact(project)}",
-            f"Brief: {brief}",
-        ]
-    )
-
-
-def _mock_md(item: dict[str, Any], asset: dict[str, Any], refs: dict[str, Any], images: list[dict[str, str]]) -> str:
-    title = (item.get("keyword") or "untitled").title()
-    return "\n".join(
-        [
-            f"## Title\n\n{title}\n",
-            f"## Meta Title\n\n{title}: Practical Guide Before You Decide\n",
-            f"## Meta Description\n\nLearn about {item.get('keyword')} with a clear decision path and SEO-ready structure.\n",
-            f"## URL Slug\n\n{title.lower().replace(' ', '-')}\n",
-            f"## Primary Keyword: {item.get('keyword')}\n",
-            "## Secondary Keywords: (fill)\n",
-            "## Last Updated\n\nToday\n",
-            f"# {title}\n",
-            f"Outline by Brief template.\n",
-            *(f"- {i['name']}: {i['position']}" for i in images),
-            *(
-                [f"## References\n\n- {s['name']}: [{s['label']}]({s['url']})" for s in refs.get("sources", [])]
-                if refs.get("triggered")
-                else []
-            ),
-        ]
+    return await generate_legacy_article_preview(
+        keyword=body.keyword,
+        project=body.project,
+        brief=body.brief or "",
+        prompt=body.prompt or "",
     )
 
 

@@ -25,6 +25,72 @@ from app.services.keyword_service import build_brief
 logger = structlog.get_logger(__name__)
 
 
+def build_prompt_preview(
+    *,
+    keyword: dict[str, Any] | None = None,
+    project: dict[str, Any] | None = None,
+    brief_override: str | None = None,
+    brief: str | None = None,
+) -> dict[str, Any]:
+    """Build the legacy prompt preview behind the brief module's interface."""
+    item = keyword or {}
+    project_data = project or {}
+    brief_text = (brief_override or brief or "").strip()
+    if not brief_text:
+        local = build_brief(item, project_data)
+        brief_text = (local.get("brief") or "") if isinstance(local.get("brief"), str) else ""
+    locale = locale_for_project(project_data)
+    return {
+        "brief": brief_text,
+        "locale": locale,
+        "articleBriefTemplate": article_brief_template_for(item, project_data),
+        "prompt": _compose_prompt_preview(item, project_data, brief_text, locale),
+    }
+
+
+def _compose_prompt_preview(
+    item: dict[str, Any],
+    project: dict[str, Any],
+    brief_text: str,
+    locale: dict[str, Any],
+) -> str:
+    store = get_store()
+    return "\n".join(
+        [
+            "你是 Google SEO 内容策略与文章写作助手。",
+            "",
+            f"主站：{project.get('domain') or ''}",
+            f"目标市场：{project.get('market') or ''}",
+            f"核心产品：{project.get('coreProducts') or ''}",
+            "",
+            "## 关键词 Brief",
+            brief_text,
+            "",
+            "## 文章 Brief 模板模块",
+            _json_dumps_compact(store.get("articleBriefTemplate.modules", [])),
+            "",
+            "## 锚文本规则",
+            _json_dumps_compact(store.get("anchorTextRules", {})),
+            "",
+            "## 输出格式",
+            _json_dumps_compact(store.get("articleOutputFormat", {})),
+            "",
+            "## 引用",
+            _json_dumps_compact(reference_plan(item)),
+            "",
+            "## Locale",
+            f"gl={locale.get('googleGl') or 'not-set'} / hl={locale.get('googleHl') or 'not-set'}",
+        ]
+    )
+
+
+def _json_dumps_compact(value: Any) -> str:
+    try:
+        return json.dumps(value, ensure_ascii=False, indent=2)
+    except Exception:  # noqa: BLE001
+        return str(value)
+
+
 def _ai_meta(stage: str, ai_result: dict[str, Any]) -> dict[str, Any]:
     return {
         "stage": stage,
