@@ -12,7 +12,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.clients.image_provider import search_images
-from app.clients.publishers import connector_for_site
+from app.clients.publishers import ImageUploadRequest, connector_for_site
 from app.clients.serpapi import fetch_google_serp
 from app.core.database import get_db
 from app.services.article_service import (
@@ -435,6 +435,52 @@ async def inspect_site_connector_route(
 
 class SyncPostsBody(BaseModel):
     limit: int = 100
+
+
+class SiteImageUploadBody(BaseModel):
+    type: str
+    url: str | None = None
+    file: str | None = None
+    base64: str | None = None
+    dry_run: bool = True
+
+
+@router.post("/sites/{site_id}/images/upload")
+async def upload_site_image_route(
+    site_id: str,
+    body: SiteImageUploadBody,
+    session: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    row = await session.execute(
+        text(
+            "SELECT id, site_key, name, site_type, domain, base_url, api_base_url, status, api_config "
+            "FROM seo_agent.sites WHERE id = CAST(:id AS uuid)"
+        ),
+        {"id": site_id},
+    )
+    site = row.mappings().first()
+    if not site:
+        raise HTTPException(status_code=404, detail="site not found")
+    if site["status"] != "active":
+        raise HTTPException(status_code=400, detail="site is not active")
+
+    connector = connector_for_site(dict(site), dry_run=body.dry_run)
+    result = await connector.upload_image(ImageUploadRequest(
+        type=body.type,
+        url=body.url,
+        file=body.file,
+        base64=body.base64,
+    ))
+    if not result.ok:
+        raise HTTPException(status_code=400, detail=result.error or "image upload failed")
+    return {
+        "ok": True,
+        "dry_run": result.dry_run,
+        "site_id": site_id,
+        "image_id": result.image_id,
+        "src": result.src,
+        "raw": result.raw,
+    }
 
 
 @router.post("/sites/{site_id}/posts/sync")

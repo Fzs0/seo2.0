@@ -55,6 +55,37 @@ class PublishResult:
     raw: dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass
+class ImageUploadRequest:
+    """Unified OEMApps image upload input matching ``POST /file/upload``."""
+
+    type: str
+    url: str | None = None
+    file: str | None = None
+    base64: str | None = None
+
+    def payload(self) -> dict[str, str]:
+        upload_type = str(self.type or "").strip().casefold()
+        if upload_type not in {"url", "file", "base64"}:
+            raise ValueError("image upload type must be one of: url, file, base64")
+        value = str(getattr(self, upload_type) or "").strip()
+        if not value:
+            raise ValueError(f"image upload field '{upload_type}' is required")
+        if upload_type == "url" and not value.startswith(("http://", "https://")):
+            raise ValueError("image upload url must use http:// or https://")
+        return {"type": upload_type, upload_type: value}
+
+
+@dataclass
+class ImageUploadResult:
+    ok: bool
+    dry_run: bool
+    image_id: str | None = None
+    src: str | None = None
+    error: str | None = None
+    raw: dict[str, Any] = field(default_factory=dict)
+
+
 class PublisherBase:
     """所有 publisher 的基类。"""
 
@@ -73,6 +104,9 @@ class PublisherBase:
 
     async def sync_seo_metadata(self, post_id: str, req: PublishRequest) -> PublishResult:
         return PublishResult(ok=False, dry_run=self.dry_run, error=f"connector {self.connector_type} does not support sync_seo_metadata")
+
+    async def upload_image(self, req: ImageUploadRequest) -> ImageUploadResult:
+        return ImageUploadResult(ok=False, dry_run=self.dry_run, error=f"connector {self.connector_type} does not support upload_image")
 
     async def get_article(self, post_id: str) -> dict[str, Any] | None:
         raise ExternalCallError(f"connector {self.connector_type} does not support get_article")
@@ -283,7 +317,7 @@ class OpenAPIPublisher(PublisherBase):
     """
 
     connector_type = "custom_openapi"
-    capabilities = ("read_articles", "get_article", "find_article_by_slug", "publish_article", "update_article")
+    capabilities = ("read_articles", "get_article", "find_article_by_slug", "publish_article", "update_article", "upload_image")
 
     def _is_oemapps(self) -> bool:
         raw = str(self.site.get("api_base_url") or "").strip()
@@ -302,6 +336,48 @@ class OpenAPIPublisher(PublisherBase):
         if self._is_oemapps():
             return "/posts", "/posts"
         return str(cfg.get("articlesPath") or "/posts"), str(cfg.get("publishPath") or "/posts/batch")
+
+    async def upload_image(self, req: ImageUploadRequest) -> ImageUploadResult:
+        if not self._is_oemapps():
+            return ImageUploadResult(ok=False, dry_run=self.dry_run, error="image upload is only configured for OEMApps sites")
+        try:
+            body = req.payload()
+        except ValueError as error:
+            return ImageUploadResult(ok=False, dry_run=self.dry_run, error=str(error))
+        if self.dry_run:
+            return ImageUploadResult(ok=True, dry_run=True, raw={"endpoint": "/file/upload", "type": body["type"]})
+
+        api_base = str(self.site.get("api_base_url") or "").rstrip("/")
+        headers = self._auth_headers()
+        if not api_base or not headers:
+            return ImageUploadResult(ok=False, dry_run=False, error="OEMApps image connector missing api_base_url or site token")
+        try:
+            data = await request_json(
+                "POST",
+                _join_endpoint(api_base, "/file/upload"),
+                client_label="connector_oemapps_image_upload",
+                headers=headers,
+                json=body,
+                timeout=120,
+            )
+        except ExternalCallError as error:
+            return ImageUploadResult(ok=False, dry_run=False, error=str(error))
+
+        item = data.get("data") if isinstance(data, dict) else None
+        if data.get("code") not in (0, "0") or not isinstance(item, dict) or not item.get("src"):
+            return ImageUploadResult(
+                ok=False,
+                dry_run=False,
+                error=str(data.get("msg") or "OEMApps image upload did not return an image URL"),
+                raw=data,
+            )
+        return ImageUploadResult(
+            ok=True,
+            dry_run=False,
+            image_id=str(item.get("id")) if item.get("id") is not None else None,
+            src=str(item["src"]),
+            raw=data,
+        )
 
     async def read_articles(self, limit: int = 1) -> list[dict[str, Any]]:
         api_base = (self.site.get("api_base_url") or self.site.get("base_url") or "").rstrip("/")
@@ -1217,6 +1293,8 @@ class UnsupportedPublisher(PublisherBase):
 __all__ = [
     "PublishRequest",
     "PublishResult",
+    "ImageUploadRequest",
+    "ImageUploadResult",
     "PublisherBase",
     "OpenAPIPublisher",
     "WordPressPublisher",

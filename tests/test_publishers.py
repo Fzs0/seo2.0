@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from app.clients.publishers import OpenAPIPublisher, PublishRequest, ShopifyPublisher, WordPressPublisher, markdown_to_gutenberg, strip_markdown_frontmatter
+from app.clients.publishers import ImageUploadRequest, OpenAPIPublisher, PublishRequest, ShopifyPublisher, WordPressPublisher, markdown_to_gutenberg, strip_markdown_frontmatter
 from app.clients.http_client import ExternalCallError
 
 
@@ -262,6 +262,74 @@ async def test_oemapps_article_update_uses_site_token(monkeypatch):
     assert called['json']['handle'] == 'updated'
     assert called['json']['status'] == 1
     assert called['json']['content'] == '<h1>Updated</h1>'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(('token_key', 'token_value'), [('tokenA', 'exdivo-token'), ('tokenB', 'avinoti-token')])
+async def test_oemapps_sites_share_image_upload_adapter(monkeypatch, token_key, token_value):
+    called: dict[str, object] = {}
+
+    async def fake_request_json(method: str, url: str, **kwargs):
+        called.update(method=method, url=url, headers=kwargs.get('headers'), json=kwargs.get('json'))
+        return {'code': 0, 'msg': 'success', 'data': {'id': 16756439, 'src': 'https://imgcdn.example.com/image.png'}}
+
+    monkeypatch.setattr('app.clients.publishers.request_json', fake_request_json)
+    publisher = OpenAPIPublisher(
+        {'site_type': 'main', 'api_base_url': 'https://openapi.oemapps.com', 'api_config': {token_key: token_value}},
+        dry_run=False,
+    )
+
+    result = await publisher.upload_image(ImageUploadRequest(type='url', url='https://source.example.com/image.png'))
+
+    assert result.ok is True
+    assert result.image_id == '16756439'
+    assert result.src == 'https://imgcdn.example.com/image.png'
+    assert called == {
+        'method': 'POST',
+        'url': 'https://openapi.oemapps.com/file/upload',
+        'headers': {'token': token_value},
+        'json': {'type': 'url', 'url': 'https://source.example.com/image.png'},
+    }
+
+
+@pytest.mark.asyncio
+async def test_oemapps_image_upload_supports_base64_and_safe_dry_run(monkeypatch):
+    called = False
+
+    async def fake_request_json(*_args, **_kwargs):
+        nonlocal called
+        called = True
+        return {}
+
+    monkeypatch.setattr('app.clients.publishers.request_json', fake_request_json)
+    publisher = OpenAPIPublisher(
+        {'site_type': 'main', 'api_base_url': 'https://openapi.oemapps.com', 'api_config': {'tokenA': 'site-token'}},
+        dry_run=True,
+    )
+
+    result = await publisher.upload_image(ImageUploadRequest(type='base64', base64='data:image/png;base64,AAAA'))
+
+    assert result.ok is True
+    assert result.dry_run is True
+    assert result.raw == {'endpoint': '/file/upload', 'type': 'base64'}
+    assert called is False
+
+
+@pytest.mark.asyncio
+async def test_oemapps_image_upload_rejects_invalid_input_before_network(monkeypatch):
+    async def fail_if_called(*_args, **_kwargs):
+        raise AssertionError('network must not be called')
+
+    monkeypatch.setattr('app.clients.publishers.request_json', fail_if_called)
+    publisher = OpenAPIPublisher(
+        {'site_type': 'main', 'api_base_url': 'https://openapi.oemapps.com', 'api_config': {'tokenA': 'site-token'}},
+        dry_run=False,
+    )
+
+    result = await publisher.upload_image(ImageUploadRequest(type='url', url='file:///tmp/image.png'))
+
+    assert result.ok is False
+    assert result.error == 'image upload url must use http:// or https://'
 
 
 @pytest.mark.asyncio

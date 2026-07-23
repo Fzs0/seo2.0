@@ -37,6 +37,8 @@ migration-data/
 exports/
 # Codex runtime 工作区
 .codex/
+# Local code graph analysis output
+graphify-out/
 # 本地 agent 助手配置
 .agents/
 .pytest_cache/
