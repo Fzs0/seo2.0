@@ -17,6 +17,7 @@ const navSections: NavSection[] = [
       { id: 'keywords', label: '关键词', icon: 'key' },
       { id: 'articles', label: '文章', icon: 'article' },
       { id: 'main-site-content', label: '主站内容', icon: 'storefront' },
+      { id: 'social-publishing', label: '社媒发布', icon: 'campaign' },
       { id: 'analytics', label: '数据复盘', icon: 'monitoring' },
     ],
   },

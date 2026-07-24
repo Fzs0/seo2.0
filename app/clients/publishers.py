@@ -13,10 +13,12 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 from html import escape
 import re
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import quote, urljoin, urlsplit, urlunsplit
 
@@ -778,11 +780,175 @@ class WordPressPublisher(PublisherBase):
 _SHOPIFY_TOKEN_CACHE: dict[str, tuple[float, str, str]] = {}
 
 
+def evict_shopify_token_cache(site_id: str) -> None:
+    prefix = f"{site_id}:"
+    for key in [key for key in _SHOPIFY_TOKEN_CACHE if key.startswith(prefix)]:
+        _SHOPIFY_TOKEN_CACHE.pop(key, None)
+
+
 class ShopifyPublisher(PublisherBase):
     """Shopify Admin GraphQL connector using the client credentials grant."""
 
     connector_type = "shopify"
-    capabilities = ("read_articles", "get_article", "publish_article", "update_article", "sync_seo_metadata")
+    capabilities = (
+        "read_articles",
+        "get_article",
+        "publish_article",
+        "update_article",
+        "sync_seo_metadata",
+        "read_products",
+        "update_product_seo",
+    )
+
+    def __init__(
+        self,
+        site: dict[str, Any],
+        dry_run: bool = True,
+        *,
+        credentials: dict[str, str] | None = None,
+    ) -> None:
+        super().__init__(site, dry_run=dry_run)
+        self._credentials = {
+            key: str(value).strip()
+            for key, value in (credentials or {}).items()
+            if key in {"client_id", "client_secret"} and str(value).strip()
+        }
+
+    async def test_credentials(self) -> dict[str, Any]:
+        shop = self._shop_domain()
+        _, scopes = await self._access_token(shop, use_cache=False)
+        identity = await self._graphql(
+            """
+            query ConnectionProbe($first: Int!) {
+              shop { id name myshopifyDomain }
+              blogs(first: $first) { nodes { id handle } }
+            }
+            """,
+            {"first": 250},
+        )
+        remote_domain = str((identity.get("shop") or {}).get("myshopifyDomain") or "").casefold()
+        if remote_domain != shop.casefold():
+            raise ExternalCallError("Shopify returned a different shop identity")
+        expected_blog = str(self._config("blogHandle", "blog_handle") or "news").casefold()
+        blogs = identity.get("blogs", {}).get("nodes", [])
+        if not any(str(item.get("handle") or "").casefold() == expected_blog for item in blogs):
+            raise ExternalCallError(f"Shopify cannot find blog handle '{expected_blog}'")
+        normalized_scopes = sorted({value.strip().casefold() for value in scopes.split(",") if value.strip()})
+        return {"shop_domain": shop, "scopes": normalized_scopes, "blog_handle": expected_blog}
+
+    async def read_products(self, limit: int = 250) -> list[dict[str, Any]]:
+        """Read a bounded product snapshot without mutating the shop."""
+        remaining = min(max(int(limit), 1), 1000)
+        cursor: str | None = None
+        products: list[dict[str, Any]] = []
+        while remaining > 0:
+            first = min(remaining, 100)
+            data = await self._graphql(
+                """
+                query ProductsForSeo($first: Int!, $after: String) {
+                  products(first: $first, after: $after, sortKey: UPDATED_AT, reverse: true) {
+                    nodes {
+                      id title handle descriptionHtml status productType vendor updatedAt
+                      onlineStoreUrl
+                      seo { title description }
+                      featuredMedia {
+                        ... on MediaImage { id alt image { url } }
+                      }
+                      media(first: 50) {
+                        nodes {
+                          ... on MediaImage { id alt image { url } }
+                        }
+                      }
+                      variants(first: 100) {
+                        nodes { id title sku price compareAtPrice inventoryQuantity }
+                      }
+                    }
+                    pageInfo { hasNextPage endCursor }
+                  }
+                }
+                """,
+                {"first": first, "after": cursor},
+            )
+            connection = data.get("products") or {}
+            batch = [item for item in connection.get("nodes") or [] if isinstance(item, dict)]
+            products.extend(batch)
+            remaining -= len(batch)
+            page_info = connection.get("pageInfo") or {}
+            cursor = page_info.get("endCursor")
+            if not batch or not page_info.get("hasNextPage") or not cursor:
+                break
+        return products
+
+    async def get_product_for_seo(self, product_id: str) -> dict[str, Any] | None:
+        data = await self._graphql(
+            """
+            query ProductForSeo($id: ID!) {
+              product(id: $id) {
+                id title handle updatedAt seo { title description }
+              }
+            }
+            """,
+            {"id": product_id},
+        )
+        product = data.get("product")
+        if not isinstance(product, dict) or str(product.get("id") or "") != product_id:
+            return None
+        return product
+
+    async def update_product_seo(
+        self,
+        product_id: str,
+        *,
+        title: str,
+        description: str,
+        expected_updated_at: str,
+    ) -> dict[str, Any]:
+        """Update only ProductUpdateInput.id and .seo, with a stale-read guard."""
+        if self.dry_run:
+            raise ExternalCallError("Shopify product SEO writes require a live connector")
+        current = await self.get_product_for_seo(product_id)
+        if not current:
+            raise ExternalCallError("Shopify product not found")
+        current_version = _canonical_shopify_timestamp(current.get("updatedAt"))
+        expected_version = _canonical_shopify_timestamp(expected_updated_at)
+        if current_version != expected_version:
+            raise ExternalCallError("Shopify product changed after review; sync and review it again")
+        product_input = {
+            "id": product_id,
+            "seo": {"title": title, "description": description},
+        }
+        data = await self._graphql(
+            """
+            mutation UpdateProductSeo($product: ProductUpdateInput!) {
+              productUpdate(product: $product) {
+                product { id title handle updatedAt seo { title description } }
+                userErrors { field message }
+              }
+            }
+            """,
+            {"product": product_input},
+            max_attempts=1,
+        )
+        result = data.get("productUpdate") or {}
+        errors = result.get("userErrors") or []
+        if errors:
+            detail = "; ".join(str(error.get("message") or error) for error in errors)
+            raise ExternalCallError(f"Shopify productUpdate: {detail}")
+        updated = result.get("product")
+        if not isinstance(updated, dict) or str(updated.get("id") or "") != product_id:
+            raise ExternalCallError("Shopify did not return the updated product")
+        seo = updated.get("seo") or {}
+        if str(seo.get("title") or "") != title or str(seo.get("description") or "") != description:
+            raise ExternalCallError("Shopify product SEO verification mismatch")
+        verified = await self.get_product_for_seo(product_id)
+        verified_seo = (verified or {}).get("seo") or {}
+        if (
+            not verified
+            or str(verified_seo.get("title") or "") != title
+            or str(verified_seo.get("description") or "") != description
+        ):
+            raise ExternalCallError("Shopify product SEO readback verification mismatch")
+        return verified
 
     async def read_articles(self, limit: int = 1) -> list[dict[str, Any]]:
         first = min(max(limit, 1), 50)
@@ -967,13 +1133,13 @@ class ShopifyPublisher(PublisherBase):
 
     def connection_info(self) -> dict[str, Any]:
         shop = self._shop_domain(raise_error=False)
-        client_id = get_settings().shopify_client_id
-        client_secret = get_settings().shopify_client_secret
+        client_id = self._credentials.get("client_id", "")
+        client_secret = self._credentials.get("client_secret", "")
         api_version = self._api_version()
         endpoint = f"https://{shop}/admin/api/{api_version}/graphql.json" if shop else ""
         checks = [
             {"key": "endpoint", "label": "Shopify GraphQL 地址", "status": "ok" if endpoint else "failed", "detail": _display_url(endpoint) if endpoint else "站点 domain 必须是 *.myshopify.com"},
-            {"key": "auth", "label": "Client Credentials 配置", "status": "ok" if client_id and client_secret else "failed", "detail": "已配置 client_id/client_secret" if client_id and client_secret else "请配置 SHOPIFY_CLIENT_ID 与 SHOPIFY_CLIENT_SECRET"},
+            {"key": "auth", "label": "站点 Client Credentials", "status": "ok" if client_id and client_secret else "failed", "detail": "已加载站点加密凭据" if client_id and client_secret else "请在该站点的 Shopify 连接卡片中配置凭据"},
         ]
         return {
             "connector_type": self.connector_type,
@@ -982,7 +1148,13 @@ class ShopifyPublisher(PublisherBase):
             "checks": checks,
         }
 
-    async def _graphql(self, query: str, variables: dict[str, Any] | None = None) -> dict[str, Any]:
+    async def _graphql(
+        self,
+        query: str,
+        variables: dict[str, Any] | None = None,
+        *,
+        max_attempts: int = 3,
+    ) -> dict[str, Any]:
         shop = self._shop_domain()
         token, _ = await self._access_token(shop)
         response = await request_json(
@@ -992,6 +1164,7 @@ class ShopifyPublisher(PublisherBase):
             headers={"Content-Type": "application/json", "X-Shopify-Access-Token": token},
             json={"query": query, "variables": variables or {}},
             timeout=60,
+            max_attempts=max_attempts,
         )
         errors = response.get("errors") or []
         if errors:
@@ -999,13 +1172,22 @@ class ShopifyPublisher(PublisherBase):
             raise ExternalCallError(f"Shopify GraphQL: {detail}")
         return response.get("data") or {}
 
-    async def _access_token(self, shop: str) -> tuple[str, str]:
-        settings = get_settings()
-        client_id = settings.shopify_client_id
-        client_secret = settings.shopify_client_secret
+    async def _access_token(self, shop: str, *, use_cache: bool = True) -> tuple[str, str]:
+        client_id = self._credentials.get("client_id", "")
+        client_secret = self._credentials.get("client_secret", "")
         if not client_id or not client_secret:
-            raise ExternalCallError("Shopify 缺少 client_id/client_secret")
-        cached = _SHOPIFY_TOKEN_CACHE.get(shop)
+            raise ExternalCallError("Shopify 站点缺少加密 client_id/client_secret")
+        site_id = str(self.site.get("id") or self.site.get("site_id") or "")
+        credential_hash = hashlib.sha256(f"{client_id}\0{client_secret}".encode()).hexdigest()[:16]
+        cache_key = f"{site_id}:{shop}:{credential_hash}"
+        now = time.time()
+        for key, value in list(_SHOPIFY_TOKEN_CACHE.items()):
+            if value[0] <= now:
+                _SHOPIFY_TOKEN_CACHE.pop(key, None)
+        if len(_SHOPIFY_TOKEN_CACHE) > 256:
+            for key, _ in sorted(_SHOPIFY_TOKEN_CACHE.items(), key=lambda item: item[1][0])[:64]:
+                _SHOPIFY_TOKEN_CACHE.pop(key, None)
+        cached = _SHOPIFY_TOKEN_CACHE.get(cache_key) if use_cache else None
         if cached and cached[0] > time.time() + 60:
             return cached[1], cached[2]
         response = await request_json(
@@ -1022,7 +1204,7 @@ class ShopifyPublisher(PublisherBase):
             raise ExternalCallError("Shopify token response missing access_token")
         expires_in = max(300, int(response.get("expires_in") or 86400))
         scopes = str(response.get("scope") or "")
-        _SHOPIFY_TOKEN_CACHE[shop] = (time.time() + expires_in, token, scopes)
+        _SHOPIFY_TOKEN_CACHE[cache_key] = (time.time() + expires_in, token, scopes)
         return token, scopes
 
     def _config(self, *keys: str) -> str:
@@ -1048,6 +1230,19 @@ class ShopifyPublisher(PublisherBase):
     def _article_url(self, handle: str) -> str:
         blog_handle = self._config("blogHandle", "blog_handle") or "news"
         return f"https://{self._shop_domain()}/blogs/{blog_handle}/{handle}"
+
+
+def _canonical_shopify_timestamp(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return raw
+    if not parsed.tzinfo:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc).isoformat(timespec="microseconds")
 
 
 def markdown_to_gutenberg(source: str) -> str:
@@ -1299,6 +1494,7 @@ __all__ = [
     "OpenAPIPublisher",
     "WordPressPublisher",
     "ShopifyPublisher",
+    "evict_shopify_token_cache",
     "UnsupportedPublisher",
     "publisher_for_site",
     "connector_for_site",

@@ -1,0 +1,1 @@
+"""Standalone Exdivo social publisher."""

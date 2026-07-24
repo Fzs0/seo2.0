@@ -7,13 +7,12 @@ from typing import Any
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, SecretStr
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.clients.image_provider import search_images
 from app.clients.publishers import ImageUploadRequest, connector_for_site
-from app.clients.serpapi import fetch_google_serp
 from app.core.database import get_db
 from app.services.article_service import (
     articles_kpi,
@@ -43,7 +42,21 @@ from app.services.business_discovery_service import discover_business_from_site
 from app.services.site_index_service import scan_site_index
 from app.services.main_site_content_service import get_main_site_content_plan
 from app.services.site_config_service import sync_sites_from_config
+from app.services.shopify_connection_service import (
+    activate_shopify_connection,
+    configure_shopify_connection,
+    get_shopify_connection,
+    publisher_for_site_runtime,
+    test_shopify_connection,
+)
+from app.services.shopify_product_service import (
+    ShopifyProductError,
+    list_shopify_product_seo,
+    sync_shopify_products,
+    update_shopify_product_seo,
+)
 from app.services.site_snapshot_service import probe_apis
+from app.services.serp_snapshot_service import fetch_and_save_serp_snapshot
 
 router = APIRouter()
 logger = structlog.get_logger(__name__)
@@ -428,7 +441,12 @@ async def inspect_site_connector_route(
     site = row.mappings().first()
     if not site:
         raise HTTPException(status_code=404, detail="site not found")
-    connector = connector_for_site(dict(site), dry_run=True)
+    try:
+        connector = await publisher_for_site_runtime(
+            session, dict(site), dry_run=True, require_active=False
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
     result = await connector.check_connection()
     return {"site_id": site_id, "site_name": site["name"], **result}
 
@@ -443,6 +461,151 @@ class SiteImageUploadBody(BaseModel):
     file: str | None = None
     base64: str | None = None
     dry_run: bool = True
+
+
+class ShopifyConnectionBody(BaseModel):
+    shop_domain: str = Field(min_length=1, max_length=255)
+    blog_handle: str = Field(default="news", min_length=1, max_length=128)
+    api_version: str = Field(default="2026-07", pattern=r"^\d{4}-\d{2}$")
+    client_id: SecretStr | None = None
+    client_secret: SecretStr | None = None
+
+
+@router.get("/sites/{site_id}/shopify/connection")
+async def get_shopify_connection_route(
+    site_id: str, session: AsyncSession = Depends(get_db)
+) -> dict[str, Any]:
+    try:
+        return await get_shopify_connection(session, site_id=site_id, include_missing=True)
+    except ValueError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+
+
+@router.post("/sites/{site_id}/shopify/connection")
+async def configure_shopify_connection_route(
+    site_id: str,
+    body: ShopifyConnectionBody,
+    session: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    try:
+        return await configure_shopify_connection(
+            session,
+            site_id=site_id,
+            shop_domain=body.shop_domain,
+            blog_handle=body.blog_handle,
+            api_version=body.api_version,
+            client_id=body.client_id.get_secret_value() if body.client_id else None,
+            client_secret=body.client_secret.get_secret_value() if body.client_secret else None,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+
+
+@router.post("/sites/{site_id}/shopify/connection/test")
+async def test_shopify_connection_route(
+    site_id: str, session: AsyncSession = Depends(get_db)
+) -> dict[str, Any]:
+    try:
+        return await test_shopify_connection(session, site_id=site_id)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+
+
+@router.post("/sites/{site_id}/shopify/connection/activate")
+async def activate_shopify_connection_route(
+    site_id: str, session: AsyncSession = Depends(get_db)
+) -> dict[str, Any]:
+    try:
+        return await activate_shopify_connection(session, site_id=site_id)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+
+
+class ShopifyProductSyncBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    limit: int = Field(default=250, ge=1, le=1000)
+
+
+class ShopifyProductSeoBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    product_id: int = Field(gt=0)
+    expected_updated_at: str = Field(min_length=1, max_length=64)
+    meta_title: str = Field(min_length=1, max_length=70)
+    meta_description: str = Field(min_length=1, max_length=320)
+    dry_run: bool = True
+    confirm: bool = False
+    preview_token: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    request_id: str | None = Field(default=None, pattern=r"^[0-9a-fA-F-]{36}$")
+    actor: str = Field(default="local_user", min_length=1, max_length=128)
+
+
+def _require_local_shopify_write(request: Request) -> None:
+    origin = str(request.headers.get("origin") or "").rstrip("/")
+    if origin not in {"http://127.0.0.1:5173", "http://localhost:5173"}:
+        raise HTTPException(status_code=403, detail="Shopify writes are restricted to the local management UI")
+
+
+@router.post("/sites/{site_id}/shopify/products/sync")
+async def sync_shopify_products_route(
+    site_id: str,
+    body: ShopifyProductSyncBody,
+    request: Request,
+    session: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    _require_local_shopify_write(request)
+    try:
+        return await sync_shopify_products(session, site_id=site_id, limit=body.limit)
+    except ShopifyProductError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+
+
+@router.get("/sites/{site_id}/shopify/products/seo")
+async def list_shopify_product_seo_route(
+    site_id: str,
+    missing_only: bool = True,
+    limit: int = Query(100, ge=1, le=250),
+    offset: int = Query(0, ge=0),
+    session: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    try:
+        return await list_shopify_product_seo(
+            session,
+            site_id=site_id,
+            missing_only=missing_only,
+            limit=limit,
+            offset=offset,
+        )
+    except ShopifyProductError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+
+
+@router.post("/sites/{site_id}/shopify/products/seo")
+async def update_shopify_product_seo_route(
+    site_id: str,
+    body: ShopifyProductSeoBody,
+    request: Request,
+    session: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    _require_local_shopify_write(request)
+    if not body.dry_run and not body.confirm:
+        raise HTTPException(status_code=400, detail="confirm=true is required for a live Shopify write")
+    try:
+        return await update_shopify_product_seo(
+            session,
+            site_id=site_id,
+            product_id=body.product_id,
+            expected_updated_at=body.expected_updated_at,
+            meta_title=body.meta_title,
+            meta_description=body.meta_description,
+            actor="local_ui",
+            dry_run=body.dry_run,
+            preview_token=body.preview_token,
+            request_id=body.request_id,
+        )
+    except ShopifyProductError as error:
+        detail = str(error)
+        status_code = 409 if "changed after review" in detail else 400
+        raise HTTPException(status_code=status_code, detail=detail) from error
 
 
 @router.post("/sites/{site_id}/images/upload")
@@ -515,14 +678,22 @@ async def site_snapshot_route(body: SiteSnapshotBody) -> dict[str, Any]:
 # ---------- /api/v1/serpapi ----------
 
 class SerpApiBody(BaseModel):
-    keyword: str
+    keyword: str = Field(min_length=1)
     gl: str | None = None
     hl: str | None = None
 
 
 @router.post("/serpapi")
-async def serpapi_route(body: SerpApiBody) -> dict[str, Any]:
-    return await fetch_google_serp(body.keyword, gl=body.gl or "us", hl=body.hl or "en")
+async def serpapi_route(
+    body: SerpApiBody,
+    session: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    return await fetch_and_save_serp_snapshot(
+        session,
+        keyword=body.keyword,
+        gl=body.gl or "us",
+        hl=body.hl or "en",
+    )
 
 
 # ---------- /api/v1/images ----------

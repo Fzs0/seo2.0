@@ -1,0 +1,1 @@
+"""Owned HTTP adapters."""

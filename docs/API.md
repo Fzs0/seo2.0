@@ -146,7 +146,7 @@
 | GET | `/api/v1/products/by-external/{external_id}` | 路径：`external_id`；可选查询 `site_id` | 按外部 ID 查询；不存在返回 404。连接器数据建议传 `site_id` 消除不同来源的 ID 歧义。该路径先于 `/{product_id}` 注册。 |
 | GET | `/api/v1/products/{product_id}` | 路径：整数 `product_id` | 按内部 ID 查询；不存在返回 404。 |
 | POST | `/api/v1/site-snapshot` | `SiteSnapshotBody` | 并发探测输入的 API，返回 `{siteResults, total}`；会发起外部调用。 |
-| POST | `/api/v1/serpapi` | `SerpApiBody` | 查询 Google SERP；默认 `gl=us`、`hl=en`，需要 SerpApi 配置。 |
+| POST | `/api/v1/serpapi` | `SerpApiBody` | 查询 Google SERP；默认 `gl=us`、`hl=en`，需要 SerpApi 配置。成功请求会保存到现有 `seo_agent.serp_snapshots` 表并返回 `snapshot_id`；不创建关键词库记录。 |
 | POST | `/api/v1/images/search` | `ImageSearchBody` | 从 Pexels/Unsplash/Pixabay 等图片提供商搜索，需对应 Key。 |
 
 #### 2.8.1 自定义商品数据连接器

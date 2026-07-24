@@ -11,7 +11,8 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.clients.http_client import ExternalCallError, request_text
-from app.clients.publishers import connector_for_site
+from app.clients.publishers import PublisherBase
+from app.services.shopify_connection_service import publisher_for_site_runtime
 from app.services.post_analysis_service import persist_post_analysis
 
 
@@ -20,8 +21,11 @@ async def sync_site_posts(session: AsyncSession, *, site_id: str, limit: int = 1
     if not site:
         return {"ok": False, "error": "site not found", "fetched": 0, "saved": 0}
     try:
-        posts = await fetch_site_posts(site, limit=limit)
-    except ExternalCallError as error:
+        connector = await publisher_for_site_runtime(
+            session, site, dry_run=True, require_active=True
+        )
+        posts = await fetch_site_posts(site, limit=limit, connector=connector)
+    except (ExternalCallError, ValueError) as error:
         return {"ok": False, "site_id": site_id, "error": str(error), "fetched": 0, "saved": 0}
     saved = 0
     for post in posts:
@@ -127,8 +131,11 @@ async def list_posts(
     return {"items": [dict(r) for r in rows.mappings().all()], "total": int(total or 0), "limit": params["limit"], "offset": params["offset"]}
 
 
-async def fetch_site_posts(site: dict[str, Any], *, limit: int = 100) -> list[dict[str, Any]]:
-    connector = connector_for_site(site, dry_run=True)
+async def fetch_site_posts(
+    site: dict[str, Any], *, limit: int = 100, connector: PublisherBase | None = None
+) -> list[dict[str, Any]]:
+    if connector is None:
+        raise ValueError("fetch_site_posts requires an explicit runtime connector")
     items = await connector.read_articles(limit=limit)
     if connector.connector_type == "wordpress":
         normalizer = _normalize_wp

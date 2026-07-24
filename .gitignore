@@ -37,6 +37,7 @@ migration-data/
 exports/
 # Codex runtime 工作区
 .codex/
+.codex_tmp/
 # Local code graph analysis output
 graphify-out/
 # 本地 agent 助手配置
@@ -83,6 +84,12 @@ social-executor/node_modules/
 social-executor/artifacts/
 # This file contains placeholders only and is needed to configure the executor.
 !social-executor/.env.example
+
+# ---- Local social publishing media & machine-specific bridge config ----
+/social-video/
+/hubstudio-native-host/*.exe
+/hubstudio-native-host/com.exdivo.publisher.json
+/hubstudio-social-extension/tunnel-config.js
 
 # ---- IDE / OS ----
 .vscode/

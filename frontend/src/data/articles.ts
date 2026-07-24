@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import type { Article, Post } from '@/types/domain'
 import type { AsyncState } from '@/data/internal/asyncState'
 import { getJson, postJson } from '@/data/internal/http'
+import { decodeArticleQa, type ArticleQaAssessment } from '@/data/articleQa'
 
 export function useArticles(refreshKey = 0, siteId?: string): AsyncState<Article[]> {
   const [state, setState] = useState<AsyncState<Article[]>>({ data: null, loading: true, error: null })
@@ -189,24 +190,44 @@ export function useArticleTimeseries(
   return state
 }
 
-export function getArticleDetail(articleId: string) {
-  return getJson<{
-    id: string
-    site_id?: string | null
-    title: string
-    status: string
-    serp_snapshot_id?: string | null
-    brief_md?: string | null
-    content_md?: string | null
-    content_html?: string | null
-    article_parts?: Record<string, unknown> | null
-    qa_checklist?: Array<{ key: string; ok: boolean }> | null
-    generation_provider?: string | null
-    generation_model?: string | null
-    primary_keyword?: string | null
-    meta_title?: string | null
-    meta_description?: string | null
-  }>(`/api/v1/articles/${encodeURIComponent(articleId)}`, new AbortController().signal)
+export interface ArticleDetail {
+  id: string
+  site_id?: string | null
+  title: string
+  status: string
+  serp_snapshot_id?: string | null
+  brief_md?: string | null
+  content_md?: string | null
+  content_html?: string | null
+  article_parts?: Record<string, unknown> | null
+  generation_provider?: string | null
+  generation_model?: string | null
+  primary_keyword?: string | null
+  meta_title?: string | null
+  meta_description?: string | null
+  qa: ArticleQaAssessment
+}
+
+type RawArticleDetail = Omit<ArticleDetail, 'qa'> & {
+  qa_checklist?: unknown
+  qa_summary?: unknown
+  qa_state?: unknown
+  qa_message?: unknown
+}
+
+export async function getArticleDetail(articleId: string): Promise<ArticleDetail> {
+  const detail = await getJson<RawArticleDetail>(
+    `/api/v1/articles/${encodeURIComponent(articleId)}`,
+    new AbortController().signal,
+  )
+  return {
+    ...detail,
+    qa: decodeArticleQa(detail.qa_checklist, {
+      state: detail.qa_state,
+      summary: detail.qa_summary,
+      message: detail.qa_message,
+    }),
+  }
 }
 
 export function syncArticleSeoMetadata(articleId: string) {

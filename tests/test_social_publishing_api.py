@@ -27,6 +27,7 @@ def test_social_openapi_exposes_reviewed_queue_foundation() -> None:
     assert "/api/v1/social/publish-jobs/{job_id}/cancel" in paths
     assert "/api/v1/social/publish-jobs/{job_id}/prepare" in paths
     assert "/api/v1/social/publish-jobs/{job_id}/confirm" in paths
+    assert "/api/v1/social/publish-jobs/confirm-batch" in paths
     assert not any(path.endswith("/advance") for path in paths)
 
 
@@ -90,6 +91,19 @@ def test_platform_content_shape_is_validated() -> None:
             "reddit", "discussion_post",
             {"title": "Question", "body": "", "metadata": {"subreddit": "Vaping"}},
         )
+    media = [{"path": r"C:\videos\unique.mp4"}]
+    validate_package_payload(
+        "youtube", "video",
+        {"title": "Device care basics", "body": "A practical maintenance clip.", "media": media},
+    )
+    validate_package_payload(
+        "instagram", "reel",
+        {"title": "", "body": "A practical maintenance clip.", "media": media},
+    )
+    validate_package_payload(
+        "facebook", "video",
+        {"title": "", "body": "A practical maintenance clip.", "media": media},
+    )
 
 
 def test_binding_rejects_non_https_publish_url_before_database_access() -> None:

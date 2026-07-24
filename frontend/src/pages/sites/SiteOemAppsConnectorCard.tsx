@@ -41,7 +41,7 @@ export function SiteOemAppsConnectorCard({ site }: { site: Site }) {
   async function verifyAndActivate() {
     const trimmedToken = token.trim()
     if (!connector && !trimmedToken) {
-      window.alert('请填写 OEMApps 站点 Token。它只会加密保存到专用商品连接器，不会写入文章接口配置。')
+      window.alert('请填写 OEMApps 站点 Token。它只会加密保存到专用商品连接器，不会覆盖通用站点 API 配置。')
       return
     }
     setAction('verify')
@@ -88,7 +88,7 @@ export function SiteOemAppsConnectorCard({ site }: { site: Site }) {
         <span className={`tag tag--${tone}`}>{loading ? '读取中' : status === 'active' ? '已启用' : status}</span>
       </div>
       <div style={{ color: 'var(--ink-500)', fontSize: 11, lineHeight: 1.55, marginTop: 6 }}>
-        专供 ExDivo、Avinoti 这类 OEMApps 主站。商品 Token 与文章接口独立加密保存；验证通过后才允许同步，不会向站点写入任何内容。
+        专供 ExDivo、Avinoti 这类 OEMApps 主站。商品 Token 与通用站点 API 凭据独立加密保存；验证通过后才允许同步，不会向站点写入任何内容。
       </div>
       {!loading && (
         <>

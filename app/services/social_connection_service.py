@@ -29,7 +29,7 @@ async def create_social_connection(
     async with session.begin():
         result = await session.execute(
             text("""
-                INSERT INTO seo_agent.social_connections (business_id, platform, name, config)
+                INSERT INTO social.connections (business_id, platform, name, config)
                 VALUES (:business_id, :platform, :name, CAST(:config AS jsonb))
                 RETURNING *
             """),
@@ -39,7 +39,7 @@ async def create_social_connection(
         row = result.mappings().one()
         await session.execute(
             text("""
-                INSERT INTO seo_agent.social_connection_secrets
+                INSERT INTO social.connection_secrets
                   (connection_id, encrypted_value, secret_names)
                 VALUES (:id, :encrypted, :names)
             """),
@@ -59,8 +59,8 @@ async def list_social_connections(
     result = await session.execute(
         text(f"""
             SELECT c.*, COALESCE(s.secret_names, ARRAY[]::text[]) AS secret_names
-              FROM seo_agent.social_connections c
-              LEFT JOIN seo_agent.social_connection_secrets s ON s.connection_id = c.id
+              FROM social.connections c
+              LEFT JOIN social.connection_secrets s ON s.connection_id = c.id
              WHERE {where} ORDER BY c.created_at DESC LIMIT :limit
         """),
         params,
@@ -75,8 +75,8 @@ async def test_social_connection(
     result = await session.execute(
         text("""
             SELECT c.*, s.encrypted_value, s.secret_names
-              FROM seo_agent.social_connections c
-              JOIN seo_agent.social_connection_secrets s ON s.connection_id = c.id
+              FROM social.connections c
+              JOIN social.connection_secrets s ON s.connection_id = c.id
              WHERE c.id = CAST(:id AS uuid) AND c.business_id = :business_id
         """),
         {"id": connection_id, "business_id": business_id},
@@ -111,7 +111,7 @@ async def _record_test(
     status = "verified" if ok else "failed"
     await session.execute(
             text("""
-                UPDATE seo_agent.social_connections
+                UPDATE social.connections
                    SET status = :status, capabilities = :capabilities,
                        account_snapshot = CAST(:account AS jsonb), last_tested_at = now(), last_error = :error
                  WHERE id = :id
@@ -121,7 +121,7 @@ async def _record_test(
         )
     await session.execute(
             text("""
-                INSERT INTO seo_agent.social_connection_runs
+                INSERT INTO social.connection_runs
                   (business_id, connection_id, status, summary, error_summary)
                 VALUES (:business_id, :id, :run_status, CAST(:summary AS jsonb), :error)
             """),

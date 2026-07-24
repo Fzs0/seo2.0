@@ -1,5 +1,6 @@
 import { useState, type ReactNode } from 'react'
 import type { PipelineStep } from '@/data/articles'
+import type { ArticleQaAssessment } from '@/data/articleQa'
 import type { Site } from '@/types/domain'
 
 export type ArticleResultData = {
@@ -23,7 +24,7 @@ export type ArticleResultData = {
   contentPreview?: string
   savedTo?: { table?: string; articleId?: string }
   serp?: { id?: string | null; source?: string; status?: string }
-  qa?: Array<{ key: string; ok: boolean }>
+  qa: ArticleQaAssessment
   provider?: string
   model?: string
   contentLength?: number
@@ -118,7 +119,7 @@ export function ArticleResultDialog({
   const content = parsedContent.body || '暂无文章正文'
   const metaTitle = result.article?.meta_title || parsedContent.meta.title || result.article?.title || ''
   const metaDescription = result.article?.meta_description || parsedContent.meta.meta_description || ''
-  const passedQa = (result.qa || []).filter((item) => item.ok).length
+  const passedQa = result.qa.checks.filter((item) => item.ok).length
   const tabLabels: Array<[ResultTab, string]> = [
     ['article', '文章正文'],
     ['brief', '增强 Brief'],
@@ -155,6 +156,13 @@ export function ArticleResultDialog({
         </div>
 
         <div className="article-dialog__body">
+          {result.qa.state !== 'valid' && (
+            <div className="article-dialog__publish-message" role="status">
+              {result.qa.state === 'legacy' && '历史 QA 已兼容转换；原始汇总信息已保留。'}
+              {result.qa.state === 'missing' && '该文章未保存 QA，不能判定发布条件。'}
+              {result.qa.state === 'invalid' && `QA 数据格式异常，已阻止正式发布：${result.qa.message || '未知格式'}`}
+            </div>
+          )}
           {activeTab === 'article' && <MarkdownContent source={content} />}
           {activeTab === 'brief' && <MarkdownContent source={result.brief?.text || '暂无 Brief 内容'} />}
           {activeTab === 'outline' && <MarkdownContent source={result.outline || '暂无文章大纲'} />}
@@ -189,9 +197,9 @@ export function ArticleResultDialog({
               <InfoItem label="Brief 来源" value={result.brief?.aiEnhanced ? 'AI 增强' : '已保存 Brief'} />
               <InfoItem label="模型厂商 / 模型" value={`${result.provider || 'unknown'} / ${result.model || 'unknown'}`} />
               <InfoItem label="SERP 状态" value={`${result.serp?.source || '未使用'} · ${result.serp?.status || '未知'}`} />
-              <InfoItem label="QA 结果" value={`${passedQa}/${result.qa?.length || 0} 项通过`} />
+              <InfoItem label="QA 结果" value={`${passedQa}/${result.qa.checks.length} 项通过`} />
               <InfoItem label="文章状态" value={result.article?.status || '未知'} />
-              {(result.qa || []).map((item) => <InfoItem key={item.key} label={`QA · ${item.key}`} value={item.ok ? '通过' : '未通过'} />)}
+              {result.qa.checks.map((item) => <InfoItem key={item.key} label={`QA · ${item.key}`} value={item.ok ? '通过' : '未通过'} />)}
             </div>
           )}
         </div>

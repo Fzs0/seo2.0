@@ -371,7 +371,7 @@ export function ArticlesPage() {
         content: detail.content_md || detail.content_html || '',
         savedTo: { table: 'seo_agent.articles', articleId: detail.id },
         serp: { id: detail.serp_snapshot_id, source: detail.serp_snapshot_id ? 'saved' : undefined, status: detail.serp_snapshot_id ? 'available' : 'not-loaded' },
-        qa: detail.qa_checklist || [],
+        qa: detail.qa,
         provider: detail.generation_provider || undefined,
         model: detail.generation_model || undefined,
         contentLength: (detail.content_md || detail.content_html || '').length,

@@ -1,12 +1,14 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { Sidebar } from '@/components/Sidebar'
 import { Topbar } from '@/components/Topbar'
+import { PageErrorBoundary } from '@/components/PageErrorBoundary'
 import { KeywordsPage } from '@/pages/KeywordsPage'
 import { ContentPage } from '@/pages/ContentPage'
 import { ArticlesPage } from '@/pages/ArticlesPage'
 import { SitesPage } from '@/pages/SitesPage'
 import { AnalyticsPage } from '@/pages/AnalyticsPage'
 import { MainSiteContentPage } from '@/pages/MainSiteContentPage'
+import { SocialPublishingPage } from '@/pages/SocialPublishingPage'
 import { useAutomationStatus } from '@/data/automation'
 import { BusinessScopeProvider, useBusinessScope } from '@/businessScope'
 
@@ -17,6 +19,7 @@ type PageId =
   | 'sites'
   | 'analytics'
   | 'main-site-content'
+  | 'social-publishing'
 
 function todayLabel() {
   return new Intl.DateTimeFormat('zh-CN', {
@@ -79,6 +82,8 @@ function AppShell() {
         return <AnalyticsPage />
       case 'main-site-content':
         return <MainSiteContentPage />
+      case 'social-publishing':
+        return <SocialPublishingPage />
       default:
         return null
     }
@@ -89,7 +94,11 @@ function AppShell() {
       <Sidebar currentPage={page} onNavigate={(id) => setPage(id as PageId)} />
       <div className="app-main">
         <Topbar dateLabel={todayLabel()} notifications={notifications} businessId={businessId} businessIds={businessIds} onBusinessChange={setBusinessId} />
-        <main className="app-content">{pageNode}</main>
+        <main className="app-content">
+          <PageErrorBoundary resetKey={`${page}:${businessId}`} onLeave={() => setPage('content')}>
+            {pageNode}
+          </PageErrorBoundary>
+        </main>
       </div>
     </div>
   )

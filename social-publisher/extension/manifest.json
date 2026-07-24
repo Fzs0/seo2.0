@@ -1,0 +1,43 @@
+{
+  "manifest_version": 3,
+  "name": "Exdivo Hubstudio Publisher",
+  "version": "0.1.0",
+  "description": "Pairs a Hubstudio browser profile with the local Exdivo social publishing backend.",
+  "permissions": ["alarms", "storage", "tabs"],
+  "host_permissions": [
+    "http://127.0.0.1:8000/*",
+    "http://localhost:8000/*",
+    "https://*.trycloudflare.com/*",
+    "https://*.reddit.com/*",
+    "https://*.quora.com/*",
+    "https://x.com/*",
+    "https://twitter.com/*",
+    "https://*.youtube.com/*",
+    "https://*.tiktok.com/*",
+    "https://*.facebook.com/*",
+    "https://*.instagram.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "Exdivo Publisher",
+    "default_popup": "popup/popup.html"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://*.reddit.com/*",
+        "https://*.quora.com/*",
+        "https://x.com/*",
+        "https://twitter.com/*",
+        "https://*.youtube.com/*",
+        "https://*.tiktok.com/*",
+        "https://*.facebook.com/*",
+        "https://*.instagram.com/*"
+      ],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}

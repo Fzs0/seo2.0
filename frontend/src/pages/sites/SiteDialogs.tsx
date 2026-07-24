@@ -3,6 +3,7 @@ import type { Site, SiteKnowledgeProfile } from '@/types/domain'
 import {
   articlePathsForForm,
   isBusinessMainForm,
+  SITE_TYPE_OPTIONS,
   splitLines,
   type BusinessConfirmation,
   type BusinessDiscoveryResult,
@@ -127,9 +128,10 @@ export function BusinessOnboardingEditor({
         <p style={{ color: 'var(--ink-500)', fontSize: 12, lineHeight: 1.65, marginTop: 8 }}>先创建业务草案。产品和分类接口同步完成后，AI 会自动生成定位、受众、主题与内容安全规则；此处不会扫描 sitemap，也不会启用策略。</p>
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginTop: 14 }}>
           {field('business_name', '业务名称 *', '例如 HealthyOxy；系统会根据主站域名自动生成内部业务标识')}
-          <label style={{ display: 'grid', gap: 5, fontSize: 12 }}><span>主站类型</span><select className="input" value={form.site_type} onChange={(event) => onChange('site_type', event.target.value)}><option value="shopify">Shopify 商业主站</option><option value="main">其他商业主站</option><option value="wp">WordPress 内容站</option><option value="blog">博客站</option><option value="other">其他</option></select></label>
+          <label style={{ display: 'grid', gap: 5, fontSize: 12 }}><span>主站类型</span><select className="input" value={form.site_type} onChange={(event) => onChange('site_type', event.target.value)}>{SITE_TYPE_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label>
           <div style={{ gridColumn: '1 / -1' }}>{field('base_url', '主站网址 *', '例如 https://example.com；用于后续关联产品与分类接口')}</div>
         </div>
+        {form.site_type === 'main' && <div style={{ marginTop: 10, color: 'var(--ink-500)', fontSize: 12, lineHeight: 1.65 }}>OEMApps 站点请选择这一项。创建业务后，在站点配置中填写站点 Token；系统会使用共用的 OEMApps 接口适配器。</div>}
         <div style={{ marginTop: 14, padding: 12, border: '1px solid var(--border)', borderRadius: 10, background: 'var(--paper-100)', fontSize: 12, lineHeight: 1.65, color: 'var(--ink-500)' }}>
           <strong style={{ color: 'var(--ink-700)' }}>创建后会做什么</strong>
           <div>1. 接入并同步产品、分类和产品页数据</div>
@@ -173,7 +175,7 @@ export function SiteEditor({
         <div className="card__title"><span>编辑站点配置：{form.name}</span><button className="icon-btn" type="button" onClick={onClose}>close</button></div>
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginTop: 14 }}>
           {field('name', '站点名称')}
-          <label style={{ display: 'grid', gap: 5, fontSize: 12 }}><span>站点类型</span><select className="input" value={form.site_type} onChange={(event) => onChange('site_type', event.target.value)}>{isBusinessMainForm(form) && <><option value="main">商业主站</option><option value="shopify">Shopify 商业主站</option></>}<option value="blog">博客</option><option value="wp">WordPress</option><option value="other">其他</option></select></label>
+          <label style={{ display: 'grid', gap: 5, fontSize: 12 }}><span>站点类型</span><select className="input" value={form.site_type} onChange={(event) => onChange('site_type', event.target.value)}>{SITE_TYPE_OPTIONS.filter((option) => isBusinessMainForm(form) || !['main', 'shopify'].includes(option.value)).map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label>
           {field('base_url', '公开站点网址')}
           <div style={{ display: 'grid', gap: 5, fontSize: 12 }}><span>所属业务</span><div className="input" style={{ display: 'flex', alignItems: 'center', color: 'var(--ink-500)' }}>{form.business_id || '未选择业务'}</div></div>
           <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12 }}>
@@ -181,14 +183,14 @@ export function SiteEditor({
             <span>参与所属业务的策略扫描与规划</span>
           </label>
         </div>
-        <div style={{ marginTop: 18, fontWeight: 700, fontSize: 13 }}>文章连接</div>
+        <div style={{ marginTop: 18, fontWeight: 700, fontSize: 13 }}>站点 API 连接</div>
         {isShopify ? (
-          <div style={{ marginTop: 6, color: 'var(--ink-500)', fontSize: 12 }}>Shopify 由已安装的应用授权连接；无需在这里填写文章接口地址或 Token。</div>
+          <div style={{ marginTop: 6, color: 'var(--ink-500)', fontSize: 12 }}>Shopify 由已安装的应用授权连接；无需在这里填写 API 基础地址或 Token。</div>
         ) : (
           <>
-            <div style={{ marginTop: 6, color: 'var(--ink-500)', fontSize: 12 }}>已保存的密钥不会回显；留空表示保留原配置，填写新值后替换。</div>
+            <div style={{ marginTop: 6, color: 'var(--ink-500)', fontSize: 12 }}>此连接用于站点支持的文章、商品、分类、首页 SEO、图片等操作；实际能力由所选适配器决定。已保存的密钥不会回显，留空表示保留原配置。</div>
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginTop: 10 }}>
-              {isWordPress ? <>{field('username', 'WordPress 用户名')}{field('applicationPassword', 'Application Password', 'password')}</> : <>{field('api_base_url', '文章接口地址')}{field('tokenA', '站点 Token', 'password')}</>}
+              {isWordPress ? <>{field('username', 'WordPress 用户名')}{field('applicationPassword', 'Application Password', 'password')}</> : <>{field('api_base_url', 'API 基础地址')}{field('tokenA', '站点 Token', 'password')}</>}
             </div>
             {articlePaths.isPreset && <div style={{ marginTop: 8, color: 'var(--ink-500)', fontSize: 12 }}>已识别为 OEMApps：文章读取和发布均使用 <code>/posts</code>，仅 Token 因站点而异，无需手填路径。</div>}
           </>

@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Exdivo Publisher</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <main>
+    <h1>Exdivo Publisher</h1>
+    <p id="identity">尚未配对</p>
+    <form id="pair-form">
+      <label for="pairing-code">配对码</label>
+      <input id="pairing-code" maxlength="9" placeholder="ABCD-2345" autocomplete="off">
+      <button type="submit">连接当前环境</button>
+    </form>
+    <label class="toggle">
+      <input id="polling" type="checkbox">
+      自动领取已分配任务
+    </label>
+    <p id="task"></p>
+    <p id="message" role="status"></p>
+  </main>
+  <script src="popup.js"></script>
+</body>
+</html>

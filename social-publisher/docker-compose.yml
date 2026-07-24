@@ -1,0 +1,21 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: publisher
+      POSTGRES_PASSWORD: publisher
+      POSTGRES_DB: social_publisher
+    ports:
+      - "127.0.0.1:55432:5432"
+    volumes:
+      - social-publisher-postgres:/var/lib/postgresql/data
+      - ./database/schema.sql:/docker-entrypoint-initdb.d/001-schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U publisher -d social_publisher"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+volumes:
+  social-publisher-postgres:

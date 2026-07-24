@@ -46,6 +46,120 @@ export function upsertSite(payload: Record<string, unknown>) {
   return postJson<Site>('/api/v1/sites', payload)
 }
 
+export interface ShopifyConnection {
+  site_id: string
+  shop_domain?: string
+  blog_handle?: string
+  api_version?: string
+  status: 'not_configured' | 'draft' | 'verified' | 'active' | 'failed' | 'disabled'
+  scopes?: string[]
+  configured_secret_names: string[]
+  last_tested_at?: string | null
+  last_error?: string | null
+}
+
+export function getShopifyConnection(siteId: string, signal: AbortSignal) {
+  return getJson<ShopifyConnection>(
+    `/api/v1/sites/${encodeURIComponent(siteId)}/shopify/connection`,
+    signal,
+  )
+}
+
+export function configureShopifyConnection(siteId: string, payload: {
+  shop_domain: string
+  blog_handle: string
+  api_version: string
+  client_id?: string
+  client_secret?: string
+}) {
+  return postJson<ShopifyConnection>(
+    `/api/v1/sites/${encodeURIComponent(siteId)}/shopify/connection`,
+    payload,
+  )
+}
+
+export function testShopifyConnection(siteId: string) {
+  return postJson<{ ok: boolean; status: string; scopes?: string[]; error?: string }>(
+    `/api/v1/sites/${encodeURIComponent(siteId)}/shopify/connection/test`,
+    {},
+  )
+}
+
+export function activateShopifyConnection(siteId: string) {
+  return postJson<ShopifyConnection>(
+    `/api/v1/sites/${encodeURIComponent(siteId)}/shopify/connection/activate`,
+    {},
+  )
+}
+
+export interface ShopifyProductSeoItem {
+  id: number
+  external_id: string
+  title: string
+  handle: string
+  url?: string
+  status: string
+  meta_title?: string
+  meta_description?: string
+  source_updated_at: string
+  seo_audit?: {
+    missing_meta_title?: boolean
+    missing_meta_description?: boolean
+    images_missing_alt?: number
+  }
+}
+
+export function syncShopifyProducts(siteId: string, limit = 250) {
+  return postJson<{ ok: boolean; received: number; upserted: number; missing_seo: number }>(
+    `/api/v1/sites/${encodeURIComponent(siteId)}/shopify/products/sync`,
+    { limit },
+  )
+}
+
+export function getShopifyProductSeo(siteId: string, missingOnly: boolean, signal: AbortSignal) {
+  return getJson<{ items: ShopifyProductSeoItem[]; total: number }>(
+    `/api/v1/sites/${encodeURIComponent(siteId)}/shopify/products/seo?missing_only=${missingOnly ? 'true' : 'false'}&limit=100`,
+    signal,
+  )
+}
+
+export function previewShopifyProductSeo(siteId: string, payload: {
+  product_id: number
+  expected_updated_at: string
+  meta_title: string
+  meta_description: string
+}) {
+  return postJson<{
+    ok: boolean
+    dry_run: true
+    preview_token: string
+    before: { meta_title: string; meta_description: string }
+    after: { meta_title: string; meta_description: string }
+  }>(`/api/v1/sites/${encodeURIComponent(siteId)}/shopify/products/seo`, {
+    ...payload,
+    dry_run: true,
+    confirm: false,
+    actor: 'local_ui',
+  })
+}
+
+export async function executeShopifyProductSeo(siteId: string, payload: {
+  product_id: number
+  expected_updated_at: string
+  meta_title: string
+  meta_description: string
+  preview_token: string
+  request_id: string
+}) {
+  const response = await fetch(`${API_BASE}/api/v1/sites/${encodeURIComponent(siteId)}/shopify/products/seo`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ...payload, dry_run: false, confirm: true, actor: 'local_ui' }),
+  })
+  if (!response.ok) throw new Error((await response.text()) || `${response.status} ${response.statusText}`)
+  return response.json() as Promise<{ ok: boolean; dry_run: false; after: { meta_title: string; meta_description: string; source_updated_at: string } }>
+}
+
 export function generateSiteKnowledge(siteId: string) {
   return postJson<{
     site_id: string

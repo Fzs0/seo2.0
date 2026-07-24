@@ -7,6 +7,8 @@ from typing import Any
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.services.article_qa import assess_article_qa
+
 
 async def save_article(session: AsyncSession, payload: dict[str, Any]) -> dict[str, Any]:
     """插入或更新一篇文章；按 task_id 或 (site_id, external_id) 判重。"""
@@ -15,6 +17,10 @@ async def save_article(session: AsyncSession, payload: dict[str, Any]) -> dict[s
     external_id = payload.get("external_id") or payload.get("externalId")
     keyword_id = payload.get("keyword_id") or payload.get("keywordId")
     serp_snapshot_id = payload.get("serp_snapshot_id") or payload.get("serpSnapshotId")
+    raw_qa = payload.get("qa_checklist") if "qa_checklist" in payload else payload.get("qaChecklist")
+    raw_qa_summary = payload.get("qa_summary") if "qa_summary" in payload else payload.get("qaSummary")
+    qa = assess_article_qa(raw_qa, raw_qa_summary)
+    qa.require_storable()
 
     sql = text(
         """
@@ -22,7 +28,7 @@ async def save_article(session: AsyncSession, payload: dict[str, Any]) -> dict[s
           (task_id, site_id, keyword_id, serp_snapshot_id, title, slug, target_url,
            status, language_code, market, brief_md, prompt_text, content_md, content_html,
            article_parts, meta_title, meta_description, primary_keyword, secondary_keywords,
-           internal_link_plan, image_plan, references_plan, qa_checklist,
+           internal_link_plan, image_plan, references_plan, qa_checklist, qa_summary,
            generation_provider, generation_model, raw_ai_response)
         VALUES
           (CAST(:task_id AS uuid), CAST(:site_id AS uuid), CAST(:keyword_id AS uuid),
@@ -33,7 +39,7 @@ async def save_article(session: AsyncSession, payload: dict[str, Any]) -> dict[s
            CAST(:article_parts AS jsonb), :meta_title, :meta_description,
            :primary_keyword, CAST(:secondary_keywords AS text[]),
            CAST(:internal_link_plan AS jsonb), CAST(:image_plan AS jsonb),
-           CAST(:references_plan AS jsonb), CAST(:qa_checklist AS jsonb),
+           CAST(:references_plan AS jsonb), CAST(:qa_checklist AS jsonb), CAST(:qa_summary AS jsonb),
            :generation_provider, :generation_model, CAST(:raw_ai_response AS jsonb))
         ON CONFLICT (task_id) WHERE task_id IS NOT NULL
         DO UPDATE SET
@@ -50,6 +56,7 @@ async def save_article(session: AsyncSession, payload: dict[str, Any]) -> dict[s
           image_plan = EXCLUDED.image_plan,
           references_plan = EXCLUDED.references_plan,
           qa_checklist = EXCLUDED.qa_checklist,
+          qa_summary = EXCLUDED.qa_summary,
           generation_provider = EXCLUDED.generation_provider,
           generation_model = EXCLUDED.generation_model,
           raw_ai_response = EXCLUDED.raw_ai_response,
@@ -68,7 +75,7 @@ async def save_article(session: AsyncSession, payload: dict[str, Any]) -> dict[s
           (task_id, site_id, keyword_id, serp_snapshot_id, title, slug, target_url,
            status, language_code, market, brief_md, prompt_text, content_md, content_html,
            article_parts, meta_title, meta_description, primary_keyword, secondary_keywords,
-           internal_link_plan, image_plan, references_plan, qa_checklist,
+           internal_link_plan, image_plan, references_plan, qa_checklist, qa_summary,
            generation_provider, generation_model, raw_ai_response)
         VALUES
           (CAST(:task_id AS uuid), CAST(:site_id AS uuid), CAST(:keyword_id AS uuid),
@@ -79,7 +86,7 @@ async def save_article(session: AsyncSession, payload: dict[str, Any]) -> dict[s
            CAST(:article_parts AS jsonb), :meta_title, :meta_description,
            :primary_keyword, CAST(:secondary_keywords AS text[]),
            CAST(:internal_link_plan AS jsonb), CAST(:image_plan AS jsonb),
-           CAST(:references_plan AS jsonb), CAST(:qa_checklist AS jsonb),
+           CAST(:references_plan AS jsonb), CAST(:qa_checklist AS jsonb), CAST(:qa_summary AS jsonb),
            :generation_provider, :generation_model, CAST(:raw_ai_response AS jsonb))
         ON CONFLICT DO NOTHING
         RETURNING id, site_id, title, slug, status, language_code, market,
@@ -109,7 +116,8 @@ async def save_article(session: AsyncSession, payload: dict[str, Any]) -> dict[s
         "internal_link_plan": _to_json(payload.get("internal_link_plan") or payload.get("internalLinkPlan") or []),
         "image_plan": _to_json(payload.get("image_plan") or payload.get("imagePlan") or []),
         "references_plan": _to_json(payload.get("references_plan") or payload.get("referencesPlan") or []),
-        "qa_checklist": _to_json(payload.get("qa_checklist") or payload.get("qaChecklist") or []),
+        "qa_checklist": _to_json(list(qa.checks)),
+        "qa_summary": _to_json(qa.summary),
         "generation_provider": payload.get("generation_provider") or payload.get("generationProvider"),
         "generation_model": payload.get("generation_model") or payload.get("generationModel"),
         "raw_ai_response": _to_json(payload.get("raw_ai_response") or payload.get("rawAiResponse") or {}),
@@ -536,7 +544,7 @@ async def get_article(session: AsyncSession, article_id: str) -> dict[str, Any] 
             "SELECT id, task_id, site_id, keyword_id, serp_snapshot_id, title, slug, target_url, "
             "status, language_code, market, brief_md, prompt_text, content_md, content_html, "
             "article_parts, meta_title, meta_description, primary_keyword, secondary_keywords, "
-            "internal_link_plan, image_plan, references_plan, qa_checklist, "
+            "internal_link_plan, image_plan, references_plan, qa_checklist, qa_summary, "
             "generation_provider, generation_model, published_url, published_at, "
             "created_at, updated_at "
             "FROM seo_agent.articles WHERE id = :id"
@@ -548,13 +556,19 @@ async def get_article(session: AsyncSession, article_id: str) -> dict[str, Any] 
         return None
     d = dict(row)
     # jsonb 字段直接转 Python 对象
-    for k in ("article_parts", "internal_link_plan", "image_plan", "references_plan", "qa_checklist"):
+    for k in ("article_parts", "internal_link_plan", "image_plan", "references_plan", "qa_checklist", "qa_summary"):
         v = d.get(k)
         if isinstance(v, str):
             try:
                 d[k] = json.loads(v)
             except (ValueError, TypeError):
                 pass
+    qa = assess_article_qa(d.get("qa_checklist"), d.get("qa_summary"))
+    d["qa_checklist"] = list(qa.checks)
+    d["qa_summary"] = qa.summary
+    d["qa_state"] = qa.state.value
+    d["qa_passed"] = qa.passed
+    d["qa_message"] = qa.message
     return d
 
 

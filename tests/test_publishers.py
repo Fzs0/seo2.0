@@ -539,7 +539,7 @@ async def test_shopify_publisher_updates_and_reads_an_existing_article(monkeypat
         return {'data': {'article': {'id': 'gid://shopify/Article/1', 'title': 'Updated', 'handle': 'hello', 'isPublished': True}}}
 
     monkeypatch.setattr('app.clients.publishers.request_json', fake_request_json)
-    publisher = ShopifyPublisher({'domain': 'example.myshopify.com', 'api_config': {'connector_type': 'shopify', 'blogHandle': 'news'}}, dry_run=False)
+    publisher = ShopifyPublisher({'id': 'site-1', 'domain': 'example.myshopify.com', 'api_config': {'connector_type': 'shopify', 'blogHandle': 'news'}}, dry_run=False, credentials={'client_id': 'client-id', 'client_secret': 'client-secret'})
 
     result = await publisher.update('gid://shopify/Article/1', PublishRequest(
         title='Updated',
@@ -578,7 +578,7 @@ async def test_shopify_publisher_syncs_only_seo_metafields(monkeypatch):
         return {'data': {'articleUpdate': {'article': {'id': 'gid://shopify/Article/1', 'title': 'Hello', 'handle': 'hello'}, 'userErrors': []}}}
 
     monkeypatch.setattr('app.clients.publishers.request_json', fake_request_json)
-    publisher = ShopifyPublisher({'domain': 'example.myshopify.com', 'api_config': {'connector_type': 'shopify', 'blogHandle': 'news'}}, dry_run=False)
+    publisher = ShopifyPublisher({'id': 'site-1', 'domain': 'example.myshopify.com', 'api_config': {'connector_type': 'shopify', 'blogHandle': 'news'}}, dry_run=False, credentials={'client_id': 'client-id', 'client_secret': 'client-secret'})
 
     result = await publisher.sync_seo_metadata('gid://shopify/Article/1', PublishRequest(
         title='Hello', slug='hello', content_md='# This must not be sent', meta_title='Search title', meta_description='Search description', status='publish',
@@ -613,7 +613,7 @@ async def test_shopify_publisher_uses_client_credentials_and_publishes(monkeypat
         return {'data': {'articleCreate': {'article': {'id': 'gid://shopify/Article/1', 'handle': 'hello'}, 'userErrors': []}}}
 
     monkeypatch.setattr('app.clients.publishers.request_json', fake_request_json)
-    publisher = ShopifyPublisher({'domain': 'example.myshopify.com', 'api_config': {'connector_type': 'shopify', 'blogId': 'gid://shopify/Blog/1'}}, dry_run=False)
+    publisher = ShopifyPublisher({'id': 'site-1', 'domain': 'example.myshopify.com', 'api_config': {'connector_type': 'shopify', 'blogId': 'gid://shopify/Blog/1'}}, dry_run=False, credentials={'client_id': 'client-id', 'client_secret': 'client-secret'})
 
     result = await publisher.publish(PublishRequest(
         title='Hello',
@@ -659,13 +659,167 @@ async def test_shopify_publisher_resolves_the_configured_blog_handle_before_crea
         return {'data': {'articleCreate': {'article': {'id': 'gid://shopify/Article/1', 'handle': 'hello'}, 'userErrors': []}}}
 
     monkeypatch.setattr('app.clients.publishers.request_json', fake_request_json)
-    publisher = ShopifyPublisher({'domain': 'example.myshopify.com', 'api_config': {'connector_type': 'shopify', 'blogHandle': 'guides'}}, dry_run=False)
+    publisher = ShopifyPublisher({'id': 'site-1', 'domain': 'example.myshopify.com', 'api_config': {'connector_type': 'shopify', 'blogHandle': 'guides'}}, dry_run=False, credentials={'client_id': 'client-id', 'client_secret': 'client-secret'})
 
     result = await publisher.publish(PublishRequest(title='Hello', slug='hello', content_md='Body', status='publish'))
 
     assert result.ok is True
     assert 'query Blogs' in called[1][2]['json']['query']
     assert called[2][2]['json']['variables']['article']['blogId'] == 'gid://shopify/Blog/9'
+
+
+@pytest.mark.asyncio
+async def test_shopify_tokens_are_isolated_by_site_and_credentials(monkeypatch):
+    calls: list[tuple[str, str]] = []
+    monkeypatch.setattr('app.clients.publishers._SHOPIFY_TOKEN_CACHE', {})
+
+    async def fake_request_json(method: str, url: str, **kwargs):
+        client_id = kwargs['data']['client_id']
+        calls.append((url, client_id))
+        return {'access_token': f'token-{client_id}', 'expires_in': 3600, 'scope': 'read_content,write_content'}
+
+    monkeypatch.setattr('app.clients.publishers.request_json', fake_request_json)
+    first = ShopifyPublisher(
+        {'id': 'site-a', 'domain': 'first.myshopify.com'},
+        dry_run=False,
+        credentials={'client_id': 'client-a', 'client_secret': 'secret-a'},
+    )
+    second = ShopifyPublisher(
+        {'id': 'site-b', 'domain': 'second.myshopify.com'},
+        dry_run=False,
+        credentials={'client_id': 'client-b', 'client_secret': 'secret-b'},
+    )
+
+    assert (await first._access_token('first.myshopify.com'))[0] == 'token-client-a'
+    assert (await second._access_token('second.myshopify.com'))[0] == 'token-client-b'
+    assert (await first._access_token('first.myshopify.com'))[0] == 'token-client-a'
+    assert calls == [
+        ('https://first.myshopify.com/admin/oauth/access_token', 'client-a'),
+        ('https://second.myshopify.com/admin/oauth/access_token', 'client-b'),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_shopify_credential_rotation_cannot_reuse_old_token(monkeypatch):
+    calls: list[str] = []
+    monkeypatch.setattr('app.clients.publishers._SHOPIFY_TOKEN_CACHE', {})
+
+    async def fake_request_json(method: str, url: str, **kwargs):
+        client_id = kwargs['data']['client_id']
+        calls.append(client_id)
+        return {'access_token': f'token-{client_id}', 'expires_in': 3600, 'scope': 'read_content,write_content'}
+
+    monkeypatch.setattr('app.clients.publishers.request_json', fake_request_json)
+    old = ShopifyPublisher(
+        {'id': 'site-a', 'domain': 'first.myshopify.com'},
+        dry_run=False,
+        credentials={'client_id': 'old-client', 'client_secret': 'old-secret'},
+    )
+    rotated = ShopifyPublisher(
+        {'id': 'site-a', 'domain': 'first.myshopify.com'},
+        dry_run=False,
+        credentials={'client_id': 'new-client', 'client_secret': 'new-secret'},
+    )
+
+    assert (await old._access_token('first.myshopify.com'))[0] == 'token-old-client'
+    assert (await rotated._access_token('first.myshopify.com'))[0] == 'token-new-client'
+    assert calls == ['old-client', 'new-client']
+
+
+@pytest.mark.asyncio
+async def test_shopify_product_seo_mutation_is_strictly_allowlisted_and_not_retried(monkeypatch):
+    calls: list[dict] = []
+    monkeypatch.setattr('app.clients.publishers._SHOPIFY_TOKEN_CACHE', {})
+
+    async def fake_request_json(method: str, url: str, **kwargs):
+        if url.endswith('/admin/oauth/access_token'):
+            return {'access_token': 'token', 'expires_in': 3600, 'scope': 'write_products'}
+        calls.append(kwargs)
+        query = kwargs['json']['query']
+        if 'query ProductForSeo' in query:
+            if sum('query ProductForSeo' in call['json']['query'] for call in calls) > 1:
+                return {'data': {'product': {
+                    'id': 'gid://shopify/Product/123',
+                    'title': 'Dress',
+                    'handle': 'dress',
+                    'updatedAt': '2026-07-24T00:01:00Z',
+                    'seo': {'title': 'SEO Dress', 'description': 'SEO description'},
+                }}}
+            return {'data': {'product': {
+                'id': 'gid://shopify/Product/123',
+                'title': 'Dress',
+                'handle': 'dress',
+                'updatedAt': '2026-07-24T00:00:00.000Z',
+                'seo': {'title': '', 'description': ''},
+            }}}
+        return {'data': {'productUpdate': {'product': {
+            'id': 'gid://shopify/Product/123',
+            'title': 'Dress',
+            'handle': 'dress',
+            'updatedAt': '2026-07-24T00:01:00Z',
+            'seo': {'title': 'SEO Dress', 'description': 'SEO description'},
+        }, 'userErrors': []}}}
+
+    monkeypatch.setattr('app.clients.publishers.request_json', fake_request_json)
+    publisher = ShopifyPublisher(
+        {'id': 'site-a', 'domain': 'shop.myshopify.com'},
+        dry_run=False,
+        credentials={'client_id': 'client', 'client_secret': 'secret'},
+    )
+
+    updated = await publisher.update_product_seo(
+        'gid://shopify/Product/123',
+        title='SEO Dress',
+        description='SEO description',
+        expected_updated_at='2026-07-24T00:00:00+00:00',
+    )
+
+    mutation = calls[1]
+    assert mutation['json']['variables'] == {
+        'product': {
+            'id': 'gid://shopify/Product/123',
+            'seo': {'title': 'SEO Dress', 'description': 'SEO description'},
+        }
+    }
+    assert mutation['max_attempts'] == 1
+    assert len(calls) == 3
+    forbidden = {'variants', 'price', 'compareAtPrice', 'inventoryQuantity', 'sku', 'handle', 'status', 'descriptionHtml'}
+    assert not (forbidden & set(mutation['json']['variables']['product']))
+    assert updated['seo']['title'] == 'SEO Dress'
+
+
+@pytest.mark.asyncio
+async def test_shopify_product_seo_rejects_stale_snapshot_before_mutation(monkeypatch):
+    queries: list[str] = []
+    monkeypatch.setattr('app.clients.publishers._SHOPIFY_TOKEN_CACHE', {})
+
+    async def fake_request_json(method: str, url: str, **kwargs):
+        if url.endswith('/admin/oauth/access_token'):
+            return {'access_token': 'token', 'expires_in': 3600, 'scope': 'write_products'}
+        queries.append(kwargs['json']['query'])
+        return {'data': {'product': {
+            'id': 'gid://shopify/Product/123',
+            'updatedAt': '2026-07-24T00:02:00Z',
+            'seo': {'title': 'Changed elsewhere', 'description': ''},
+        }}}
+
+    monkeypatch.setattr('app.clients.publishers.request_json', fake_request_json)
+    publisher = ShopifyPublisher(
+        {'id': 'site-a', 'domain': 'shop.myshopify.com'},
+        dry_run=False,
+        credentials={'client_id': 'client', 'client_secret': 'secret'},
+    )
+
+    with pytest.raises(ExternalCallError, match='changed after review'):
+        await publisher.update_product_seo(
+            'gid://shopify/Product/123',
+            title='SEO Dress',
+            description='SEO description',
+            expected_updated_at='2026-07-24T00:00:00Z',
+        )
+
+    assert len(queries) == 1
+    assert 'mutation UpdateProductSeo' not in queries[0]
 
 
 def test_shopify_connector_is_selected_for_shopify_site():

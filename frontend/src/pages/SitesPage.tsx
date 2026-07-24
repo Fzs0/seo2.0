@@ -23,6 +23,8 @@ import {
 } from './sites/SiteDialogs'
 import { SiteIndexScanCard, SiteKnowledgeCard } from './sites/SiteKnowledgePanels'
 import { SiteOemAppsConnectorCard } from './sites/SiteOemAppsConnectorCard'
+import { SiteShopifyConnectorCard } from './sites/SiteShopifyConnectorCard'
+import { SiteShopifyProductSeoCard } from './sites/SiteShopifyProductSeoCard'
 import {
   PRIORITY_META,
   TYPE_LABEL,
@@ -600,6 +602,8 @@ export function SitesPage() {
                       </div>
                     )}
                     {isBusinessMain(s) && isOemAppsUrl(s.api_base_url || '') && <SiteOemAppsConnectorCard site={s} />}
+                    {isBusinessMain(s) && ['shopify', 'shopify_admin'].includes(s.site_type) && <SiteShopifyConnectorCard site={s} />}
+                    {isBusinessMain(s) && ['shopify', 'shopify_admin'].includes(s.site_type) && <SiteShopifyProductSeoCard site={s} />}
                     {isBusinessMain(s) && (
                       <SiteIndexScanCard
                         profile={s.knowledge_profile}

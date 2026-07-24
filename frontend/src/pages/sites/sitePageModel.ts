@@ -14,6 +14,14 @@ export const TYPE_TONE: Record<string, 'gold' | 'blue' | 'violet'> = {
   wp: 'violet',
 }
 
+export const SITE_TYPE_OPTIONS = [
+  { value: 'main', label: '商业主站（OEMApps / 自建站）' },
+  { value: 'shopify', label: 'Shopify 商业主站' },
+  { value: 'wp', label: 'WordPress 内容站' },
+  { value: 'blog', label: '博客站' },
+  { value: 'other', label: '其他' },
+] as const
+
 export const PRIORITY_META: Record<string, { label: string; tone: 'gold' | 'pink' | 'blue' | 'green'; width: number; fill: string }> = {
   commercial: { label: '高', tone: 'gold', width: 85, fill: '#c9a03c' },
   educational: { label: '中高', tone: 'pink', width: 70, fill: '#d77e6c' },
@@ -121,7 +129,7 @@ export type BusinessOnboardingForm = {
 
 export function blankBusinessOnboarding(): BusinessOnboardingForm {
   return {
-    business_name: '', site_type: 'shopify', base_url: '',
+    business_name: '', site_type: 'main', base_url: '',
   }
 }
 

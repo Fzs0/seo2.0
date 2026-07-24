@@ -11,7 +11,9 @@ from urllib.parse import unquote, urlsplit
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.clients.publishers import PublishRequest, PublishResult, publisher_for_site
+from app.clients.publishers import PublishRequest, PublishResult
+from app.services.shopify_connection_service import publisher_for_site_runtime
+from app.services.article_qa import assess_article_qa
 
 
 class PublishError(Exception):
@@ -29,7 +31,7 @@ async def publish_article(
 ) -> dict[str, Any]:
     article_sql = (
         "SELECT id, task_id, site_id, title, slug, target_url, status, content_md, meta_title, meta_description, "
-        "primary_keyword, language_code, market, qa_checklist, published_post_id, published_url, published_at "
+        "primary_keyword, language_code, market, qa_checklist, qa_summary, published_post_id, published_url, published_at "
         "FROM seo_agent.articles WHERE id = CAST(:id AS uuid)"
         + (" FOR UPDATE" if not dry_run else "")
     )
@@ -38,9 +40,14 @@ async def publish_article(
         raise PublishError(f"article id={article_id} not found")
     if not a["content_md"]:
         raise PublishError(f"article id={article_id} has empty content_md")
-    failed_qa = [check.get("key") for check in a["qa_checklist"] or [] if not check.get("ok")]
-    if not a["qa_checklist"] or failed_qa:
-        raise PublishError(f"article id={article_id} QA not passed: {', '.join(str(key) for key in failed_qa) or 'missing checklist'}")
+    qa = assess_article_qa(a["qa_checklist"], a.get("qa_summary"))
+    if not qa.passed:
+        if qa.state.value == "invalid":
+            raise PublishError(f"article id={article_id} QA 数据格式异常: {qa.message}")
+        failed = ", ".join(qa.failed_keys)
+        raise PublishError(
+            f"article id={article_id} QA not passed: {failed or qa.message or 'missing checklist'}"
+        )
 
     target_site_id = site_id or a["site_id"]
     if not target_site_id:
@@ -58,7 +65,7 @@ async def publish_article(
         raise PublishError(f"site id={target_site_id} not found")
     if s["status"] != "active":
         raise PublishError(f"site id={target_site_id} is not active (status={s['status']})")
-    if not dry_run and not s["api_config"]:
+    if not dry_run and not s["api_config"] and str(s["site_type"]).casefold() not in {"shopify", "shopify_admin"}:
         raise PublishError(f"site id={target_site_id} has empty api_config")
     article_language = _locale_token(a["language_code"])
     site_language = _locale_token(s["language_code"])
@@ -79,7 +86,9 @@ async def publish_article(
         excerpt=a["meta_description"] or "",
         primary_keyword=a["primary_keyword"] or "",
     )
-    publisher = publisher_for_site(dict(s), dry_run=dry_run)
+    publisher = await publisher_for_site_runtime(
+        session, dict(s), dry_run=dry_run, require_active=not dry_run
+    )
 
     if dry_run:
         result = await (publisher.update(update_post_id, req) if update_post_id else publisher.publish(req))
@@ -249,7 +258,7 @@ async def sync_article_seo_metadata(
         meta_description=article["meta_description"] or "",
         status="publish",
     )
-    publisher = publisher_for_site(dict(site), dry_run=False)
+    publisher = await publisher_for_site_runtime(session, dict(site), dry_run=False)
     try:
         result = await publisher.sync_seo_metadata(str(article["published_post_id"]), req)
     except Exception as error:  # noqa: BLE001 - remote failures need an audit task

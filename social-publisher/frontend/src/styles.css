@@ -1,0 +1,205 @@
+:root {
+  color: #1d1c1a;
+  background: #f1ede4;
+  font-family: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-synthesis: none;
+}
+
+* { box-sizing: border-box; }
+body { margin: 0; min-width: 320px; min-height: 100vh; }
+button, input { font: inherit; }
+
+.publisher-shell {
+  display: grid;
+  grid-template-columns: 260px minmax(0, 1fr);
+  min-height: 100vh;
+}
+.publisher-sidebar {
+  background: #171615;
+  color: #f8f4ed;
+  padding: 32px 24px;
+}
+.publisher-brand { display: grid; gap: 6px; margin-bottom: 42px; }
+.publisher-brand span, .eyebrow {
+  color: #cf8d35;
+  font-size: 12px;
+  font-weight: 800;
+  letter-spacing: .14em;
+}
+.publisher-brand b { font-size: 22px; }
+.publisher-sidebar label { display: grid; gap: 8px; font-size: 13px; }
+.publisher-sidebar input {
+  width: 100%;
+  padding: 11px 12px;
+  color: #fff;
+  background: #292725;
+  border: 1px solid #4b4743;
+  border-radius: 10px;
+}
+.publisher-sidebar p { margin: 28px 0 6px; color: #d9d1c5; }
+.publisher-sidebar small { color: #928b82; line-height: 1.5; }
+.publisher-main { padding: 42px clamp(20px, 4vw, 64px); overflow: hidden; }
+
+.page-header h1 { margin: 8px 0; font-size: clamp(30px, 4vw, 48px); }
+.page-header p, .social-publishing__list-header p { color: #6e685f; }
+.card, .social-publishing__result {
+  margin-top: 22px;
+  padding: 22px;
+  background: #fffdf8;
+  border: 1px solid #e5ded2;
+  border-radius: 18px;
+  box-shadow: 0 8px 30px rgba(45, 36, 22, .05);
+}
+.social-publishing__summary {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 220px;
+  gap: 24px;
+  align-items: center;
+}
+.social-publishing__summary-metrics {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(100px, 1fr));
+  gap: 12px;
+}
+.social-publishing__summary-metrics > div { display: grid; gap: 4px; }
+.social-publishing__summary-metrics b { font-size: 30px; }
+.social-publishing__summary-metrics span { color: #746d64; font-size: 13px; }
+.social-publishing__summary-action { display: grid; gap: 8px; }
+.social-publishing__summary-action small { color: #746d64; line-height: 1.45; }
+.btn {
+  min-height: 44px;
+  padding: 0 18px;
+  border: 0;
+  border-radius: 12px;
+  cursor: pointer;
+}
+.btn--primary { color: white; background: #181716; font-weight: 750; }
+.btn:disabled { opacity: .42; cursor: not-allowed; }
+
+.social-extension-pairing {
+  display: grid;
+  grid-template-columns: minmax(220px, 1fr) minmax(280px, 1.2fr);
+  gap: 22px;
+}
+.social-extension-pairing h2, .social-publishing__list h2 { margin: 5px 0; }
+.social-extension-pairing__form { display: flex; gap: 10px; align-items: start; }
+.social-extension-pairing__form input {
+  flex: 1;
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid #d8d0c4;
+  border-radius: 11px;
+}
+.social-extension-pairing__code {
+  grid-column: 1 / -1;
+  display: flex;
+  gap: 14px;
+  align-items: center;
+  padding: 14px;
+  background: #f6ead3;
+  border-radius: 12px;
+}
+.social-extension-pairing__code b { font-size: 24px; letter-spacing: .08em; }
+.social-extension-pairing__devices {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 12px;
+}
+.social-extension-device {
+  display: grid;
+  gap: 5px;
+  padding: 14px;
+  border: 1px solid #e2dbd0;
+  border-radius: 12px;
+}
+.social-extension-device__header { display: flex; gap: 8px; align-items: center; }
+.social-extension-device__dot {
+  width: 9px; height: 9px; border-radius: 50%; background: #aaa;
+}
+.social-extension-device__dot.is-online { background: #35a56c; }
+
+.social-publishing__list-header,
+.social-publishing__environment > header,
+.social-publishing__platform,
+.social-publishing__platform-meta,
+.social-job-status__headline,
+.social-publishing__environment-counts,
+.social-job-status__counts {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.social-publishing__list-header,
+.social-publishing__environment > header,
+.social-publishing__platform { justify-content: space-between; }
+.social-publishing__environment {
+  margin-top: 20px;
+  padding-top: 20px;
+  border-top: 1px solid #e7e0d6;
+}
+.social-publishing__environment > header > div:first-child { display: flex; gap: 10px; }
+.social-publishing__environment h3 { margin: 0; }
+.social-publishing__platforms { display: grid; gap: 10px; margin-top: 14px; }
+.social-publishing__platform {
+  padding: 15px;
+  border: 1px solid #ebe4da;
+  border-radius: 13px;
+}
+.social-publishing__platform-meta { min-width: 280px; }
+.social-publishing__platform-meta > div { display: grid; gap: 4px; }
+.social-publishing__platform small, .social-extension-device small { color: #81796f; }
+.social-job-status { max-width: 520px; text-align: right; }
+.social-job-status p { margin: 6px 0 0; color: #746d64; font-size: 13px; }
+.social-job-status__headline { justify-content: flex-end; }
+.social-job-status__details { margin-top: 7px; color: #746d64; font-size: 12px; }
+.social-job-status__details code, .social-job-history code {
+  display: block;
+  margin-top: 6px;
+  padding: 8px;
+  white-space: normal;
+  background: #f5f1eb;
+  border-radius: 8px;
+}
+.social-job-history { margin-top: 8px; }
+.social-job-history article { padding: 10px; border-top: 1px solid #e8e1d7; }
+.social-publishing__result.has-error { border-color: #e8b4a9; }
+.social-publishing__result-list { display: grid; gap: 8px; margin-top: 12px; }
+.social-publishing__result-row { display: grid; grid-template-columns: 64px 1fr; gap: 6px 12px; }
+.social-publishing__result-row small { grid-column: 2; color: #746d64; }
+.article-chart__error {
+  margin-top: 20px;
+  padding: 14px;
+  color: #8d261b;
+  background: #fff0ed;
+  border: 1px solid #efb9af;
+  border-radius: 12px;
+}
+.tag {
+  display: inline-flex;
+  width: fit-content;
+  padding: 5px 9px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 750;
+}
+.tag--green { color: #14764a; background: #e4f5eb; }
+.tag--gold { color: #8b5f10; background: #f8edce; }
+.tag--blue { color: #245b83; background: #e4eef6; }
+.tag--pink { color: #992e52; background: #f8e3ea; }
+.agent-empty { padding: 30px; color: #746d64; text-align: center; }
+.msr { color: #a46a20; }
+
+@media (max-width: 900px) {
+  .publisher-shell { grid-template-columns: 1fr; }
+  .publisher-sidebar { padding: 20px; }
+  .publisher-brand { margin-bottom: 18px; }
+  .social-publishing__summary,
+  .social-extension-pairing { grid-template-columns: 1fr; }
+  .social-publishing__summary-metrics { grid-template-columns: repeat(2, 1fr); }
+  .social-extension-pairing__code,
+  .social-extension-pairing__devices { grid-column: auto; }
+  .social-publishing__platform { align-items: start; flex-direction: column; }
+  .social-job-status { text-align: left; }
+  .social-job-status__headline { justify-content: flex-start; }
+}

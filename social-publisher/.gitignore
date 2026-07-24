@@ -1,0 +1,12 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+*.log
+*.pid
+frontend/dist/
+frontend/node_modules/
+*.tsbuildinfo
+executor/node_modules/
+executor/artifacts/
+database/data/

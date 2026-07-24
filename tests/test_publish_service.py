@@ -79,6 +79,13 @@ class Publisher:
         return self.found
 
 
+def _use_publisher(monkeypatch: pytest.MonkeyPatch, publisher: Publisher) -> None:
+    async def resolve(*_args: Any, **_kwargs: Any) -> Publisher:
+        return publisher
+
+    monkeypatch.setattr(publish_service, "publisher_for_site_runtime", resolve)
+
+
 def _article(**changes: Any) -> dict[str, Any]:
     return {
         "id": "article-id",
@@ -145,7 +152,7 @@ def _remote(**changes: Any) -> dict[str, Any]:
 async def test_dry_run_is_database_read_only(monkeypatch: pytest.MonkeyPatch) -> None:
     session = Session(approval=None)
     publisher = Publisher()
-    monkeypatch.setattr(publish_service, "publisher_for_site", lambda *_args, **_kwargs: publisher)
+    _use_publisher(monkeypatch, publisher)
 
     result = await publish_service.publish_article(session, article_id="article-id", site_id=None, dry_run=True)
 
@@ -160,7 +167,7 @@ async def test_dry_run_is_database_read_only(monkeypatch: pytest.MonkeyPatch) ->
 async def test_live_publish_rejects_missing_approved_execution(monkeypatch: pytest.MonkeyPatch) -> None:
     session = Session(approval={})
     publisher = Publisher()
-    monkeypatch.setattr(publish_service, "publisher_for_site", lambda *_args, **_kwargs: publisher)
+    _use_publisher(monkeypatch, publisher)
 
     with pytest.raises(publish_service.PublishError, match="human-approved"):
         await publish_service.publish_article(session, article_id="article-id", site_id=None, dry_run=False)
@@ -173,7 +180,7 @@ async def test_live_publish_rejects_missing_approved_execution(monkeypatch: pyte
 async def test_existing_remote_id_is_verified_and_reused(monkeypatch: pytest.MonkeyPatch) -> None:
     session = Session(article=_article(published_post_id="42", published_url="https://example.com/hello/"))
     publisher = Publisher()
-    monkeypatch.setattr(publish_service, "publisher_for_site", lambda *_args, **_kwargs: publisher)
+    _use_publisher(monkeypatch, publisher)
 
     result = await publish_service.publish_article(session, article_id="article-id", site_id=None, dry_run=False)
 
@@ -192,7 +199,7 @@ async def test_matching_slug_is_reused_without_creating(monkeypatch: pytest.Monk
     session = Session()
     publisher = Publisher()
     publisher.found = _remote()
-    monkeypatch.setattr(publish_service, "publisher_for_site", lambda *_args, **_kwargs: publisher)
+    _use_publisher(monkeypatch, publisher)
 
     result = await publish_service.publish_article(session, article_id="article-id", site_id=None, dry_run=False)
 
@@ -208,7 +215,7 @@ async def test_failed_remote_verification_saves_failed_task_without_publishing_l
     session = Session()
     publisher = Publisher()
     publisher.remote = _remote(title={"rendered": "Wrong"}, status="draft")
-    monkeypatch.setattr(publish_service, "publisher_for_site", lambda *_args, **_kwargs: publisher)
+    _use_publisher(monkeypatch, publisher)
 
     result = await publish_service.publish_article(session, article_id="article-id", site_id=None, dry_run=False)
 
@@ -225,7 +232,7 @@ async def test_update_uses_approved_remote_id_and_verifies_by_id(monkeypatch: py
     session = Session(approval=_approval(execution_type="update_article", approved_remote_id="17"))
     publisher = Publisher()
     publisher.remote = _remote(id=17, slug="old-slug", link="https://example.com/old-slug/")
-    monkeypatch.setattr(publish_service, "publisher_for_site", lambda *_args, **_kwargs: publisher)
+    _use_publisher(monkeypatch, publisher)
 
     result = await publish_service.publish_article(
         session,
@@ -252,7 +259,7 @@ async def test_sync_seo_metadata_updates_only_the_published_shopify_article(monk
         site=_site(site_type="shopify", domain="example.myshopify.com"),
     )
     publisher = Publisher()
-    monkeypatch.setattr(publish_service, "publisher_for_site", lambda *_args, **_kwargs: publisher)
+    _use_publisher(monkeypatch, publisher)
 
     result = await publish_service.sync_article_seo_metadata(session, article_id="article-id")
 

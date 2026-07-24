@@ -5,6 +5,8 @@
 > 新窗口先阅读本文，再检查 `git status --short`。工作区有大量已有修改，禁止 `git reset --hard`、批量回滚或覆盖无关文件。
 >
 > 维护约定：跨模块、数据库结构、核心策略链路或发布行为的大改动，必须同步更新本文；设计草案、开发中和已上线状态必须明确区分，不能覆盖既有历史。
+>
+> 内容运营日志约定：每次文章生成或旧文更新必须同时保存一份总运行日志和每篇文章一份独立日志。独立日志至少包含目标用户、搜索意图、SERP/GSC/GA4/产品 API/权威来源依据、文章结构理由、重要编辑取舍、更新前后全文结构、精确模型、发布任务和效果观察。完整规范见 `logs/content-run-log-standard.md`；日志记录可审计依据，不记录或伪造模型私有思维链。
 
 2026-07-18 测试数据重置：已清空 `seo_agent.tasks`、`seo_agent.articles`、`seo_agent.keywords` 与 `seo_agent.serp_snapshots`，用于重新验证 Semrush 主题导入和新策略流程；未删除远端文章。2026-07-19 用户已手动导入 Strategy Builder 真实文件；最近一次只读核对为 `keywords=1,274`、`tasks=224`、`articles=0`、`serp_snapshots=10`、`posts=135`、`post_analyses=292`。策略候选、今日计划和执行任务仍为 0；`tasks` 主要包含页面簇 AI 历史和 107 条内容诊断记录，不能等同于待执行策略。
 

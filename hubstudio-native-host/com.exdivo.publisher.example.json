@@ -1,0 +1,9 @@
+{
+  "name": "com.exdivo.publisher",
+  "description": "Local bridge between Hubstudio and the Exdivo publishing backend",
+  "path": "C:\\absolute\\path\\to\\hubstudio-native-host\\ExdivoNativeHost.exe",
+  "type": "stdio",
+  "allowed_origins": [
+    "chrome-extension://replace-with-your-extension-id/"
+  ]
+}
