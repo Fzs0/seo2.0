@@ -13,7 +13,7 @@ done
 
 python3 -m venv .venv
 .venv/bin/python -m pip install --upgrade pip
-.venv/bin/pip install -r backend/requirements.txt
+.venv/bin/pip install -r requirements.txt
 
 if [[ ! -f .env ]]; then
   cp .env.example .env

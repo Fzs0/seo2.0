@@ -1,10 +1,12 @@
-"""Compatibility facade for the shared social platform contract."""
+"""Stable social publishing contracts shared by both backend runtimes."""
 
-from exdivo_social_contract import (
+from .platforms import (
     PLATFORMS,
     list_platform_specs,
     platform_spec,
     validate_binding_payload,
+    validate_connection_config,
+    validate_connection_secrets,
     validate_package_payload,
 )
 
@@ -13,5 +15,7 @@ __all__ = [
     "list_platform_specs",
     "platform_spec",
     "validate_binding_payload",
+    "validate_connection_config",
+    "validate_connection_secrets",
     "validate_package_payload",
 ]

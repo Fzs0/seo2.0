@@ -29,6 +29,7 @@ social-publisher/
 ├── executor/     # Puppeteer 执行器和七个平台适配器
 ├── extension/    # 可选的 Hubstudio 扩展、心跳和任务记录
 ├── frontend/     # 独立发布页面
+├── shared/       # 主项目与独立后端共用的平台契约 Python 包
 └── scripts/      # macOS 安装、启动和媒体路径迁移
 ```
 
@@ -56,7 +57,7 @@ bash scripts/setup-macos.sh
 安装脚本会：
 
 - 创建 `.venv`；
-- 安装精简后的 Python 依赖；
+- 通过根目录 `requirements.txt` 安装后端依赖和 `shared/python` 中唯一的平台能力与校验契约；
 - 为数据库加密和执行器生成本地密钥；
 - 启动 PostgreSQL；
 - 初始化独立的 `social` schema；
@@ -133,7 +134,7 @@ Hubstudio 环境必须使用 ChroBrowser；FireBrowser 无法提供该自动化�
 ## 测试
 
 ```bash
-PYTHONPATH=backend .venv/bin/pytest backend/tests -q
+PYTHONPATH=backend .venv/bin/pytest backend/tests shared/python/tests -q
 (cd executor && npm test)
 (cd extension && node --test tests/*.test.js)
 (cd frontend && npm test && npm run build)

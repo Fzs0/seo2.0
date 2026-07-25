@@ -7,14 +7,11 @@ from typing import Any
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from exdivo_social_contract import validate_connection_config, validate_connection_secrets
 from app.connectors.secrets import SecretCipher
 from app.connectors.social_connections import SocialConnectionError, connection_adapter
 from app.core.config import get_settings
 from app.services.social_platform_registry import platform_spec
-
-HUBSTUDIO_PLATFORMS = {
-    "x", "reddit", "quora", "youtube", "tiktok", "facebook", "instagram",
-}
 
 
 def _cipher() -> SecretCipher:
@@ -137,29 +134,8 @@ async def _record_test(
     await session.commit()
 
 
-def _validate_config(platform: str, config: dict[str, Any]) -> dict[str, Any]:
-    if platform not in HUBSTUDIO_PLATFORMS:
-        raise ValueError(f"unsupported Hubstudio platform: {platform}")
-    allowed = {"base_url"}
-    unknown = set(config) - allowed
-    if unknown:
-        raise ValueError(f"unsupported {platform} connection config fields: {', '.join(sorted(unknown))}")
-    base_url = str(config.get("base_url") or "http://127.0.0.1:6873").rstrip("/")
-    if base_url != "http://127.0.0.1:6873":
-        raise ValueError("Hubstudio connection must use http://127.0.0.1:6873")
-    return {"base_url": base_url}
-
-
-def _validate_secret_names(platform: str, secrets: dict[str, str]) -> None:
-    if platform not in HUBSTUDIO_PLATFORMS:
-        raise ValueError(f"unsupported Hubstudio platform: {platform}")
-    allowed = {"app_id", "app_secret", "group_code"}
-    unknown = set(secrets) - allowed
-    if unknown:
-        raise ValueError(f"unsupported {platform} secret fields: {', '.join(sorted(unknown))}")
-    supplied = [bool(secrets.get(name)) for name in ("app_id", "app_secret", "group_code")]
-    if any(supplied) and not all(supplied):
-        raise ValueError("Hubstudio app_id, app_secret and group_code must be provided together")
+_validate_config = validate_connection_config
+_validate_secret_names = validate_connection_secrets
 
 
 def _public(row: Any, *, secret_names: list[str]) -> dict[str, Any]:

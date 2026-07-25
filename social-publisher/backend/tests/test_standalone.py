@@ -15,6 +15,7 @@ def test_standalone_interface_contains_publish_and_pairing_routes() -> None:
 
 
 def test_all_required_platforms_are_registered() -> None:
+    assert list_platform_specs.__module__ == "exdivo_social_contract.platforms"
     assert {item["platform"] for item in list_platform_specs()} == {
         "x", "reddit", "quora", "youtube", "tiktok", "facebook", "instagram",
     }

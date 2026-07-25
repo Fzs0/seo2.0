@@ -5,8 +5,13 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from app.api.v1.social import router
+from app.services.social_connection_service import _validate_config, _validate_secret_names
 from app.services.social_publishing_service import validate_platform
-from app.services.social_platform_registry import validate_binding_payload, validate_package_payload
+from app.services.social_platform_registry import (
+    list_platform_specs,
+    validate_binding_payload,
+    validate_package_payload,
+)
 
 
 def test_social_openapi_exposes_reviewed_queue_foundation() -> None:
@@ -54,6 +59,16 @@ def test_social_platforms_are_normalized_and_unknown_platforms_rejected() -> Non
     assert validate_platform(" Reddit ") == "reddit"
     with pytest.raises(ValueError, match="unsupported social platform"):
         validate_platform("myspace")
+
+
+def test_platform_facade_uses_the_shared_contract_module() -> None:
+    assert list_platform_specs.__module__ == "exdivo_social_contract.platforms"
+
+
+@pytest.mark.parametrize("platform", [item["platform"] for item in list_platform_specs()])
+def test_every_registered_platform_has_a_connection_contract(platform: str) -> None:
+    assert _validate_config(platform, {}) == {"base_url": "http://127.0.0.1:6873"}
+    _validate_secret_names(platform, {})
 
 
 def test_x_and_reddit_have_distinct_delivery_adapters() -> None:

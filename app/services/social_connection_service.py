@@ -7,6 +7,7 @@ from typing import Any
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from exdivo_social_contract import validate_connection_config, validate_connection_secrets
 from app.connectors.secrets import SecretCipher
 from app.connectors.social_connections import SocialConnectionError, connection_adapter
 from app.core.config import get_settings
@@ -133,28 +134,8 @@ async def _record_test(
     await session.commit()
 
 
-def _validate_config(platform: str, config: dict[str, Any]) -> dict[str, Any]:
-    allowed = {"x": {"base_url"}, "reddit": {"base_url"}}[platform]
-    unknown = set(config) - allowed
-    if unknown:
-        raise ValueError(f"unsupported {platform} connection config fields: {', '.join(sorted(unknown))}")
-    if platform in {"x", "reddit"}:
-        base_url = str(config.get("base_url") or "http://127.0.0.1:6873").rstrip("/")
-        if base_url != "http://127.0.0.1:6873":
-            raise ValueError("Reddit Hubstudio connection must use http://127.0.0.1:6873")
-        return {"base_url": base_url}
-    return {}
-
-
-def _validate_secret_names(platform: str, secrets: dict[str, str]) -> None:
-    allowed = {"x": {"app_id", "app_secret", "group_code"}, "reddit": {"app_id", "app_secret", "group_code"}}[platform]
-    unknown = set(secrets) - allowed
-    if unknown:
-        raise ValueError(f"unsupported {platform} secret fields: {', '.join(sorted(unknown))}")
-    if platform in {"x", "reddit"}:
-        supplied = [bool(secrets.get(name)) for name in ("app_id", "app_secret", "group_code")]
-        if any(supplied) and not all(supplied):
-            raise ValueError("Hubstudio app_id, app_secret and group_code must be provided together")
+_validate_config = validate_connection_config
+_validate_secret_names = validate_connection_secrets
 
 
 def _public(row: Any, *, secret_names: list[str]) -> dict[str, Any]:
