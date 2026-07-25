@@ -84,6 +84,9 @@ social-executor/node_modules/
 social-executor/artifacts/
 # This file contains placeholders only and is needed to configure the executor.
 !social-executor/.env.example
+# These placeholder-only files are required by the standalone Mac setup.
+!social-publisher/.env.example
+!social-publisher/executor/.env.example
 
 # ---- Local social publishing media & machine-specific bridge config ----
 /social-video/

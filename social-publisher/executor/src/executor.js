@@ -3,7 +3,6 @@
 const crypto = require('node:crypto');
 const fs = require('node:fs/promises');
 const path = require('node:path');
-const puppeteer = require('puppeteer-core');
 const { getAdapter } = require('./adapters/registry');
 const { ManualRequiredError } = require('./errors');
 const { assertAllowedUrl, redact } = require('./security');
@@ -19,6 +18,10 @@ class SocialExecutor {
     this.prepared = new Map();
     this.log = options.log || (() => {});
     this.adapterFor = options.adapterFor || getAdapter;
+    if (typeof options.connectBrowser !== 'function') {
+      throw new TypeError('connectBrowser adapter is required');
+    }
+    this.connectBrowser = options.connectBrowser;
   }
 
   async run(request) {
@@ -68,7 +71,7 @@ class SocialExecutor {
   async prepare(request) {
     const context = logContext(request);
     this.log('prepare_browser_connecting', context);
-    const browser = await puppeteer.connect({ browserURL: `http://127.0.0.1:${request.debugging_port}`, defaultViewport: null });
+    const browser = await this.connectBrowser({ debuggingPort: request.debugging_port });
     let page;
     try {
       this.log('prepare_browser_connected', context);

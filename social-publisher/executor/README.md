@@ -1,12 +1,19 @@
-# Social Executor
+# Social Executor Canonical Module
 
-本机 Hubstudio 辅助发布执行器。它连接已经由 Hubstudio 打开的 Chromium 调试端口，自动回填 X 或 Reddit 发布表单。`prepare` **永远不会点击最终发布按钮**；只有持有一次性确认令牌的 `confirm` 才会点击，并且必须识别真实帖子 URL 才返回 `published`。
+这是主项目和独立 Social Publisher 共用的唯一执行器实现。主项目的
+`social-executor/` 只保留薄启动器；平台 Adapter、schema、安全规则、两阶段
+确认状态机和 HTTP transport 都以本目录为单一事实来源。
+
+执行器连接已经由 Hubstudio 打开的 Chromium 调试端口，支持 X、Reddit、
+Quora、TikTok、YouTube、Instagram 和 Facebook。`prepare` **永远不会点击
+最终发布按钮**；只有持有一次性确认令牌的 `confirm` 才会点击，并且必须识别
+真实帖子 URL 才返回 `published`。
 
 ## 安全边界
 
 - 只监听 `127.0.0.1`，拒绝配置其他监听地址。
 - 所有命令必须带 `X-Social-Executor-Secret`，共享密钥至少 32 字符。
-- 只允许导航及验证 `https://x.com`、`https://twitter.com` 和 Reddit 域名。
+- 只允许导航及验证七个受支持平台的显式 HTTPS 域名 allowlist。
 - 每个 `container_code` 同一时间只运行一个命令。
 - 不接收任意 JavaScript、选择器或任意目标网址。
 - prepare 生成截图和结构化日志；日志会脱敏。
@@ -62,4 +69,5 @@ Reddit prepare 的 `content` 必须使用 `title`、`body`、`subreddit`；`link
 npm test
 ```
 
-测试只覆盖 schema、URL allowlist、脱敏和 URL 构造，不连接真实浏览器或账号。
+测试覆盖 schema、URL allowlist、脱敏、URL 构造、两阶段状态机和生命周期
+日志，不连接真实浏览器或账号。

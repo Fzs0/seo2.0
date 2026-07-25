@@ -8,7 +8,7 @@
 | --- | --- | --- | --- |
 | SEO Workbench 主服务 | `http://127.0.0.1:8000` | `app/main.py` | `http://127.0.0.1:8000/docs` |
 | Local Knowledge 独立知识服务 | `http://127.0.0.1:8010` | `knowledge/backend/app/main.py` | `http://127.0.0.1:8010/docs` |
-| Social Executor 本机执行器 | `http://127.0.0.1:4317` | `social-executor/src/server.js` | 无 OpenAPI；协议见第 7 节 |
+| Social Executor 本机执行器 | `http://127.0.0.1:4317` | `social-publisher/executor/src/server-core.js`（主项目由 `social-executor/src/server.js` 启动） | 无 OpenAPI；协议见第 7 节 |
 
 主服务与知识服务当前都没有应用级入站鉴权，启动脚本均绑定 `127.0.0.1`，只能作为可信本机服务使用。Social Executor 同样强制绑定 `127.0.0.1`，并额外要求至少 32 字符的共享密钥。任何服务都不应在未增加身份认证、权限和网络访问控制前暴露到局域网或公网。
 
@@ -503,7 +503,7 @@ curl -X POST http://127.0.0.1:8010/api/v1/knowledge/retrieve \
 | 知识接口 | `knowledge/backend/app/api.py` |
 | 知识请求/响应模型 | `knowledge/backend/app/schemas.py` |
 | 知识服务错误映射 | `knowledge/backend/app/main.py` |
-| Social Executor HTTP 协议 | `social-executor/src/server.js`、`social-executor/src/schema.js` |
+| Social Executor HTTP 协议 | `social-publisher/executor/src/server-core.js`、`social-publisher/executor/src/schema.js` |
 
 ## 10. 前端集成注意事项
 

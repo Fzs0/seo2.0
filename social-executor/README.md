@@ -1,12 +1,25 @@
-# Social Executor
+# Social Executor 主项目启动器
 
-本机 Hubstudio 辅助发布执行器。它连接已经由 Hubstudio 打开的 Chromium 调试端口，自动回填 X 或 Reddit 发布表单。`prepare` **永远不会点击最终发布按钮**；只有持有一次性确认令牌的 `confirm` 才会点击，并且必须识别真实帖子 URL 才返回 `published`。
+本目录是 SEO Workbench 的薄启动器。唯一的执行器实现位于
+`social-publisher/executor/src/`；这里仅从本包加载 `puppeteer-core`，再通过
+`connectBrowser({ debuggingPort })` port 启动同一个深 Module。
+
+这是 `private` 的 monorepo 内部入口，不是可单独迁出的 npm 发布包。需要独立
+复制部署时，使用包含 canonical Module 的完整 `social-publisher/` 目录。
+
+执行器连接已经由 Hubstudio 打开的 Chromium 调试端口，支持 X、Reddit、
+Quora、TikTok、YouTube、Instagram 和 Facebook。`prepare` **永远不会点击
+最终发布按钮**；只有持有一次性确认令牌的 `confirm` 才会点击，并且必须识别
+真实帖子 URL 才返回 `published`。
+
+不要把平台 Adapter、schema、安全规则或状态机复制回本目录。平台行为只在
+`social-publisher/executor/` 中维护和测试。
 
 ## 安全边界
 
 - 只监听 `127.0.0.1`，拒绝配置其他监听地址。
 - 所有命令必须带 `X-Social-Executor-Secret`，共享密钥至少 32 字符。
-- 只允许导航及验证 `https://x.com`、`https://twitter.com` 和 Reddit 域名。
+- 只允许导航及验证七个受支持平台的显式 HTTPS 域名 allowlist。
 - 每个 `container_code` 同一时间只运行一个命令。
 - 不接收任意 JavaScript、选择器或任意目标网址。
 - prepare 生成截图和结构化日志；日志会脱敏。
@@ -62,4 +75,6 @@ Reddit prepare 的 `content` 必须使用 `title`、`body`、`subreddit`；`link
 npm test
 ```
 
-测试只覆盖 schema、URL allowlist、脱敏和 URL 构造，不连接真实浏览器或账号。
+本目录测试启动器到 canonical Module 的 HTTP `/health` 契约。完整 schema、
+状态机、URL allowlist、脱敏和平台 Adapter 测试位于
+`social-publisher/executor/tests/`，不连接真实浏览器或账号。

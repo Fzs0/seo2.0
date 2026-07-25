@@ -2,6 +2,8 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const http = require('node:http');
+const { once } = require('node:events');
 const { assertAllowedUrl, redact, timingSafeSecret } = require('../src/security');
 const { validateCommand } = require('../src/schema');
 const { intentUrl } = require('../src/adapters/x');
@@ -12,6 +14,93 @@ const { assertNoChallenge } = require('../src/challenge');
 const {
   MANAGED_PAGE_PREFIX, SocialExecutor, hash, managedPageName, softTimeout,
 } = require('../src/executor');
+const { startStandaloneExecutor } = require('../src/server');
+
+function requestJson(url) {
+  return new Promise((resolve, reject) => {
+    http.get(url, response => {
+      let raw = '';
+      response.on('data', chunk => { raw += chunk; });
+      response.on('end', () => {
+        try {
+          resolve({ status: response.statusCode, body: JSON.parse(raw) });
+        } catch (error) {
+          reject(error);
+        }
+      });
+    }).on('error', reject);
+  });
+}
+
+test('standalone launcher serves the canonical executor health interface', async t => {
+  const sink = { write: () => {} };
+  const server = startStandaloneExecutor({
+    env: {
+      SOCIAL_EXECUTOR_HOST: '127.0.0.1',
+      SOCIAL_EXECUTOR_PORT: '0',
+      SOCIAL_EXECUTOR_SHARED_SECRET: 'x'.repeat(32),
+    },
+    stdout: sink,
+    stderr: sink,
+    connectBrowser: async () => {
+      throw new Error('browser connection is not expected in the health test');
+    },
+  });
+  t.after(() => new Promise(resolve => server.close(resolve)));
+  await once(server, 'listening');
+
+  const address = server.address();
+  const response = await requestJson(`http://127.0.0.1:${address.port}/health`);
+
+  assert.equal(response.status, 200);
+  assert.deepEqual(response.body, { status: 'ok' });
+});
+
+test('canonical executor requires a browser connector adapter', () => {
+  assert.throws(() => new SocialExecutor(), /connectBrowser adapter is required/);
+});
+
+test('canonical executor exposes only debuggingPort to the browser connector port', async () => {
+  let connectInput;
+  const page = {
+    setDefaultTimeout: () => {},
+    evaluate: async () => {},
+    screenshot: async () => {},
+    target: () => ({ _targetId: 'target-port-contract' }),
+    url: () => 'https://x.com/intent/post',
+    isClosed: () => false,
+    close: async () => {},
+  };
+  const browser = {
+    pages: async () => [],
+    newPage: async () => page,
+    disconnect: async () => {},
+  };
+  const executor = new SocialExecutor({
+    artifactDir: '.',
+    connectBrowser: async input => {
+      connectInput = input;
+      return browser;
+    },
+    adapterFor: () => ({
+      prepare: async () => ({ target_url: 'https://x.com/intent/post' }),
+    }),
+  });
+
+  const result = await executor.prepare({
+    command: 'prepare',
+    platform: 'x',
+    job_id: 'job-port-contract',
+    container_code: 'container-port-contract',
+    debugging_port: 9222,
+    content: { body: 'Prepared content' },
+  });
+
+  assert.deepEqual(connectInput, { debuggingPort: 9222 });
+  assert.equal(result.status, 'awaiting_review');
+  await page.close();
+  await browser.disconnect();
+});
 
 test('allows only HTTPS X and Reddit URLs', () => {
   assert.equal(assertAllowedUrl('https://x.com/intent/post').hostname, 'x.com');
@@ -132,7 +221,7 @@ test('Instagram verification rejects an old profile link that existed before pub
 });
 
 test('keeps a container locked until the actual browser operation settles', async () => {
-  const executor = new SocialExecutor();
+  const executor = new SocialExecutor({ connectBrowser: async () => {} });
   let finish;
   const pending = new Promise(resolve => { finish = resolve; });
   executor.confirm = async () => pending;
@@ -156,6 +245,7 @@ test('keeps a container locked until the actual browser operation settles', asyn
 test('confirmation foregrounds a prepared page before touching platform controls', async () => {
   const order = [];
   const executor = new SocialExecutor({
+    connectBrowser: async () => {},
     adapterFor: () => ({
       confirm: async () => {
         order.push('adapter_confirm');
@@ -203,7 +293,7 @@ test('managed browser pages use opaque job-bound markers', () => {
 });
 
 test('dispose closes only the exact leased page', async () => {
-  const executor = new SocialExecutor();
+  const executor = new SocialExecutor({ connectBrowser: async () => {} });
   let closed = 0;
   let disconnected = 0;
   const state = {
@@ -250,7 +340,10 @@ test('ignores preloaded invisible CAPTCHA frames but blocks visible challenges',
 
 test('executor emits correlated lifecycle stages without logging content or tokens', async () => {
   const events = [];
-  const executor = new SocialExecutor({ log: (event, fields) => events.push({ event, fields }) });
+  const executor = new SocialExecutor({
+    connectBrowser: async () => {},
+    log: (event, fields) => events.push({ event, fields }),
+  });
   executor.prepare = async () => ({ status: 'awaiting_review' });
   const request = {
     command: 'prepare',
@@ -272,7 +365,10 @@ test('executor emits correlated lifecycle stages without logging content or toke
 
 test('executor failure stage includes error metadata and correlation fields', async () => {
   const events = [];
-  const executor = new SocialExecutor({ log: (event, fields) => events.push({ event, fields }) });
+  const executor = new SocialExecutor({
+    connectBrowser: async () => {},
+    log: (event, fields) => events.push({ event, fields }),
+  });
   executor.prepare = async () => {
     const error = new Error('adapter exploded');
     error.code = 'E_ADAPTER';
