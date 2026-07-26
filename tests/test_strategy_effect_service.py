@@ -73,7 +73,10 @@ async def test_backfill_missing_effect_url_uses_historical_execution_evidence() 
                 return Result([{
                     "id": "effect-id",
                     "target_url": None,
-                    "payload": {"baseline": {"metric_scope": {"gsc": "query", "ga4": "site"}}},
+                    "payload": {
+                        "action": "update_article",
+                        "baseline": {"metric_scope": {"gsc": "query", "ga4": "site"}},
+                    },
                     "strategy": {"evidence": {"site_content": {"published_url": "https://example.com/original-article"}}},
                     "article_url": None,
                 }])
@@ -88,7 +91,9 @@ async def test_backfill_missing_effect_url_uses_historical_execution_evidence() 
 
     assert repaired == 1
     assert writes[0]["target_url"] == "https://example.com/original-article"
-    assert "初始基线创建时未绑定目标 URL" in json.loads(writes[0]["patch"])["baseline_note"]
+    patch = json.loads(writes[0]["patch"])
+    assert "初始基线创建时未绑定目标 URL" in patch["baseline_note"]
+    assert patch["baseline_valid"] is False
 
 
 def test_outcome_waits_until_day_28_and_contamination_wins() -> None:
@@ -101,6 +106,104 @@ def test_outcome_waits_until_day_28_and_contamination_wins() -> None:
     assert service.classify_outcome(snapshot, positive, day=28) == "winner"
     assert service.classify_outcome(snapshot, negative, day=28) == "loser"
     assert service.classify_outcome({"gsc": {"impressions": 199}}, positive, day=90) == "inconclusive"
+
+
+def test_outcome_rejects_an_invalid_baseline() -> None:
+    snapshot = {"gsc": {"impressions": 1000}}
+    positive = {"clicks": 1.0, "avg_position": 0.5, "conversions": 1.0}
+
+    assert service.classify_outcome(
+        snapshot,
+        positive,
+        baseline_valid=False,
+        day=90,
+    ) == "inconclusive"
+
+
+def test_update_effect_invalidates_baseline_when_public_url_changes() -> None:
+    payload = {
+        "action": "update_article",
+        "target_url": "https://example.com/blogs/detail/42",
+        "baseline": {"gsc": {"clicks": 10}},
+    }
+
+    reconciled = service.reconcile_effect_target_url(
+        payload,
+        current_target_url="https://example.com/blogs/detail/42",
+        new_target_url="https://example.com/blogs/guide",
+    )
+
+    assert reconciled["target_url"] == "https://example.com/blogs/guide"
+    assert reconciled["baseline_valid"] is False
+    assert reconciled["previous_target_url"] == "https://example.com/blogs/detail/42"
+    assert "URL" in reconciled["baseline_note"]
+    assert reconciled["baseline"] == payload["baseline"]
+
+
+def test_new_article_url_change_keeps_its_zero_baseline_valid() -> None:
+    payload = {
+        "action": "new_article",
+        "target_url": "https://example.com/draft-location",
+        "baseline": {"ga4": {"sessions": 0, "conversions": 0}},
+    }
+
+    reconciled = service.reconcile_effect_target_url(
+        payload,
+        current_target_url=payload["target_url"],
+        new_target_url="https://example.com/blogs/new-guide",
+    )
+
+    assert reconciled["target_url"] == "https://example.com/blogs/new-guide"
+    assert "baseline_valid" not in reconciled
+    assert "previous_target_url" not in reconciled
+    assert reconciled["baseline"] == payload["baseline"]
+
+
+def test_effect_url_reconciliation_is_idempotent_and_preserves_first_evidence() -> None:
+    payload = {
+        "action": "update_article",
+        "target_url": "https://example.com/blogs/guide",
+        "baseline_valid": False,
+        "previous_target_url": "https://example.com/blogs/detail/42",
+        "baseline_note": "首次修复证据",
+    }
+
+    reconciled = service.reconcile_effect_target_url(
+        payload,
+        current_target_url="https://example.com/blogs/guide/",
+        new_target_url="https://example.com/blogs/guide",
+    )
+
+    assert reconciled == payload
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {
+            "action": "new_article",
+            "target_url": "https://example.com/old",
+            "baseline": {"ga4": {"sessions": 0, "conversions": 0}},
+            "checkpoints": [{"day": 7}],
+        },
+        {
+            "target_url": "https://example.com/old",
+            "baseline": {"ga4": {"sessions": 0, "conversions": 0}},
+            "checkpoints": [],
+        },
+    ],
+)
+def test_effect_url_change_invalidates_non_initial_or_unknown_baseline(
+    payload: dict,
+) -> None:
+    reconciled = service.reconcile_effect_target_url(
+        payload,
+        current_target_url=payload["target_url"],
+        new_target_url="https://example.com/new",
+    )
+
+    assert reconciled["baseline_valid"] is False
+    assert reconciled["previous_target_url"] == "https://example.com/old"
 
 
 @pytest.mark.asyncio

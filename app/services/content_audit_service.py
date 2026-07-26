@@ -11,7 +11,11 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.clients.ai_provider import generate_ai_content, is_stage_configured
-from app.clients.serpapi import fetch_google_serp
+from app.clients.serpapi import (
+    fetch_google_serp,
+    is_terminal_serp_failure,
+    is_usable_serp_result,
+)
 from app.engine.semrush_strategy import _normalized_url
 from app.services.post_sync_service import sync_all_site_posts
 from app.services.serp_competitor_service import fetch_competitor_pages
@@ -219,6 +223,7 @@ async def _load_serp_snapshots(session: AsyncSession, business_id: str) -> dict[
                      WHERE s.business_id = :business_id
                        AND s.strategy_enabled = true
                        AND s.status = 'active'
+                       AND COALESCE(ss.raw->>'status', 'success') <> 'fetch-failed'
                    ) latest
              WHERE row_number = 1
             """
@@ -254,6 +259,9 @@ async def _attach_evidence(
     configured = False
     competitor_fetched = 0
     competitor_attempted = 0
+    failure_count = 0
+    last_error_type: str | None = None
+    terminal_failure = False
     for item in items:
         post = posts_by_id.get(str(item.get("post_id")))
         keyword = keywords_by_id.get(str(item.get("keyword_id")))
@@ -266,44 +274,52 @@ async def _attach_evidence(
         serp = None
         if keyword:
             serp = serp_snapshots.get(f"id:{keyword['id']}") or serp_snapshots.get(f"query:{_normalise(query)}")
-        if serp:
+        if is_usable_serp_result(serp):
             cached += 1
         # ponytail: cap live SERP fetches at 10 per scan; queue bulk refresh when coverage matters.
-        elif fetch_serp and keyword and query and fetch_attempts < 10:
+        elif fetch_serp and not terminal_failure and keyword and query and fetch_attempts < 10:
             fetch_attempts += 1
             serp = await _fetch_and_save_serp(session, keyword)
             configured = configured or bool(serp and serp.get("configured"))
-            fetched += int(bool(serp and serp.get("organic_results")))
-            if serp:
+            if is_usable_serp_result(serp):
+                fetched += 1
                 serp_snapshots[f"id:{keyword['id']}"] = serp
                 serp_snapshots[f"query:{_normalise(query)}"] = serp
-        if serp and serp.get("organic_results") and not serp.get("competitor_pages"):
+            elif serp and serp.get("status") == "fetch-failed":
+                failure_count += 1
+                last_error_type = str(serp.get("error_type") or "request_failed")
+                terminal_failure = is_terminal_serp_failure(serp)
+        if is_usable_serp_result(serp) and not serp.get("competitor_pages"):
             competitor_attempted += 1
             serp = await _ensure_competitor_pages(session, serp)
             competitor_fetched += len([page for page in serp.get("competitor_pages") or [] if page.get("status") == "fetched"])
-        if serp and serp.get("id"):
+        if is_usable_serp_result(serp) and serp.get("id"):
             item["serp_snapshot_id"] = str(serp["id"])
 
         item["data_evidence"] = {
             "gsc": _compact_data(gsc, ("clicks", "impressions", "ctr", "avg_position")),
             "ga4": _compact_data(ga4, ("sessions", "pageviews", "engagement_rate", "bounce_rate", "conversions")),
             "keyword": _compact_data(keyword, ("keyword", "volume", "kd", "intent", "score")),
-            "serp": _compact_serp(serp),
+            "serp": _compact_serp(serp if is_usable_serp_result(serp) else None),
         }
         for source, data, fact in (
             ("gsc", gsc, _gsc_fact(gsc)),
             ("ga4", ga4, _ga4_fact(ga4)),
             ("keyword_data", keyword, _keyword_fact(keyword)),
-            ("serp", serp, _serp_fact(serp)),
+            ("serp", serp, _serp_fact(serp if is_usable_serp_result(serp) else None)),
         ):
             if data and fact:
                 item["evidence"].append({"source": source, "fact": fact})
     return {
         "configured": configured,
-        "available": configured or bool(serp_snapshots),
+        "available": fetched > 0 or any(
+            is_usable_serp_result(snapshot) for snapshot in serp_snapshots.values()
+        ),
         "cached": cached,
         "fetched": fetched,
         "attempted": fetch_attempts,
+        "failure_count": failure_count,
+        "last_error_type": last_error_type,
         "competitor_attempted": competitor_attempted,
         "competitor_fetched": competitor_fetched,
     }
@@ -317,7 +333,11 @@ async def _fetch_and_save_serp(session: AsyncSession, keyword: dict[str, Any]) -
     )
     if not data.get("configured"):
         return data
-    data["competitor_pages"] = await fetch_competitor_pages(data.get("organic_results") or [])
+    data["competitor_pages"] = (
+        await fetch_competitor_pages(data.get("organic_results") or [])
+        if is_usable_serp_result(data)
+        else []
+    )
     row = (
         await session.execute(
             text(
@@ -521,7 +541,7 @@ def _compact_data(value: dict[str, Any] | None, fields: tuple[str, ...]) -> dict
 
 
 def _compact_serp(value: dict[str, Any] | None) -> dict[str, Any] | None:
-    if not value or (not value.get("id") and not value.get("organic_results")):
+    if not is_usable_serp_result(value):
         return None
     return {
         "source": value.get("source") or "cache",
@@ -567,7 +587,7 @@ def _keyword_fact(data: dict[str, Any] | None) -> str:
 
 
 def _serp_fact(data: dict[str, Any] | None) -> str:
-    if not data:
+    if not is_usable_serp_result(data):
         return ""
     return f"SERP 已有 {int(data.get('top_result_count') or len(data.get('organic_results') or []))} 条自然结果"
 

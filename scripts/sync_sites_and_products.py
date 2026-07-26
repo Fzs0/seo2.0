@@ -78,11 +78,15 @@ def upsert_sites() -> dict[str, str]:
           '{esc(s.get("contentRole", ""))}',
           'active',
           '{esc(json.dumps(s, ensure_ascii=False))}'::jsonb,
-          jsonb_build_object('tokenA', '{esc(s.get("tokenA", ""))}', 'tokenB', '{esc(s.get("tokenB", ""))}')
+          jsonb_strip_nulls(jsonb_build_object(
+            'tokenA', NULLIF('{esc(s.get("tokenA", ""))}', ''),
+            'tokenB', NULLIF('{esc(s.get("tokenB", ""))}', ''),
+            'articleUrlPath', NULLIF('{esc(s.get("articleUrlPath", ""))}', '')
+          ))
         )
         ON CONFLICT (site_key) DO UPDATE SET
           name = EXCLUDED.name,
-          api_config = EXCLUDED.api_config,
+          api_config = seo_agent.sites.api_config || EXCLUDED.api_config,
           content_role = EXCLUDED.content_role,
           raw = EXCLUDED.raw,
           updated_at = now();
@@ -108,11 +112,18 @@ def upsert_sites() -> dict[str, str]:
           '{esc(s.get("contentRole", ""))}',
           'active',
           '{esc(json.dumps(s, ensure_ascii=False))}'::jsonb,
-          jsonb_build_object('openApiKey', '{esc(s.get("openApiKey", ""))}', 'defaultAuthor', '{esc(s.get("defaultAuthor", ""))}')
+          jsonb_strip_nulls(jsonb_build_object(
+            'openApiKey', NULLIF('{esc(s.get("openApiKey", ""))}', ''),
+            'defaultAuthor', NULLIF('{esc(s.get("defaultAuthor", ""))}', ''),
+            'connector_type', 'custom_openapi',
+            'articlesPath', '/posts',
+            'publishPath', '/posts',
+            'articleUrlPath', NULLIF('{esc(s.get("articleUrlPath", ""))}', '')
+          ))
         )
         ON CONFLICT (site_key) DO UPDATE SET
           name = EXCLUDED.name,
-          api_config = EXCLUDED.api_config,
+          api_config = seo_agent.sites.api_config || EXCLUDED.api_config,
           content_role = EXCLUDED.content_role,
           raw = EXCLUDED.raw,
           updated_at = now();

@@ -243,6 +243,42 @@ def test_keyword_qa_accepts_title_and_punctuation_variants() -> None:
     assert checks["has_keyword"] is True
 
 
+def test_article_qa_accepts_strategy_target_url_as_contextual_link() -> None:
+    target_url = "https://avinoti.shop/blogs/detail/2624326"
+    content = (
+        "# Titanium Insulated Bottle Guide\n\n"
+        "## What to compare\n\n"
+        f"Read the [titanium cutting board guide]({target_url}) for another material comparison.\n\n"
+        "## FAQ\n\nTitanium insulated bottle questions answered."
+    )
+    description = (
+        "Compare titanium insulated bottles by capacity, lid, dimensions, care, "
+        "weight and insulation details before choosing one for daily travel."
+    )
+    context = {
+        "required_modules": ["contextual_internal_link"],
+        "target_asset": {},
+        "site_profile": {},
+        "keyword_and_intent": {},
+        "article_goal": {},
+        "facts_and_sources": [],
+    }
+
+    checks = {
+        item["key"]: item["ok"]
+        for item in article_generation_service._qa(
+            content,
+            "titanium insulated bottle",
+            description,
+            internal_link_plan=[{"target_url": target_url}],
+            generation_context=context,
+        )
+    }
+
+    assert checks["has_planned_internal_link"] is True
+    assert checks["has_required_contextual_link"] is True
+
+
 def test_article_slug_uses_primary_keyword_and_stays_short() -> None:
     slug = article_generation_service._slug("G Wiz Vape Review")
 

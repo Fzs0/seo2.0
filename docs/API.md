@@ -1,6 +1,6 @@
 # API 接口文档
 
-> 基于 2026-07-23 当前工作区源码与动态 OpenAPI 核对。本文覆盖 167 个显式 HTTP 操作：主服务 136 个、独立知识服务 29 个、社媒执行器 2 个。FastAPI 自动生成的 `/docs`、`/redoc`、`/openapi.json` 及静态资源未计入接口总数；同一路径的不同 HTTP 方法分别计数。
+> 基于 2026-07-26 当前工作区源码与动态 OpenAPI 核对。本文覆盖 182 个显式 HTTP 操作：主服务 151 个、独立知识服务 29 个、社媒执行器 2 个。FastAPI 自动生成的 `/docs`、`/redoc`、`/openapi.json` 及静态资源未计入接口总数；同一路径的不同 HTTP 方法分别计数。
 
 ## 1. 服务概览
 
@@ -38,7 +38,7 @@
 
 | 方法 | 路径 | 请求 | 响应/说明 |
 | --- | --- | --- | --- |
-| GET | `/api/health` | 无 | `{ok, name, env}`；进程级健康检查，不检查数据库。 |
+| GET | `/api/health` | 无 | `{ok, name, env, pid, started_at, revision, startup_source_fingerprint, current_source_fingerprint, source_drift}`；进程级健康检查和源码漂移检测，不检查数据库。 |
 | GET | `/metrics` | 无 | Prometheus exposition 文本。 |
 
 ### 2.2 工作流标准与导入分析
@@ -146,7 +146,7 @@
 | GET | `/api/v1/products/by-external/{external_id}` | 路径：`external_id`；可选查询 `site_id` | 按外部 ID 查询；不存在返回 404。连接器数据建议传 `site_id` 消除不同来源的 ID 歧义。该路径先于 `/{product_id}` 注册。 |
 | GET | `/api/v1/products/{product_id}` | 路径：整数 `product_id` | 按内部 ID 查询；不存在返回 404。 |
 | POST | `/api/v1/site-snapshot` | `SiteSnapshotBody` | 并发探测输入的 API，返回 `{siteResults, total}`；会发起外部调用。 |
-| POST | `/api/v1/serpapi` | `SerpApiBody` | 查询 Google SERP；默认 `gl=us`、`hl=en`，需要 SerpApi 配置。成功请求会保存到现有 `seo_agent.serp_snapshots` 表并返回 `snapshot_id`；不创建关键词库记录。 |
+| POST | `/api/v1/serpapi` | `SerpApiBody` | 查询 Google SERP；默认 `gl=us`、`hl=en`，需要 SerpApi 配置。成功请求会保存到 `seo_agent.serp_snapshots` 并返回 `snapshot_id`；失败返回 `error_type`、`http_status`、`retryable`、`retry_after`，不保存失败快照，也不创建关键词库记录。 |
 | POST | `/api/v1/images/search` | `ImageSearchBody` | 从 Pexels/Unsplash/Pixabay 等图片提供商搜索，需对应 Key。 |
 
 #### 2.8.1 自定义商品数据连接器

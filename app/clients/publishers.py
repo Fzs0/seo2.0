@@ -20,11 +20,12 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
-from urllib.parse import quote, urljoin, urlsplit, urlunsplit
+from urllib.parse import quote, urlsplit, urlunsplit
 
 import structlog
 
 from app.clients.http_client import ExternalCallError, request_json
+from app.core.article_urls import is_oemapps_site, resolve_article_public_url
 from app.core.config import get_settings
 
 logger = structlog.get_logger(__name__)
@@ -322,9 +323,12 @@ class OpenAPIPublisher(PublisherBase):
     capabilities = ("read_articles", "get_article", "find_article_by_slug", "publish_article", "update_article", "upload_image")
 
     def _is_oemapps(self) -> bool:
-        raw = str(self.site.get("api_base_url") or "").strip()
-        host = urlsplit(raw if "://" in raw else f"//{raw}").hostname or ""
-        return host.casefold() == "openapi.oemapps.com"
+        return is_oemapps_site(self.site)
+
+    def _dry_response(self, req: PublishRequest) -> PublishResult:
+        result = super()._dry_response(req)
+        result.url = self._public_article_url(req.slug, "")
+        return result
 
     def _article_paths(self) -> tuple[str, str]:
         """Resolve the documented article protocol for the selected site.
@@ -517,16 +521,11 @@ class OpenAPIPublisher(PublisherBase):
         return PublishResult(ok=True, dry_run=False, post_id=remote_id, url=self._public_article_url(slug, remote_id), raw=data)
 
     def _public_article_url(self, slug: str, post_id: str) -> str | None:
-        path = str((self.site.get("api_config") or {}).get("articleUrlPath") or "")
-        base = str(self.site.get("base_url") or self.site.get("domain") or "").strip()
-        if not path or not base:
-            return None
-        path = path.replace("{slug}", quote(slug, safe="")).replace("{id}", quote(post_id, safe=""))
-        if path.startswith(("http://", "https://")):
-            return path
-        if not base.startswith(("http://", "https://")):
-            base = f"https://{base}"
-        return urljoin(f"{base.rstrip('/')}/", path.lstrip("/"))
+        return resolve_article_public_url(
+            self.site,
+            slug=slug,
+            article_id=post_id,
+        )
 
     async def _real_publish(self, req: PublishRequest) -> PublishResult:
         api_base = self.site.get("api_base_url") or self.site.get("base_url")

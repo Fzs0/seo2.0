@@ -180,6 +180,25 @@ async def test_oemapps_article_connector_ignores_legacy_articles_defaults(monkey
 
 
 @pytest.mark.asyncio
+async def test_oemapps_dry_run_uses_the_same_canonical_url_contract():
+    publisher = OpenAPIPublisher(
+        {
+            'site_type': 'main',
+            'base_url': 'https://avinoti.shop',
+            'api_base_url': 'https://openapi.oemapps.com',
+            'api_config': {'tokenB': 'site-token'},
+        },
+        dry_run=True,
+    )
+
+    result = await publisher.publish(
+        PublishRequest(title='SEO Guide', slug='seo-guide', content_md='# Guide')
+    )
+
+    assert result.url == 'https://avinoti.shop/blogs/seo-guide'
+
+
+@pytest.mark.asyncio
 async def test_oemapps_sites_share_single_article_publish_adapter(monkeypatch):
     calls: list[dict[str, object]] = []
 
@@ -201,17 +220,27 @@ async def test_oemapps_sites_share_single_article_publish_adapter(monkeypatch):
         status='publish',
     )
 
-    for token_key, token_value in [('tokenA', 'exdivo-token'), ('tokenB', 'avinoti-token')]:
+    sites = [
+        ('tokenA', 'exdivo-token', 'https://exdivo.com', 'https://exdivo.com/blogs/seo-guide'),
+        ('tokenB', 'avinoti-token', 'https://avinoti.shop', 'https://avinoti.shop/blogs/seo-guide'),
+    ]
+    for token_key, token_value, base_url, canonical_url in sites:
         publisher = OpenAPIPublisher(
             {
                 'site_type': 'main',
+                'base_url': base_url,
                 'api_base_url': 'https://openapi.oemapps.com',
-                'api_config': {token_key: token_value, 'publishPath': '/posts/batch'},
+                'api_config': {
+                    token_key: token_value,
+                    'publishPath': '/posts/batch',
+                    'articleUrlPath': '/blogs/detail/{id}',
+                },
             },
             dry_run=False,
         )
         result = await publisher.publish(request)
         assert result.ok is True
+        assert result.url == canonical_url
 
     assert [call['url'] for call in calls] == [
         'https://openapi.oemapps.com/posts',
@@ -249,13 +278,19 @@ async def test_oemapps_article_update_uses_site_token(monkeypatch):
 
     monkeypatch.setattr('app.clients.publishers.request_json', fake_request_json)
     publisher = OpenAPIPublisher(
-        {'site_type': 'main', 'api_base_url': 'https://openapi.oemapps.com', 'api_config': {'tokenB': 'site-token'}},
+        {
+            'site_type': 'main',
+            'base_url': 'https://avinoti.shop',
+            'api_base_url': 'https://openapi.oemapps.com',
+            'api_config': {'tokenB': 'site-token', 'articleUrlPath': '/blogs/detail/{id}'},
+        },
         dry_run=False,
     )
 
     result = await publisher.update('7', PublishRequest(title='Updated', slug='updated', content_md='# Updated', status='publish'))
 
     assert result.ok is True
+    assert result.url == 'https://avinoti.shop/blogs/updated'
     assert called['method'] == 'PUT'
     assert called['url'] == 'https://openapi.oemapps.com/posts/7'
     assert called['headers'] == {'token': 'site-token'}

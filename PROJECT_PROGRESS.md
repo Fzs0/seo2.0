@@ -1,6 +1,6 @@
 # SEO Workbench 项目进度
 
-更新时间：2026-07-21（Asia/Shanghai）
+更新时间：2026-07-26（Asia/Shanghai）
 
 > 新窗口先阅读本文，再检查 `git status --short`。工作区有大量已有修改，禁止 `git reset --hard`、批量回滚或覆盖无关文件。
 >
@@ -23,9 +23,21 @@
 | 主站电商 SEO 内容分层 | 已实现只读 V1 | 可查看产品页/分类页/支持文章职责；主站文章候选和生文尚未接入 |
 | 自定义商品数据连接器 | 后端已实现并完成本地验证 | 通用连接器保持只读；支持配置、样例预览、真实请求测试、版本、激活、分页同步和 SEO 缺口审计；尚未制作前端配置页 |
 | 自建站 OEMApps 商品接口 | 后端已实现，待站点配置验收 | 所有自建站共用内置读取/修改协议，每站只配置 Token；SEO 修改要求预览、快照确认、单商品 PUT、审计和回读；Shopify 暂缓 |
-| 当前运行环境 | 未部署本轮最新代码 | 用户需通过根目录 `start-backend.bat` 手动重启 |
+| 当前运行环境 | 本轮源码已加载并通过指纹校验 | 本地 8000 后端健康，`source_drift=false`；后续源码变化必须重启 |
 
-当前最近的可执行动作只有一个：手动重启后，在“今日策略”重新扫描并生成候选，先人工批准 1 条低风险策略，核对策略、执行、发布和 `strategy_effect` 记录。真实验收完成前，不能把本轮代码描述为已上线闭环。
+当前最近的可执行动作是：等待 SerpApi 额度恢复或配置新密钥后，在“今日策略”重新扫描并生成候选，先人工批准 1 条低风险策略，核对策略、执行、发布和 `strategy_effect` 记录。真实验收完成前，不能把本轮代码描述为已上线闭环。
+
+### 2026-07-26 主项目稳定化检查点
+
+- 本轮明确排除 `knowledge/`，只验证主服务、主前端和社媒发布子项目。
+- Trendprairie 文章运行时已复用激活 OEMApps 连接器中的加密 Token；真实同步成功抓取并保存 3 篇文章，Token 未写回站点明文配置。
+- 文章公开 URL 规则已集中到单一解析模块：OEMApps 主站使用 `/blogs/{slug}` canonical，通用内容 OpenAPI 使用配置模板，已知内容站缺配置时回退 `/blog/{slug}`。历史 62 篇缺 URL 内容站文章已回填，当前数据库 `posts=157`、缺 URL 为 0。
+- 旧文效果观察在公开 URL 改变或初始基线没有目标 URL时会把 `baseline_valid` 标记为 false，后续结论固定为 `inconclusive`；新文章的零流量基线保持有效。
+- SERP 失败已结构化区分额度、认证、限流和供应商故障；失败结果不再作为缓存、竞争证据或“0 条自然结果”，批量扫描遇到终止型失败立即停止。当前 SerpApi 外部额度仍为 0，预计 2026-08-04 恢复；恢复前不应执行依赖实时 SERP 的正式扫描。
+- 历史无错误类型的 SERP 失败由 `030_classify_legacy_serp_failures.sql` 标记为 `legacy_unclassified`，只修复告警语义，不伪造历史根因。
+- 后端健康接口新增进程、Git revision、启动时/当前源码指纹和 `source_drift`；`backend-control.ps1` 会拒绝把漂移进程当作当前版本。
+- 默认 `pytest` 发现范围固定为主项目和共享社媒 Python 契约，排除 `knowledge/`、`.codex_tmp/`、`outputs/` 等本地副本，避免重复收集。
+- 完整验证：Python `397 passed`；主前端 `11 passed` 且生产构建通过；社媒前端 `4 passed` 且生产构建通过；两个执行器分别 `2 passed`、`22 passed`，两个浏览器扩展各 `1 passed`；Python compileall、Git diff 检查通过。运行中主后端健康，OpenAPI 为 138 个路径、151 个操作，站点、文章库存和本地文章接口冒烟均返回 200。
 
 2026-07-21 自定义商品数据连接器后端 V1 已完成：新增只读 HTTPS 请求模板、域名白名单、分页、响应校验、字段映射、secret 加密、版本验证/激活、运行记录和产品幂等同步；产品同步后同时保存 TDK、canonical、图片 ALT 等 SEO 审计结果。ExDivo 提供的真实 104 条响应样例已全部成功映射，发现 49 条缺少 meta title、49 条缺少 meta description、461 张图片缺少 ALT。数据库迁移已应用到本地 `pg-workbench`，尚未重启 8000 端口进程；正式保存 token 前还需在 `.env` 配置 `CONNECTOR_SECRET_KEY`。当前仅负责安全读取、标准化和识别缺口，AI 修正与向上游写回仍未实现。
 
@@ -41,9 +53,9 @@
 
 2026-07-22 OEMApps 首页 SEO 接口已接入：`GET/PUT /seoplans` 在 Avinoti 上完成真实同值测试，平台同时容忍响应外壳和纯数据，但适配器固定只提交 `meta_title`、`meta_descript`、`meta_keywords` 三个字段。ExDivo 首页 TDK 已只读同步到 `seo_agent.site_home_seo`，当前 Title、Description、Keywords 均完整。写回接口要求先预览、匹配快照、`confirm=true`、审计和写后回读。
 
-## 0.1 跨窗口恢复点（2026-07-20）
+## 0.1 历史跨窗口恢复点（2026-07-20）
 
-当前主线已从“先做主站文章”收敛为“先建立主站商业页面归属，再生成支持文章”：
+以下内容是 2026-07-20 的恢复快照，不代表 2026-07-26 的运行状态。当时主线从“先做主站文章”收敛为“先建立主站商业页面归属，再生成支持文章”：
 
 ```text
 四类主站索引已导入
@@ -108,8 +120,8 @@ Google GSC/GA4 OAuth 的 `RS256` 依赖已修复：现有 `.venv` 已安装 `cry
 
 ### 站点与文章
 
-- 当前有 8 个活跃站点，本地 `posts` 共 135 条，其中 3 条为 `remote_missing`。
-- 2026-07-19 最近一次只读核对为 `tasks=224`、`articles=0`、`keywords=1,274`、`serp_snapshots=10`；策略候选、计划和执行记录为 0，远端文章没有删除，`posts=135`、`post_analyses=292` 保留。
+- 2026-07-26 当前有 13 个活跃站点，本地 `posts=157`，其中 `remote_missing=3`、缺 URL 为 0。
+- 2026-07-26 只读核对为 `tasks=1,435`、`articles=33`、`keywords=1,885`、`serp_snapshots=66`、`posts=157`、`post_analyses=567`。这些是库存总量，不能直接等同于待执行策略或可发布内容。
 - 独立 knowledge PostgreSQL 已通过 `knowledge/docker-compose.yml` 在本机 `127.0.0.1:5434` 启动，使用独立 volume `knowledge-system-postgres-data`；此前 `knowledge` schema 下的表已清空，目前仅重新创建 Claim-only 表 `knowledge.claims`，并从 `exports/knowledge_claims_2026-07-18` 导入 153 条记录（approved 107、pending 6、rejected 40）。sources/documents/evidence/usages 及其他知识系统表当前不存在，主业务侧尚未接入新的 Claim 检索/API。
 - `exdivo` 是主站，`is_main=true`；站点知识画像已清空。
 - 主站暂不参与自动关键词策略、自动生文和自动发布，后续单独审查产品页、分类页和博客页。
@@ -127,6 +139,7 @@ Google GSC/GA4 OAuth 的 `RS256` 依赖已修复：现有 `.venv` 已安装 `cry
 ### SERP 与竞争文章
 
 - SERP API 快照已持久化，包含关键词、自然结果、相关问题、相关搜索和原始响应。
+- SERP 成功结果才允许进入缓存和策略证据；额度、认证、限流或供应商失败不会被解释成“0 条自然结果”。当前外部额度耗尽，恢复或更换密钥前实时抓取不可用。
 - 已根据 SERP URL 抓取竞争页面 HTML，并提取标题层级、字数、段落、列表、表格、图片、内外链和 FAQ 信号。
 - 竞争特征目前主要保存在 SERP 快照 JSON 中，尚未形成独立的长期结构化分析表。
 - 竞争差距已接入内容审查 AI，但还没有完全进入全局策略的统一排序链路。
@@ -293,7 +306,7 @@ POST /api/v1/publish
 > 以下大部分为 2026-07-18 数据重置前的历史验证证据。当前策略候选、计划和执行数据已清空且 `articles=0`，不能把历史策略任务数当作现状。
 
 ```text
-当前最新回归：项目根目录 `tests/` 223 passed；前端 TypeScript/Vite build、Python compileall、git diff --check 通过。主站内容分层测试和索引合并测试均通过。
+2026-07-26 当前最新非 knowledge 回归：Python `397 passed`；主前端 `11 passed`、社媒前端 `4 passed`，两个执行器分别 `2 passed` 与 `22 passed`，两个浏览器扩展各 `1 passed`；两个前端生产构建、Python compileall、git diff --check 通过。运行中主后端 OpenAPI 为 138 个路径、151 个操作，核心只读接口冒烟返回 200。
 WP 自动新文发布：vapetopline 远端文章 ID 302，状态 publish
 WP 远端 GET 核验：成功
 相关策略 / 任务 / 发布测试：通过
@@ -340,7 +353,7 @@ WordPress 线上修复：经用户明确确认，已使用已保存正文更新 
 ## 8. 新窗口检查命令
 
 ```powershell
-cd D:\桌面\seo2.0
+cd C:\Users\PC\Desktop\seo2.0
 git status --short
 Get-Content -Raw PROJECT_PROGRESS.md
 Get-Content -Raw TXT\strategy-close-loop-2026-07-17\strategy-closed-loop-2026-07-17.md

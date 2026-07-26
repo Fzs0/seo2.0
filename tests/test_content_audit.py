@@ -58,6 +58,59 @@ def test_ai_response_parser_accepts_json_object_and_percentage_confidence():
 
 
 @pytest.mark.asyncio
+async def test_serp_quota_failure_stops_the_rest_of_the_scan(monkeypatch):
+    calls = 0
+
+    async def quota_exhausted(_session, keyword):
+        nonlocal calls
+        calls += 1
+        return {
+            "id": "failure-snapshot",
+            "configured": True,
+            "status": "fetch-failed",
+            "error_type": "quota_exhausted",
+            "retryable": False,
+            "organic_results": [],
+        }
+
+    monkeypatch.setattr(audit_service, "_fetch_and_save_serp", quota_exhausted)
+    items = [
+        {
+            "site_id": "site-1",
+            "keyword_id": f"keyword-{index}",
+            "query": f"query {index}",
+            "evidence": [],
+        }
+        for index in range(3)
+    ]
+    keywords = [
+        {
+            "id": f"keyword-{index}",
+            "assigned_site_id": "site-1",
+            "keyword": f"query {index}",
+        }
+        for index in range(3)
+    ]
+
+    result = await audit_service._attach_evidence(
+        object(),  # type: ignore[arg-type]
+        items,
+        posts=[],
+        keywords=keywords,
+        signals={"gsc_page": {}, "gsc_site": {}, "ga4_page": {}, "ga4_site": {}},
+        serp_snapshots={},
+        fetch_serp=True,
+    )
+
+    assert calls == 1
+    assert result["attempted"] == 1
+    assert result["available"] is False
+    assert result["failure_count"] == 1
+    assert result["last_error_type"] == "quota_exhausted"
+    assert all(not (item["data_evidence"].get("serp")) for item in items)
+
+
+@pytest.mark.asyncio
 async def test_ai_review_merges_structured_decision(monkeypatch):
     seen = {}
 

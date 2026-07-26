@@ -5,15 +5,17 @@ import json
 from html.parser import HTMLParser
 from datetime import datetime
 from typing import Any
-from urllib.parse import quote, urljoin, urlsplit, urlunsplit
+from urllib.parse import quote, urljoin
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.clients.http_client import ExternalCallError, request_text
 from app.clients.publishers import PublisherBase
+from app.core.article_urls import resolve_article_public_url
 from app.services.shopify_connection_service import publisher_for_site_runtime
 from app.services.post_analysis_service import persist_post_analysis
+from app.services.strategy_effect_service import reconcile_effect_target_url
 
 
 async def sync_site_posts(session: AsyncSession, *, site_id: str, limit: int = 100) -> dict[str, Any]:
@@ -206,11 +208,13 @@ def _normalize_openapi(p: dict[str, Any], site: dict[str, Any] | None = None) ->
     site = site or {}
     slug = p.get("slug") or p.get("handle")
     article_id = p.get("id") or p.get("articleId") or p.get("external_id")
-    url = p.get("url") or p.get("link") or p.get("detail_url") or p.get("detailUrl") or None
-    if not url:
-        url = _public_article_url(site, slug, article_id)
-    else:
-        url = _rewrite_public_host(site, url)
+    url = resolve_article_public_url(
+        site,
+        slug=slug,
+        article_id=article_id,
+        remote_url=p.get("url") or p.get("link") or p.get("detail_url") or p.get("detailUrl"),
+        canonical_url=p.get("canonical_url") or p.get("canonicalUrl"),
+    )
     return {
         "external_id": str(article_id or url or ""),
         "title": p.get("title") or "untitled",
@@ -369,38 +373,6 @@ def _parse_public_article_html(source: str) -> dict[str, Any]:
     }
 
 
-def _public_article_url(site: dict[str, Any], slug: Any, article_id: Any) -> str | None:
-    if not slug and not article_id:
-        return None
-    path = (site.get("api_config") or {}).get("articleUrlPath")
-    if not path:
-        return None
-    path = str(path).replace("{slug}", quote(str(slug or ""), safe=""))
-    path = path.replace("{id}", quote(str(article_id or ""), safe=""))
-    if path.startswith(("http://", "https://")):
-        return path
-    base = str(site.get("base_url") or site.get("domain") or "").strip()
-    if not base:
-        return None
-    if not base.startswith(("http://", "https://")):
-        base = f"https://{base}"
-    return urljoin(f"{base.rstrip('/')}/", path.lstrip("/"))
-
-
-def _rewrite_public_host(site: dict[str, Any], url: Any) -> str | None:
-    raw_url = str(url or "").strip()
-    base = str(site.get("base_url") or "").strip()
-    if not raw_url or not base:
-        return raw_url or None
-    if not base.startswith(("http://", "https://")):
-        base = f"https://{base}"
-    parsed = urlsplit(raw_url)
-    public = urlsplit(base)
-    if not parsed.netloc or not public.netloc or parsed.netloc.lower() == public.netloc.lower():
-        return raw_url
-    return urlunsplit((public.scheme, public.netloc, parsed.path, parsed.query, parsed.fragment))
-
-
 def _openapi_status(value: Any) -> str | None:
     if value in (1, "1", "published", "publish"):
         return "published"
@@ -475,6 +447,7 @@ async def _upsert_post(session: AsyncSession, site: dict[str, Any], post: dict[s
     await persist_post_analysis(session, str(row["id"]), {**post, "fetched_at": row["fetched_at"]})
     await _sync_linked_article_url(
         session,
+        post_id=str(row["id"]),
         site_id=str(site["id"]),
         external_id=post.get("external_id"),
         slug=post.get("slug"),
@@ -485,6 +458,7 @@ async def _upsert_post(session: AsyncSession, site: dict[str, Any], post: dict[s
 async def _sync_linked_article_url(
     session: AsyncSession,
     *,
+    post_id: str,
     site_id: str,
     external_id: Any,
     slug: Any,
@@ -492,21 +466,36 @@ async def _sync_linked_article_url(
 ) -> None:
     if not external_id or not url:
         return
-    await session.execute(
+    linked = await session.execute(
         text(
             """
             WITH linked AS (
-              UPDATE seo_agent.articles
-                 SET slug = COALESCE(NULLIF(:slug, ''), slug), published_url = :url, updated_at = now()
+              SELECT id
+                FROM seo_agent.articles
                WHERE site_id = CAST(:site_id AS uuid) AND published_post_id = :external_id
-               RETURNING id
+            ),
+            updated AS (
+              UPDATE seo_agent.articles article
+                 SET slug = COALESCE(NULLIF(:slug, ''), article.slug),
+                     target_url = CASE
+                       WHEN article.target_url = article.published_url THEN :url
+                       ELSE article.target_url
+                     END,
+                     published_url = :url,
+                     updated_at = now()
+                FROM linked
+               WHERE article.id = linked.id
+                 AND (
+                   article.slug IS DISTINCT FROM COALESCE(NULLIF(:slug, ''), article.slug)
+                   OR article.published_url IS DISTINCT FROM :url
+                   OR (
+                     article.target_url = article.published_url
+                     AND article.target_url IS DISTINCT FROM :url
+                   )
+                 )
+              RETURNING article.id
             )
-            UPDATE seo_agent.tasks
-               SET target_url = :url,
-                   payload = payload || jsonb_build_object('target_url', :url),
-                   updated_at = now()
-             WHERE task_type = 'review' AND payload->>'kind' = 'strategy_effect'
-               AND article_id IN (SELECT id FROM linked)
+            SELECT id::text AS id FROM linked
             """
         ),
         {
@@ -515,6 +504,59 @@ async def _sync_linked_article_url(
             "slug": str(slug or ""),
             "url": str(url),
         },
+    )
+    article_ids = [str(row["id"]) for row in linked.mappings().all()]
+    if article_ids:
+        effects = await session.execute(
+            text(
+                """
+                SELECT id::text AS id, target_url, payload
+                  FROM seo_agent.tasks
+                 WHERE task_type = 'review' AND payload->>'kind' = 'strategy_effect'
+                   AND status = 'queued'
+                   AND article_id::text = ANY(CAST(:article_ids AS text[]))
+                   FOR UPDATE
+                """
+            ),
+            {"article_ids": article_ids},
+        )
+        for effect in effects.mappings().all():
+            original_payload = dict(effect["payload"] or {})
+            payload = reconcile_effect_target_url(
+                original_payload,
+                current_target_url=effect["target_url"],
+                new_target_url=url,
+            )
+            if str(effect["target_url"] or "") == str(url) and payload == original_payload:
+                continue
+            await session.execute(
+                text(
+                    """
+                    UPDATE seo_agent.tasks
+                       SET target_url = :url,
+                           payload = CAST(:payload AS jsonb),
+                           updated_at = now()
+                     WHERE id = CAST(:id AS uuid) AND status = 'queued'
+                    """
+                ),
+                {
+                    "id": str(effect["id"]),
+                    "url": str(url),
+                    "payload": json.dumps(payload, ensure_ascii=False, default=str),
+                },
+            )
+    await session.execute(
+        text(
+            """
+            UPDATE seo_agent.tasks
+               SET payload = jsonb_set(payload, '{item,url}', to_jsonb(CAST(:url AS text))),
+                   updated_at = now()
+             WHERE task_type = 'review' AND payload->>'kind' = 'content_audit'
+               AND status = 'queued'
+               AND post_id = CAST(:post_id AS uuid)
+            """
+        ),
+        {"post_id": post_id, "url": str(url)},
     )
 
 

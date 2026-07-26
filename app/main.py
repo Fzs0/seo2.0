@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
+from typing import Any
 
 import structlog
 from fastapi import FastAPI
@@ -12,6 +13,7 @@ from app.core.config import get_settings
 from app.core.database import SessionLocal
 from app.core.google_config import get_store as get_google_store
 from app.core.logging import configure_logging, get_logger
+from app.core.runtime_identity import capture_runtime_identity, runtime_health
 from app.engine.loader import get_store
 from app.middleware.errors import install_exception_handlers
 from app.middleware.metrics import MetricsMiddleware, metrics_response
@@ -19,6 +21,7 @@ from app.middleware.trace import TraceIdMiddleware
 
 logger = get_logger(__name__)
 settings = get_settings()
+runtime_identity = capture_runtime_identity()
 
 # Google 同步调度：每 N 秒跑一次（默认 6 小时 = 21600 秒）。
 GOOGLE_SYNC_INTERVAL_SECONDS = 21600
@@ -208,8 +211,13 @@ def create_app() -> FastAPI:
     app.include_router(admin_router, prefix="/admin")
 
     @app.get("/api/health")
-    async def health() -> dict[str, str]:
-        return {"ok": "true", "name": settings.app_name, "env": settings.app_env}
+    async def health() -> dict[str, Any]:
+        return {
+            "ok": "true",
+            "name": settings.app_name,
+            "env": settings.app_env,
+            **runtime_health(runtime_identity),
+        }
 
     @app.get("/metrics")
     async def metrics():

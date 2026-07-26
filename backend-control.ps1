@@ -31,12 +31,23 @@ function Get-BackendInfo {
         $_.CommandLine -match 'app\.main:app' -and $_.CommandLine -match "--port\s+$Port"
     }
     $managed = $chain | Where-Object { $_.CommandLine -match $projectPattern } | Select-Object -First 1
-    $state = if ($uvicorn -and $managed) { 'managed' } elseif ($uvicorn) { 'unmanaged' } else { 'occupied' }
+    $health = $null
+    if ($uvicorn -and $managed) {
+        try {
+            $health = Invoke-RestMethod -Uri $healthUrl -TimeoutSec 5
+        } catch {
+            $health = $null
+        }
+    }
+    $hasFingerprint = $health -and $health.PSObject.Properties['startup_source_fingerprint']
+    $stale = ($uvicorn -and $managed) -and ((-not $hasFingerprint) -or [bool]$health.source_drift)
+    $state = if ($stale) { 'stale' } elseif ($uvicorn -and $managed) { 'managed' } elseif ($uvicorn) { 'unmanaged' } else { 'occupied' }
     [pscustomobject]@{
         State = $state
         ListenerPid = $listener.OwningProcess
         RootPid = if ($managed) { $managed.ProcessId } else { $null }
         Chain = $chain
+        Health = $health
     }
 }
 
@@ -48,6 +59,10 @@ switch ($Action) {
         if ($info.State -eq 'managed') {
             Write-Host "Managed backend already listens on port $Port (root PID $($info.RootPid))."
             exit 1
+        }
+        if ($info.State -eq 'stale') {
+            Write-Host "Backend source is stale or unverifiable on port $Port. Run start-backend.bat restart."
+            exit 3
         }
         Write-Host "Port $Port is occupied by an unmanaged process."
         $info.Chain | ForEach-Object { Write-Host "PID $($_.ProcessId): $($_.CommandLine)" }
@@ -62,12 +77,18 @@ switch ($Action) {
         Write-Host "Listener PID: $($info.ListenerPid)"
         if ($info.RootPid) { Write-Host "Managed root PID: $($info.RootPid)" }
         $info.Chain | ForEach-Object { Write-Host "PID $($_.ProcessId): $($_.CommandLine)" }
-        try {
-            $health = Invoke-RestMethod -Uri $healthUrl -TimeoutSec 5
-            Write-Host "Health: $($health.ok) ($($health.name), $($health.env))"
-        } catch {
-            Write-Host "Health: unavailable ($($_.Exception.Message))"
+        if ($info.Health) {
+            Write-Host "Health: $($info.Health.ok) ($($info.Health.name), $($info.Health.env))"
+            if ($info.Health.PSObject.Properties['source_drift']) {
+                Write-Host "Source drift: $($info.Health.source_drift)"
+                Write-Host "Revision: $($info.Health.revision)"
+            } else {
+                Write-Host "Source drift: unverifiable (restart required)"
+            }
+        } else {
+            Write-Host "Health: unavailable"
         }
+        if ($info.State -eq 'stale') { exit 3 }
         exit 0
     }
     'stop' {
@@ -75,7 +96,7 @@ switch ($Action) {
             Write-Host 'Backend is already stopped.'
             exit 0
         }
-        if ($info.State -ne 'managed' -or -not $info.RootPid) {
+        if ($info.State -notin @('managed', 'stale') -or -not $info.RootPid) {
             Write-Host 'Refusing to stop an unmanaged or unrelated process on port 8000.'
             exit 2
         }

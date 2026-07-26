@@ -2,15 +2,17 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from typing import Any
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import httpx
 import structlog
 from tenacity import (
     AsyncRetrying,
     RetryError,
-    retry_if_exception_type,
+    retry_if_exception,
     stop_after_attempt,
     wait_exponential,
 )
@@ -24,6 +26,44 @@ _settings = get_settings()
 
 class ExternalCallError(Exception):
     """外部调用失败，统一抛出。"""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        retryable: bool | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.retryable = retryable
+
+
+_SENSITIVE_QUERY_KEY = re.compile(
+    r"(?:api[_-]?key|(?:access[_-]?)?token|auth(?:orization)?|secret|password|signature)",
+    re.IGNORECASE,
+)
+
+
+def safe_log_url(url: str) -> str:
+    """Remove credentials from URLs before they reach logs or exceptions."""
+    parsed = urlsplit(str(url))
+    query = [
+        (key, "[REDACTED]" if _SENSITIVE_QUERY_KEY.fullmatch(key) else value)
+        for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+    ]
+    host = parsed.hostname or ""
+    if parsed.port:
+        host = f"{host}:{parsed.port}"
+    return urlunsplit((parsed.scheme, host, parsed.path, urlencode(query), parsed.fragment))
+
+
+def _retryable_http_error(error: BaseException) -> bool:
+    if isinstance(error, (httpx.TransportError, asyncio.TimeoutError)):
+        return True
+    if isinstance(error, httpx.HTTPStatusError):
+        return error.response.status_code == 408 or error.response.status_code >= 500
+    return False
 
 
 async def request_json(
@@ -47,7 +87,7 @@ async def request_json(
         async for attempt in AsyncRetrying(
             stop=stop_after_attempt(max(1, attempts)),
             wait=wait_exponential(multiplier=0.5, min=0.5, max=4),
-            retry=retry_if_exception_type((httpx.HTTPError, asyncio.TimeoutError)),
+            retry=retry_if_exception(_retryable_http_error),
             reraise=True,
         ):
             with attempt:
@@ -63,20 +103,28 @@ async def request_json(
                     resp.raise_for_status()
                     return resp.json() if resp.content else {}
     except RetryError as e:
-        logger.error("external_call_retry_exhausted", client=client_label, url=url, error=str(e))
-        raise ExternalCallError(f"{client_label} 重试耗尽：{e}") from e
+        logger.error("external_call_retry_exhausted", client=client_label, url=safe_log_url(url), error=str(e))
+        raise ExternalCallError(f"{client_label} 重试耗尽：{e}", retryable=True) from e
     except httpx.HTTPStatusError as e:
-        logger.error("external_call_status_error", client=client_label, url=url, status=e.response.status_code)
+        status_code = e.response.status_code
+        logger.error("external_call_status_error", client=client_label, url=safe_log_url(url), status=status_code)
         signals = "; ".join(
             f"{key}={e.response.headers[key]}"
             for key in ("server", "cf-ray", "cf-mitigated", "x-cache")
             if e.response.headers.get(key)
         )
         suffix = f"（{signals}）" if signals else ""
-        raise ExternalCallError(f"{client_label} 状态码 {e.response.status_code}{suffix}") from e
+        raise ExternalCallError(
+            f"{client_label} 状态码 {status_code}{suffix}",
+            status_code=status_code,
+            retryable=_retryable_http_error(e),
+        ) from e
     except (httpx.HTTPError, asyncio.TimeoutError) as e:
-        logger.error("external_call_failed", client=client_label, url=url, error=str(e))
-        raise ExternalCallError(f"{client_label} 调用失败（{type(e).__name__}）：{str(e) or '无详细信息'}") from e
+        logger.error("external_call_failed", client=client_label, url=safe_log_url(url), error=str(e))
+        raise ExternalCallError(
+            f"{client_label} 调用失败（{type(e).__name__}）：{str(e) or '无详细信息'}",
+            retryable=True,
+        ) from e
     finally:
         external_call_duration_seconds.labels(client=client_label).observe(time.perf_counter() - start)
 
@@ -100,7 +148,7 @@ async def request_text(
         async for attempt in AsyncRetrying(
             stop=stop_after_attempt(max(1, attempts)),
             wait=wait_exponential(multiplier=0.5, min=0.5, max=4),
-            retry=retry_if_exception_type((httpx.HTTPError, asyncio.TimeoutError)),
+            retry=retry_if_exception(_retryable_http_error),
             reraise=True,
         ):
             with attempt:
@@ -109,20 +157,28 @@ async def request_text(
                     resp.raise_for_status()
                     return resp.text
     except RetryError as e:
-        logger.error("external_call_retry_exhausted", client=client_label, url=url, error=str(e))
-        raise ExternalCallError(f"{client_label} 重试耗尽：{e}") from e
+        logger.error("external_call_retry_exhausted", client=client_label, url=safe_log_url(url), error=str(e))
+        raise ExternalCallError(f"{client_label} 重试耗尽：{e}", retryable=True) from e
     except httpx.HTTPStatusError as e:
-        logger.error("external_call_status_error", client=client_label, url=url, status=e.response.status_code)
+        status_code = e.response.status_code
+        logger.error("external_call_status_error", client=client_label, url=safe_log_url(url), status=status_code)
         signals = "; ".join(
             f"{key}={e.response.headers[key]}"
             for key in ("server", "cf-ray", "cf-mitigated", "x-cache")
             if e.response.headers.get(key)
         )
         suffix = f"（{signals}）" if signals else ""
-        raise ExternalCallError(f"{client_label} 状态码 {e.response.status_code}{suffix}") from e
+        raise ExternalCallError(
+            f"{client_label} 状态码 {status_code}{suffix}",
+            status_code=status_code,
+            retryable=_retryable_http_error(e),
+        ) from e
     except (httpx.HTTPError, asyncio.TimeoutError) as e:
-        logger.error("external_call_failed", client=client_label, url=url, error=str(e))
-        raise ExternalCallError(f"{client_label} 调用失败（{type(e).__name__}）：{str(e) or '无详细信息'}") from e
+        logger.error("external_call_failed", client=client_label, url=safe_log_url(url), error=str(e))
+        raise ExternalCallError(
+            f"{client_label} 调用失败（{type(e).__name__}）：{str(e) or '无详细信息'}",
+            retryable=True,
+        ) from e
     finally:
         external_call_duration_seconds.labels(client=client_label).observe(time.perf_counter() - start)
 
@@ -146,7 +202,7 @@ async def request_bytes(
         async for attempt in AsyncRetrying(
             stop=stop_after_attempt(max(1, attempts)),
             wait=wait_exponential(multiplier=0.5, min=0.5, max=4),
-            retry=retry_if_exception_type((httpx.HTTPError, asyncio.TimeoutError)),
+            retry=retry_if_exception(_retryable_http_error),
             reraise=True,
         ):
             with attempt:
@@ -155,19 +211,27 @@ async def request_bytes(
                     resp.raise_for_status()
                     return resp.content
     except RetryError as e:
-        logger.error("external_call_retry_exhausted", client=client_label, url=url, error=str(e))
-        raise ExternalCallError(f"{client_label} 重试耗尽：{e}") from e
+        logger.error("external_call_retry_exhausted", client=client_label, url=safe_log_url(url), error=str(e))
+        raise ExternalCallError(f"{client_label} 重试耗尽：{e}", retryable=True) from e
     except httpx.HTTPStatusError as e:
-        logger.error("external_call_status_error", client=client_label, url=url, status=e.response.status_code)
+        status_code = e.response.status_code
+        logger.error("external_call_status_error", client=client_label, url=safe_log_url(url), status=status_code)
         signals = "; ".join(
             f"{key}={e.response.headers[key]}"
             for key in ("server", "cf-ray", "cf-mitigated", "x-cache")
             if e.response.headers.get(key)
         )
         suffix = f"（{signals}）" if signals else ""
-        raise ExternalCallError(f"{client_label} 状态码 {e.response.status_code}{suffix}") from e
+        raise ExternalCallError(
+            f"{client_label} 状态码 {status_code}{suffix}",
+            status_code=status_code,
+            retryable=_retryable_http_error(e),
+        ) from e
     except (httpx.HTTPError, asyncio.TimeoutError) as e:
-        logger.error("external_call_failed", client=client_label, url=url, error=str(e))
-        raise ExternalCallError(f"{client_label} 调用失败（{type(e).__name__}）：{str(e) or '无详细信息'}") from e
+        logger.error("external_call_failed", client=client_label, url=safe_log_url(url), error=str(e))
+        raise ExternalCallError(
+            f"{client_label} 调用失败（{type(e).__name__}）：{str(e) or '无详细信息'}",
+            retryable=True,
+        ) from e
     finally:
         external_call_duration_seconds.labels(client=client_label).observe(time.perf_counter() - start)

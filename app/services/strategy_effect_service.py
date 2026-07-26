@@ -13,6 +13,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 POLICY_VERSION = "strategy_policy_v1"
 CHECKPOINT_DAYS = (7, 14, 28, 56, 90)
+URL_CHANGE_BASELINE_NOTE = (
+    "文章公开 URL 已切换为 canonical 地址；旧 URL 的发布前基线不可直接比较。"
+)
 
 
 def resolve_strategy_target_url(strategy: dict[str, Any]) -> str | None:
@@ -26,6 +29,63 @@ def resolve_strategy_target_url(strategy: dict[str, Any]) -> str | None:
         (evidence.get("content_audit") or {}).get("url"),
     )
     return next((str(value).strip() for value in candidates if _is_page_url(value)), None)
+
+
+def reconcile_effect_target_url(
+    payload: dict[str, Any],
+    *,
+    current_target_url: Any,
+    new_target_url: Any,
+) -> dict[str, Any]:
+    """Reconcile an effect with a newly confirmed public article URL.
+
+    Update strategies measured the old page before publication, so changing
+    that page identity invalidates the comparison baseline. New-article
+    strategies intentionally start from a zero landing-page baseline and must
+    remain valid.
+    """
+    reconciled = dict(payload or {})
+    new_url = str(new_target_url or "").strip()
+    if not new_url:
+        return reconciled
+
+    previous_url = str(
+        current_target_url or reconciled.get("target_url") or ""
+    ).strip()
+    reconciled["target_url"] = new_url
+    url_changed = _effect_url_key(previous_url) != _effect_url_key(new_url)
+    initial_new_article = (
+        reconciled.get("action") == "new_article"
+        and not (reconciled.get("checkpoints") or [])
+        and _has_zero_landing_page_baseline(reconciled)
+    )
+    if url_changed and not initial_new_article:
+        reconciled["baseline_valid"] = False
+        if previous_url and not reconciled.get("previous_target_url"):
+            reconciled["previous_target_url"] = previous_url
+        if not reconciled.get("baseline_note"):
+            reconciled["baseline_note"] = URL_CHANGE_BASELINE_NOTE
+    return reconciled
+
+
+def _has_zero_landing_page_baseline(payload: dict[str, Any]) -> bool:
+    ga4 = ((payload.get("baseline") or {}).get("ga4") or {})
+    try:
+        return float(ga4.get("sessions")) == 0 and float(ga4.get("conversions")) == 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _effect_url_key(value: Any) -> tuple[str, str, str]:
+    raw = str(value or "").strip()
+    if not raw:
+        return ("", "", "")
+    parsed = urlsplit(raw)
+    return (
+        parsed.scheme.casefold(),
+        parsed.netloc.casefold(),
+        parsed.path.rstrip("/") or "/",
+    )
 
 
 def _is_page_url(value: Any) -> bool:
@@ -171,10 +231,13 @@ def classify_outcome(
     delta: dict[str, float | None],
     *,
     contaminated: bool = False,
+    baseline_valid: bool = True,
     day: int = 90,
 ) -> str:
     if contaminated:
         return "contaminated"
+    if not baseline_valid:
+        return "inconclusive"
     if day < 28:
         return "inconclusive"
     if int((snapshot.get("gsc") or {}).get("impressions") or 0) < 200:
@@ -425,6 +488,8 @@ async def backfill_missing_effect_target_urls(session: AsyncSession, *, business
             "target_url": target_url,
             "baseline_note": "初始基线创建时未绑定目标 URL；其中的 0 值不能作为可靠的更新前对比。",
         }
+        if dict(row["payload"] or {}).get("action") == "update_article":
+            patch["baseline_valid"] = False
         await session.execute(
             text(
                 """
@@ -508,7 +573,13 @@ async def process_due_effects(session: AsyncSession, *, limit: int = 3) -> dict[
             published_at=published_at,
         )
         delta = metric_delta(payload.get("baseline") or {}, snapshot)
-        outcome = classify_outcome(snapshot, delta, contaminated=contaminated, day=day)
+        outcome = classify_outcome(
+            snapshot,
+            delta,
+            contaminated=contaminated,
+            baseline_valid=payload.get("baseline_valid") is not False,
+            day=day,
+        )
         checkpoint = {"day": day, "snapshot": snapshot, "delta": delta, "outcome": outcome}
         checkpoints = [*(payload.get("checkpoints") or []), checkpoint]
         finished = day >= CHECKPOINT_DAYS[-1]

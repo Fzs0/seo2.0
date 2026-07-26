@@ -37,6 +37,10 @@ if "%GUARD_RESULT%"=="1" (
   echo Backend is already managed on port 8000. Use start-backend.bat status.
   exit /b 0
 )
+if "%GUARD_RESULT%"=="3" (
+  echo Backend is running stale source. Use start-backend.bat restart.
+  exit /b 3
+)
 if not "%GUARD_RESULT%"=="0" (
   echo Port 8000 is occupied by an unmanaged process. No backend was started.
   exit /b 2

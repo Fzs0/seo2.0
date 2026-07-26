@@ -32,6 +32,10 @@ def configure_logging(level: str = "INFO", json_output: bool = True, log_file: s
     """
     log_level = getattr(logging, level.upper(), logging.INFO)
     logging.basicConfig(level=log_level, stream=sys.stdout, format="%(message)s")
+    # httpx/httpcore INFO records include fully rendered request URLs, including
+    # sensitive query parameters that are outside our structured-log redactor.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
     output: Any = sys.stdout
     if log_file:
         path = Path(log_file)

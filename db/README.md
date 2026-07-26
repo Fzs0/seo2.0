@@ -18,6 +18,8 @@
 | `migrations/015_site_strategy_scope.sql` | 站点业务归属与策略开关：`business_id` / `strategy_enabled` + 范围索引 |
 | `migrations/016_knowledge_claims.sql` | 从独立 knowledge 服务迁入 Claim-only 数据：审核/质量字段保留，不迁移来源、文档、证据和使用记录 |
 | `migrations/017_keyword_business_import_scope.sql` | 把关键词导入唯一键纳入 `business_id`，避免不同业务导入相同市场关键词时互相覆盖 |
+| `migrations/029_strategy_effect_baseline_validity.sql` | 把缺少原始目标 URL 的旧文更新效果基线标记为不可比较，避免产生伪效果结论 |
+| `migrations/030_classify_legacy_serp_failures.sql` | 将旧客户端留下的无错误类型 SERP 失败标记为 `legacy_unclassified`，避免与当前故障混淆 |
 | `scripts/seed_rule_baseline.mjs` | 把 `workflows/seo-standard.json` 灌入一次 baseline 的 Node.js 脚本 |
 
 ---

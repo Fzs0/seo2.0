@@ -14,7 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.clients.ai_provider import generate_ai_content, is_stage_configured
 from app.clients.publishers import strip_markdown_frontmatter
-from app.clients.serpapi import fetch_google_serp
+from app.clients.serpapi import fetch_google_serp, is_usable_serp_result
 from app.engine.content_plan import image_plan_for, reference_plan
 from app.services.article_service import save_article
 from app.services.brief_service import build_brief_with_optional_ai
@@ -210,7 +210,9 @@ async def generate_article_pipeline(
     ok(
         "serp",
         "获取 SERP",
-        "已获取真实搜索结果" if serp.get("configured") or serp.get("source") == "cache" else serp.get("status") or "SerpApi 未配置，未使用搜索结果",
+        "已获取真实搜索结果"
+        if is_usable_serp_result(serp)
+        else serp.get("error_type") or serp.get("status") or "SerpApi 未配置，未使用搜索结果",
         {"source": serp.get("source"), "id": serp.get("id"), "organicCount": len(serp.get("organic_results") or [])},
     )
     logger.info(
@@ -485,7 +487,7 @@ async def _latest_or_fetch_serp(session: AsyncSession, keyword: dict[str, Any]) 
         await session.execute(
             text(
                 """
-                SELECT id, organic_results, related_questions, related_searches, requested_at
+                SELECT id, organic_results, related_questions, related_searches, requested_at, raw
                   FROM seo_agent.serp_snapshots
                  WHERE keyword_id = CAST(:keyword_id AS uuid)
                  ORDER BY requested_at DESC
@@ -496,7 +498,15 @@ async def _latest_or_fetch_serp(session: AsyncSession, keyword: dict[str, Any]) 
         )
     ).mappings().first()
     if row:
-        return {**dict(row), "id": str(row["id"]), "requested_at": str(row["requested_at"]), "source": "cache"}
+        cached = {
+            **dict(row),
+            **(dict(row.get("raw") or {}) if isinstance(row.get("raw"), dict) else {}),
+            "id": str(row["id"]),
+            "requested_at": str(row["requested_at"]),
+            "source": "cache",
+        }
+        if is_usable_serp_result(cached):
+            return cached
 
     data = await fetch_google_serp(
         keyword["keyword"],
@@ -698,7 +708,11 @@ def _qa(
 ) -> list[dict[str, Any]]:
     h1 = re.findall(r"^#\s+(.+)$", content, re.M)
     title_years = re.findall(r"\b20\d{2}\b", " ".join([title, *h1]))
-    planned_urls = [str(link.get("url") or "") for link in internal_link_plan or [] if link.get("url")]
+    planned_urls = [
+        str(link.get("url") or link.get("target_url") or "")
+        for link in internal_link_plan or []
+        if link.get("url") or link.get("target_url")
+    ]
     required_context_modules = set((generation_context or {}).get("required_modules") or [])
     faq_required = not generation_context or "faq" in required_context_modules
     metadata_policy = (generation_context or {}).get("metadata_policy") or {"min": 120, "max": 160}

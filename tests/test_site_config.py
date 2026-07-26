@@ -21,6 +21,20 @@ def test_site_config_normalizes_market_and_language_codes():
     assert site["semrush_database"] == "de"
 
 
+def test_site_config_keeps_public_article_url_template():
+    site = _normalize(
+        {
+            "name": "topvapes.de",
+            "siteUrl": "https://topvapes.de",
+            "apiBaseUrl": "https://topvapes.de/api/open/v1",
+            "articleUrlPath": "/blog/{slug}",
+        },
+        "blog",
+    )
+
+    assert site["api_config"]["articleUrlPath"] == "/blog/{slug}"
+
+
 def test_locale_fallback_sets_google_language_code_without_presets():
     locale = locale_for_market("US / English")
 

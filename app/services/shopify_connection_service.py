@@ -18,6 +18,7 @@ from app.clients.publishers import (
     publisher_for_site,
 )
 from app.connectors.secrets import SecretCipher
+from app.core.article_urls import is_oemapps_site
 from app.core.config import get_settings
 
 
@@ -329,7 +330,22 @@ async def publisher_for_site_runtime(
         or ""
     ).casefold()
     if site_type not in {"shopify", "shopify_admin"}:
-        return publisher_for_site(site, dry_run=dry_run)
+        runtime_site = site
+        if is_oemapps_site(site):
+            token = await _load_active_oemapps_token(
+                session,
+                site_id=str(site["id"]),
+                require_active=require_active,
+            )
+            if token:
+                runtime_site = {
+                    **site,
+                    "api_config": {
+                        **dict(site.get("api_config") or {}),
+                        "tokenB": token,
+                    },
+                }
+        return publisher_for_site(runtime_site, dry_run=dry_run)
     if dry_run and not require_active:
         try:
             stored, secrets = await load_shopify_runtime(
@@ -351,6 +367,40 @@ async def publisher_for_site_runtime(
         },
     }
     return ShopifyPublisher(runtime_site, dry_run=dry_run, credentials=secrets)
+
+
+async def _load_active_oemapps_token(
+    session: AsyncSession,
+    *,
+    site_id: str,
+    require_active: bool,
+) -> str | None:
+    status_clause = "AND c.status = 'active'" if require_active else ""
+    version_column = "c.active_version" if require_active else "c.current_version"
+    row = (
+        await session.execute(
+            text(
+                f"""
+                SELECT secrets.encrypted_value
+                  FROM seo_agent.custom_connectors c
+                  JOIN seo_agent.custom_connector_versions version
+                    ON version.connector_id = c.id
+                   AND version.version = {version_column}
+                  JOIN seo_agent.custom_connector_secrets secrets
+                    ON secrets.connector_id = c.id
+                 WHERE c.site_id = CAST(:site_id AS uuid)
+                   AND version.config->>'adapter' = 'oemapps'
+                   {status_clause}
+                 ORDER BY c.updated_at DESC
+                 LIMIT 1
+                """
+            ),
+            {"site_id": site_id},
+        )
+    ).mappings().first()
+    if not row:
+        return None
+    return str(_cipher().decrypt(row["encrypted_value"]).get("token") or "").strip() or None
 
 
 async def test_shopify_connection(session: AsyncSession, *, site_id: str) -> dict[str, Any]:
