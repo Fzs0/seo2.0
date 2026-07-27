@@ -117,7 +117,93 @@ async def test_keywordless_new_article_is_rejected() -> None:
     )
 
     assert result["status"] == "failed"
-    assert "必须关联关键词" in result["steps"][0]["message"]
+    assert "证据快照" in result["steps"][0]["message"]
+
+
+@pytest.mark.asyncio
+async def test_keywordless_new_article_reaches_execution_with_verified_evidence(monkeypatch: pytest.MonkeyPatch) -> None:
+    decision = {
+        "business_id": "business-a",
+        "strategy_type": "new_article",
+        "query": "how to choose a titanium tea set",
+        "risk_level": "standard",
+        "risk_gate_passed": True,
+        "scope_key": "scope-id",
+        "strategy_fingerprint": "strategy-id",
+        "evidence_fingerprint": "evidence-id",
+        "execution_evidence": {
+            "search_intent": {"status": "confirmed", "source": "live_serp", "snapshot_id": "serp-1"},
+            "topic_basis": {"product_or_category_match": True, "content_gap": True},
+            "cannibalization": {"status": "clear"},
+            "product_facts": [{"name": "material", "value": "titanium"}],
+            "authority_sources": [],
+            "evidence_sources": ["products", "live_serp", "content_audit"],
+            "snapshots": {"serp": "serp-1", "content_audit": "audit-1"},
+        },
+    }
+
+    class Session(_Session):
+        async def execute(self, statement, params=None):
+            sql = str(statement)
+            self.calls.append((sql, params or {}))
+            if "SELECT t.decision, t.site_id" in sql:
+                return _Rows([{
+                    "decision": {**decision, "execution_task_id": "execution-id"},
+                    "site_id": "site-id", "keyword_id": None, "post_id": None,
+                    "site_status": "active", "business_id": "business-a", "strategy_enabled": True,
+                    "task_business_id": "business-a", "candidate_id": "candidate-id",
+                    "plan_id": "plan-id", "analysis_batch_id": "analysis-id",
+                }])
+            if "SELECT id, task_type, status, site_id, keyword_id" in sql:
+                return _Rows([{
+                    "id": "execution-id", "task_type": "new_article", "status": "running",
+                    "site_id": "site-id", "keyword_id": None, "post_id": None,
+                    "payload": {"strategy": decision, "auto_publish": False},
+                }])
+            if "AS candidate_ok" in sql:
+                return _Rows([{
+                    "candidate_ok": True, "plan_ok": True, "analysis_ok": True,
+                    "keyword_ok": True, "target_ok": True, "conflict_ok": True, "effect_ok": True,
+                }])
+            if "SELECT name, status, business_id" in sql:
+                return _Rows([{
+                    "id": "site-id", "name": "Tea", "status": "active",
+                    "business_id": "business-a", "strategy_enabled": True,
+                    "market": "US", "language_code": "en", "site_type": "main",
+                    "domain": "example.com", "base_url": "https://example.com",
+                    "api_base_url": None, "api_config": {},
+                }])
+            return _Rows([])
+
+    captured: dict = {}
+
+    async def pipeline(_session, keyword_id, **kwargs):
+        captured.update(keyword_id=keyword_id, **kwargs)
+        return {"status": "done", "article": {"id": "article-id"}}
+
+    async def baseline(*args, **kwargs):
+        return {"id": "effect-id"}
+
+    monkeypatch.setattr(article_generation_service, "generate_article_pipeline", pipeline)
+    monkeypatch.setattr(strategy_execution, "ensure_effect", baseline)
+    session = Session()
+
+    result = await strategy_execution.execute_strategy(
+        session,  # type: ignore[arg-type]
+        task_id="strategy-id",
+        execution_task_id="execution-id",
+        allow_running=True,
+    )
+
+    assert result["ok"] is True
+    assert captured["keyword_id"] is None
+    assert captured["keyword_context"]["keyword"] == decision["query"]
+    assert captured["keyword_context"]["evidence_sources"] == ["products", "live_serp", "content_audit"]
+    assert captured["keyword_context"]["evidence_snapshot"] == {
+        "serp": "serp-1",
+        "content_audit": "audit-1",
+    }
+    assert not any("UPDATE seo_agent.keywords" in sql for sql, _ in session.calls)
 
 
 @pytest.mark.asyncio
@@ -127,6 +213,7 @@ async def test_keywordless_update_can_be_reviewed_and_executed(monkeypatch: pyte
         "business_id": "business-a",
         "strategy_type": "update_article",
         "query": "existing topic",
+        "target_url": "https://example.com/blogs/detail/42",
         "priority": "P1",
         "scope_key": "scope-id",
         "strategy_fingerprint": "strategy-fingerprint",
@@ -185,8 +272,12 @@ async def test_keywordless_update_can_be_reviewed_and_executed(monkeypatch: pyte
                     "name": "Site", "status": "active", "business_id": "business-a",
                     "strategy_enabled": True, "market": "US", "language_code": "en",
                 }])
-            if "SELECT external_id FROM seo_agent.posts" in sql:
-                return _Rows([{"external_id": "remote-id"}])
+            if "SELECT external_id, url, slug FROM seo_agent.posts" in sql:
+                return _Rows([{
+                    "external_id": "remote-id",
+                    "url": "https://example.com/blogs/guide",
+                    "slug": "guide",
+                }])
             if "AS candidate_ok" in sql:
                 return _Rows([{"candidate_ok": True, "plan_ok": True, "analysis_ok": True, "keyword_ok": True, "target_ok": True, "conflict_ok": True, "effect_ok": True}])
             return _Rows([])
@@ -201,7 +292,11 @@ async def test_keywordless_update_can_be_reviewed_and_executed(monkeypatch: pyte
         events.append("publish")
         return {"ok": True}
 
+    effect_call: dict = {}
+
     async def effect(*args, **kwargs):
+        events.append("baseline")
+        effect_call.update(kwargs)
         return {"id": "effect-id"}
 
     async def published_effect(*args, **kwargs):
@@ -220,7 +315,7 @@ async def test_keywordless_update_can_be_reviewed_and_executed(monkeypatch: pyte
     )
 
     assert executed["ok"] is True
-    assert events == ["publishing", "publish"]
+    assert events == ["baseline", "publishing", "publish"]
     assert captured["keyword_id"] is None
     assert captured["keyword_context"] == {
         "id": None,
@@ -231,6 +326,29 @@ async def test_keywordless_update_can_be_reviewed_and_executed(monkeypatch: pyte
         "market": "US",
         "language_code": "en",
     }
+    assert effect_call["strategy"]["target_url"] == "https://example.com/blogs/guide"
+
+
+@pytest.mark.asyncio
+async def test_get_strategy_effects_is_read_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    class ReadOnlySession:
+        async def execute(self, *_args, **_kwargs):
+            raise AssertionError("GET endpoint must not run maintenance writes")
+
+    async def list_items(session, *, business_id, limit):
+        assert isinstance(session, ReadOnlySession)
+        assert business_id == "business"
+        assert limit == 5
+        return [{"id": "effect"}]
+
+    monkeypatch.setattr(endpoints, "list_effects", list_items)
+    result = await endpoints.get_strategy_effects(
+        business_id=" business ",
+        limit=5,
+        session=ReadOnlySession(),  # type: ignore[arg-type]
+    )
+
+    assert result == {"items": [{"id": "effect"}]}
 
 
 @pytest.mark.asyncio
@@ -258,8 +376,12 @@ async def test_keywordless_update_missing_query_persists_terminal_failure(monkey
                     "name": "Site", "status": "active", "business_id": "business-a",
                     "strategy_enabled": True, "market": "US", "language_code": "en",
                 }])
-            if "SELECT external_id FROM seo_agent.posts" in sql:
-                return _Rows([{"external_id": "remote-id"}])
+            if "SELECT external_id, url, slug FROM seo_agent.posts" in sql:
+                return _Rows([{
+                    "external_id": "remote-id",
+                    "url": "https://example.com/blogs/guide",
+                    "slug": "guide",
+                }])
             return _Rows([])
 
     async def valid(*_args, **_kwargs):

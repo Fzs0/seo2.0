@@ -46,7 +46,11 @@ from app.services.automation_service import (
     start_execution,
     stop_execution,
 )
-from app.services.strategy_effect_service import backfill_missing_effect_target_urls, list_effects
+from app.services.strategy_effect_service import list_effects
+from app.services.strategy_on_page_execution import (
+    execute_strategy_on_page,
+    preview_strategy_on_page,
+)
 from app.services.strategy_service import (
     cancel_strategy,
     clear_strategy_queue,
@@ -411,6 +415,21 @@ class StrategyReviewBody(BaseModel):
     executeNow: bool = False
 
 
+class StrategyOnPagePreviewBody(BaseModel):
+    patch: dict[str, Any]
+    generationMode: str = Field(pattern="^(manual|model)$")
+    generationProvider: str | None = None
+    generationModel: str | None = None
+    generationRunId: str | None = None
+
+
+class StrategyOnPageExecuteBody(StrategyOnPagePreviewBody):
+    expectedSnapshotHash: str = Field(min_length=64, max_length=64)
+    confirm: bool
+    confirmVariantRecreation: bool = False
+    confirmMembershipTopReset: bool = False
+
+
 class ContentAuditBody(BaseModel):
     businessId: str = Field(min_length=1)
     refresh: bool = True
@@ -488,7 +507,6 @@ async def get_strategy_effects(
     session: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
     scoped_business_id = business_id.strip()
-    await backfill_missing_effect_target_urls(session, business_id=scoped_business_id)
     return {"items": await list_effects(session, business_id=scoped_business_id, limit=limit)}
 
 
@@ -556,6 +574,50 @@ async def review_strategy_task(task_id: str, body: StrategyReviewBody, session: 
 async def execute_strategy_task(task_id: str, session: AsyncSession = Depends(get_db)) -> dict[str, Any]:
     try:
         return await execute_strategy(session, task_id=task_id)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+
+
+@router.post("/workflow/strategies/{task_id}/on-page/preview")
+async def preview_strategy_on_page_task(
+    task_id: str,
+    body: StrategyOnPagePreviewBody,
+    session: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    try:
+        return await preview_strategy_on_page(
+            session,
+            strategy_task_id=task_id,
+            patch=body.patch,
+            generation_mode=body.generationMode,
+            generation_provider=body.generationProvider,
+            generation_model=body.generationModel,
+            generation_run_id=body.generationRunId,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+
+
+@router.post("/workflow/strategies/{task_id}/on-page/execute")
+async def execute_strategy_on_page_task(
+    task_id: str,
+    body: StrategyOnPageExecuteBody,
+    session: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    try:
+        return await execute_strategy_on_page(
+            session,
+            strategy_task_id=task_id,
+            patch=body.patch,
+            expected_snapshot_hash=body.expectedSnapshotHash,
+            confirm=body.confirm,
+            confirm_variant_recreation=body.confirmVariantRecreation,
+            confirm_membership_top_reset=body.confirmMembershipTopReset,
+            generation_mode=body.generationMode,
+            generation_provider=body.generationProvider,
+            generation_model=body.generationModel,
+            generation_run_id=body.generationRunId,
+        )
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
 

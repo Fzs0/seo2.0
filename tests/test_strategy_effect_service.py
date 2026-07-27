@@ -29,28 +29,71 @@ class Result:
         return self.scalar if self.scalar is not None else self.rows[0]
 
 
-def test_strategy_identity_targets_page_for_update_and_intent_for_new() -> None:
+def test_strategy_identity_targets_canonical_page_for_update_and_intent_for_new() -> None:
     common = {
         "site_id": "site",
         "market": "US",
         "language_code": "en",
         "topic_cluster_id": "topic-a",
         "post_id": "post-a",
+        "target_url": "HTTP://WWW.Example.COM/blog/a/?utm_source=test#top",
+        "site_url": "https://example.com",
         "query": "best vape",
         "objective": "improve",
     }
     update = service.strategy_identity("business", **common, action="update_article")
     update_topic_changed = service.strategy_identity("business", **{**common, "topic_cluster_id": "topic-b"}, action="update_article")
     update_post_changed = service.strategy_identity("business", **{**common, "post_id": "post-b"}, action="update_article")
+    update_url_changed = service.strategy_identity(
+        "business", **{**common, "target_url": "https://example.com/blog/b"}, action="update_article"
+    )
     new = service.strategy_identity("business", **common, action="new_article")
     new_post_changed = service.strategy_identity("business", **{**common, "post_id": "post-b"}, action="new_article")
     new_topic_changed = service.strategy_identity("business", **{**common, "topic_cluster_id": "topic-b"}, action="new_article")
 
     assert update["scope_key"] == update_topic_changed["scope_key"]
-    assert update["scope_key"] != update_post_changed["scope_key"]
+    assert update["scope_key"] == update_post_changed["scope_key"]
+    assert update["scope_key"] != update_url_changed["scope_key"]
     assert new["scope_key"] == new_post_changed["scope_key"]
     assert new["scope_key"] != new_topic_changed["scope_key"]
     assert update == service.strategy_identity("business", **common, action="update_article")
+    assert update["lock_scope"] == "url"
+    assert update["lock_key"] == update["scope_key"]
+    assert new["lock_scope"] == "topic_cluster"
+    assert new["lock_key"] == new["scope_key"]
+    assert update["canonical_url"] == "https://example.com/blog/a"
+
+
+def test_update_identity_without_page_identity_does_not_fall_back_to_topic_lock() -> None:
+    identity = service.strategy_identity(
+        "business",
+        site_id="site",
+        topic_cluster_id="topic-a",
+        query="best vape",
+        action="update_article",
+        objective="improve",
+    )
+
+    assert identity["lock_scope"] == "unresolved_url"
+    assert identity["lock_key"] == ""
+    assert identity["scope_key"] == ""
+
+
+def test_canonical_url_rules_and_site_ownership() -> None:
+    assert service.normalize_canonical_url(
+        "HTTP://WWW.Example.COM:80/a/?b=2&utm_source=x&a=1#frag",
+        site_url="https://example.com",
+    ) == "https://example.com/a"
+    assert service.normalize_canonical_url(
+        "https://www.example.com/a/?b=2&a=1#frag",
+        site_url="http://example.com",
+        query_policy="keep",
+    ) == "https://example.com/a?a=1&b=2"
+    with pytest.raises(ValueError, match="target site"):
+        service.normalize_canonical_url(
+            "https://evil.example/a",
+            site_url="https://example.com",
+        )
 
 
 def test_update_strategy_resolves_the_existing_article_url_from_site_evidence() -> None:
@@ -144,7 +187,10 @@ def test_new_article_url_change_keeps_its_zero_baseline_valid() -> None:
     payload = {
         "action": "new_article",
         "target_url": "https://example.com/draft-location",
-        "baseline": {"ga4": {"sessions": 0, "conversions": 0}},
+        "baseline": {
+            "kind": "structural_zero",
+            "ga4": {"sessions": 0, "conversions": 0},
+        },
     }
 
     reconciled = service.reconcile_effect_target_url(
@@ -177,6 +223,30 @@ def test_effect_url_reconciliation_is_idempotent_and_preserves_first_evidence() 
     assert reconciled == payload
 
 
+@pytest.mark.asyncio
+async def test_contamination_query_uses_remote_post_timestamp_only() -> None:
+    captured_sql = ""
+
+    class Session:
+        async def execute(self, statement, _params=None):
+            nonlocal captured_sql
+            captured_sql = str(statement)
+            return Result(scalar=False)
+
+    contaminated = await service._is_contaminated(
+        Session(),  # type: ignore[arg-type]
+        site_id="00000000-0000-0000-0000-000000000001",
+        article_id="00000000-0000-0000-0000-000000000002",
+        target_url="https://example.com/blog/guide",
+        published_at=datetime(2026, 7, 20, tzinfo=timezone.utc),
+    )
+
+    assert contaminated is False
+    assert "FROM seo_agent.articles" not in captured_sql
+    assert "FROM seo_agent.posts" in captured_sql
+    assert captured_sql.count("CAST(:published_at AS timestamptz)") == 1
+
+
 @pytest.mark.parametrize(
     "payload",
     [
@@ -207,7 +277,7 @@ def test_effect_url_change_invalidates_non_initial_or_unknown_baseline(
 
 
 @pytest.mark.asyncio
-async def test_scope_locks_release_update_after_28_days_but_keep_new_article() -> None:
+async def test_scope_locks_release_expired_url_and_topic_observation() -> None:
     rows = [
         {"status": "queued", "scope_key": "executing", "action": "update_article", "target_url": None, "cooling": False},
         {"status": "queued", "scope_key": "cooled", "action": "update_article", "target_url": "/old", "cooling": False},
@@ -221,8 +291,83 @@ async def test_scope_locks_release_update_after_28_days_but_keep_new_article() -
 
     locks = await service.load_scope_locks(Session(), business_id="business")  # type: ignore[arg-type]
 
-    assert set(locks) == {"executing", "cooling", "new"}
+    assert set(locks) == {"executing", "cooling"}
     assert "cooled" not in locks
+    assert "new" not in locks
+
+
+@pytest.mark.asyncio
+async def test_url_cooldown_does_not_lock_an_unrelated_url_on_the_same_site() -> None:
+    url_a = service.strategy_identity(
+        "business", site_id="site", post_id="post-a", target_url="https://example.com/blog/a",
+        site_url="https://example.com", action="update_article"
+    )
+    url_b = service.strategy_identity(
+        "business", site_id="site", post_id="post-b", target_url="https://example.com/blog/b",
+        site_url="https://example.com", action="update_article"
+    )
+    rows = [{
+        "status": "done",
+        "scope_key": url_a["scope_key"],
+        "lock_scope": "url",
+        "lock_key": url_a["lock_key"],
+        "action": "update_article",
+        "target_url": "https://example.com/blog/a",
+        "cooling": True,
+    }]
+
+    class Session:
+        async def execute(self, *_args, **_kwargs):
+            return Result(rows)
+
+    locks = await service.load_scope_locks(Session(), business_id="business")  # type: ignore[arg-type]
+
+    assert url_a["lock_key"] in locks
+    assert url_b["lock_key"] not in locks
+
+
+def test_same_public_url_with_different_article_ids_has_one_lock() -> None:
+    first = service.strategy_identity(
+        "business", site_id="site", article_id="old",
+        target_url="http://www.example.com/blog/a/?utm_campaign=x#part",
+        site_url="https://example.com", action="update_article",
+    )
+    second = service.strategy_identity(
+        "business", site_id="site", article_id="new",
+        target_url="https://example.com/blog/a",
+        site_url="https://www.example.com", action="update_article",
+    )
+    assert first["lock_key"] == second["lock_key"]
+
+
+@pytest.mark.parametrize(
+    ("relation", "cooling", "expected"),
+    [
+        ("same", True, True),
+        ("similar", True, True),
+        ("different", True, False),
+        ("same", False, False),
+        ("cannibalizing", False, True),
+    ],
+)
+def test_topic_cluster_lock_is_time_bounded_and_overlap_aware(
+    relation: str, cooling: bool, expected: bool
+) -> None:
+    assert service.should_lock_topic_cluster(
+        relation=relation,
+        observation_active=cooling,
+        cannibalization_detected=relation == "cannibalizing",
+    ) is expected
+
+
+def test_topic_cluster_cooldown_is_configurable_but_bounded() -> None:
+    published = datetime(2026, 7, 1, tzinfo=timezone.utc)
+    assert service.topic_cooldown_until(published, 14) == published + timedelta(days=14)
+    assert service.topic_cooldown_until(published, 28) == published + timedelta(days=28)
+    with pytest.raises(ValueError):
+        service.topic_cooldown_until(published, 13)
+    with pytest.raises(ValueError):
+        service.topic_cooldown_until(published, 29)
 
 
 @pytest.mark.asyncio
@@ -245,7 +390,9 @@ async def test_ensure_effect_reuses_execution_and_accepts_direct_target_url(monk
 
     monkeypatch.setattr(service, "capture_metrics", metrics)
     identity = service.strategy_identity(
-        "business", site_id="site", post_id="post", action="update_article", objective="improve"
+        "business", site_id="site", post_id="post",
+        target_url="https://example.com/old", site_url="https://example.com",
+        action="update_article", objective="improve"
     )
     created = await service.ensure_effect(
         Session(),  # type: ignore[arg-type]
@@ -265,7 +412,48 @@ async def test_ensure_effect_reuses_execution_and_accepts_direct_target_url(monk
 
     assert created["id"] == "effect-id"
     insert = next(params for sql, params in calls if sql.lstrip().startswith("INSERT INTO seo_agent.tasks"))
-    assert json.loads(insert["payload"])["target_url"] == "https://example.com/old"
+    inserted_payload = json.loads(insert["payload"])
+    assert inserted_payload["target_url"] == "https://example.com/old"
+    assert inserted_payload["baseline"]["target_url"] == "https://example.com/old"
+
+
+@pytest.mark.asyncio
+async def test_update_effect_requires_public_target_url_before_capturing_baseline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Session:
+        async def execute(self, statement, _params=None):
+            if str(statement).lstrip().startswith("SELECT id::text AS id"):
+                return Result()
+            return Result()
+
+    async def metrics(*_args, **_kwargs):
+        raise AssertionError("missing target URL must be rejected before metric capture")
+
+    monkeypatch.setattr(service, "capture_metrics", metrics)
+    identity = service.strategy_identity(
+        "business",
+        site_id="site",
+        post_id="post",
+        action="update_article",
+        objective="improve",
+    )
+
+    with pytest.raises(ValueError, match="正式公开地址"):
+        await service.ensure_effect(
+            Session(),  # type: ignore[arg-type]
+            execution_task_id="execution",
+            strategy_task_id="strategy",
+            site_id="site",
+            article_id=None,
+            strategy={
+                "business_id": "business",
+                "query": "query",
+                "strategy_type": "update_article",
+                "recommended_action": "improve",
+                **identity,
+            },
+        )
 
 
 @pytest.mark.asyncio
@@ -295,6 +483,75 @@ async def test_ensure_effect_reactivates_canceled_retry_without_inserting(monkey
     assert not any(sql.lstrip().startswith("INSERT INTO seo_agent.tasks") for sql, _ in writes)
     assert any("status = 'queued'" in sql for sql, _ in writes)
     assert json.loads(next(params for sql, params in writes if "status = 'queued'" in sql)["payload"]) == {"outcome": "observing"}
+
+
+@pytest.mark.asyncio
+async def test_existing_update_effect_recaptures_baseline_for_current_public_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    writes: list[tuple[str, dict]] = []
+
+    class Session:
+        async def execute(self, statement, params=None):
+            sql = str(statement)
+            params = params or {}
+            writes.append((sql, params))
+            if sql.lstrip().startswith("SELECT id::text AS id"):
+                return Result([{
+                    "id": "effect-id",
+                    "status": "queued",
+                    "payload": {
+                        "kind": "strategy_effect",
+                        "action": "update_article",
+                        "target_url": "https://example.com/blogs/detail/42",
+                        "baseline": {
+                            "kind": "measured",
+                            "target_url": "https://example.com/blogs/detail/42",
+                        },
+                    },
+                }])
+            return Result()
+
+    async def metrics(*_args, **kwargs):
+        assert kwargs["target_url"] == "https://example.com/blogs/guide"
+        return {
+            "captured_at": "2026-07-20T00:00:00+00:00",
+            "metric_scope": {"gsc": "page", "ga4": "landing_page"},
+            "gsc": {},
+            "ga4": {},
+        }
+
+    monkeypatch.setattr(service, "capture_metrics", metrics)
+    identity = service.strategy_identity(
+        "business",
+        site_id="site",
+        post_id="post",
+        action="update_article",
+        objective="improve",
+    )
+    result = await service.ensure_effect(
+        Session(),  # type: ignore[arg-type]
+        execution_task_id="execution",
+        strategy_task_id="strategy",
+        site_id="site",
+        article_id=None,
+        strategy={
+            "business_id": "business",
+            "query": "query",
+            "strategy_type": "update_article",
+            "recommended_action": "improve",
+            "target_url": "https://example.com/blogs/guide",
+            **identity,
+        },
+    )
+
+    assert result["target_url"] == "https://example.com/blogs/guide"
+    assert result["baseline"]["target_url"] == "https://example.com/blogs/guide"
+    assert any(
+        "SET target_url = :target_url" in sql
+        and params["target_url"] == "https://example.com/blogs/guide"
+        for sql, params in writes
+    )
 
 
 @pytest.mark.asyncio
@@ -384,6 +641,77 @@ async def test_published_update_keeps_existing_page_url_when_connector_returns_p
 
 
 @pytest.mark.asyncio
+async def test_published_update_keeps_prepublication_url_when_connector_returns_technical_detail_url() -> None:
+    writes: list[dict] = []
+    published_at = datetime(2026, 7, 21, tzinfo=timezone.utc)
+
+    class Session:
+        async def execute(self, statement, params=None):
+            if str(statement).lstrip().startswith("SELECT published_url"):
+                return Result([{
+                    "published_url": "https://example.com/blogs/guide",
+                    "published_at": published_at,
+                    "effect_payload": {
+                        "target_url": "https://example.com/blogs/guide",
+                        "baseline": {
+                            "captured_at": "2026-07-20T00:00:00+00:00",
+                            "gsc": {"impressions": 10},
+                            "ga4": {"sessions": 2},
+                        },
+                    },
+                }])
+            writes.append(params or {})
+            return Result()
+
+    await service.mark_effect_published(
+        Session(),  # type: ignore[arg-type]
+        execution_task_id="execution",
+        article_id="article",
+        target_url="https://example.com/blogs/detail/42",
+        action="update_article",
+    )
+
+    patch = json.loads(writes[0]["patch"])
+    assert patch["target_url"] == "https://example.com/blogs/guide"
+
+
+@pytest.mark.asyncio
+async def test_published_update_invalidates_baseline_captured_after_publication() -> None:
+    writes: list[dict] = []
+    published_at = datetime(2026, 7, 21, tzinfo=timezone.utc)
+
+    class Session:
+        async def execute(self, statement, params=None):
+            if str(statement).lstrip().startswith("SELECT published_url"):
+                return Result([{
+                    "published_url": "https://example.com/blogs/guide",
+                    "published_at": published_at,
+                    "effect_payload": {
+                        "target_url": "https://example.com/blogs/guide",
+                        "baseline": {
+                            "captured_at": "2026-07-21T00:01:00+00:00",
+                            "gsc": {"impressions": 10},
+                            "ga4": {"sessions": 2},
+                        },
+                    },
+                }])
+            writes.append(params or {})
+            return Result()
+
+    await service.mark_effect_published(
+        Session(),  # type: ignore[arg-type]
+        execution_task_id="execution",
+        article_id="article",
+        target_url=None,
+        action="update_article",
+    )
+
+    patch = json.loads(writes[0]["patch"])
+    assert patch["baseline_valid"] is False
+    assert "发布后" in patch["baseline_note"]
+
+
+@pytest.mark.asyncio
 async def test_published_new_article_switches_ga4_baseline_to_new_landing_page() -> None:
     published_at = datetime(2026, 7, 19, tzinfo=timezone.utc)
     writes: list[dict] = []
@@ -414,10 +742,36 @@ async def test_published_new_article_switches_ga4_baseline_to_new_landing_page()
         action="new_article",
     )
 
-    baseline = json.loads(writes[0]["patch"])["baseline"]
-    assert baseline["gsc"]["impressions"] == 20
-    assert baseline["metric_scope"] == {"gsc": "query", "ga4": "landing_page"}
+    patch = json.loads(writes[0]["patch"])
+    baseline = patch["baseline"]
+    assert baseline["gsc"] == {"clicks": 0, "impressions": 0, "avg_position": 0}
+    assert baseline["metric_scope"] == {"gsc": "page", "ga4": "landing_page"}
     assert baseline["ga4"] == {"sessions": 0, "conversions": 0}
+    assert baseline["kind"] == "structural_zero"
+    assert patch["baseline_context"]["gsc"]["impressions"] == 20
+    assert patch["baseline_valid"] is True
+
+
+@pytest.mark.asyncio
+async def test_published_new_article_requires_public_url() -> None:
+    class Session:
+        async def execute(self, statement, _params=None):
+            if str(statement).lstrip().startswith("SELECT published_url"):
+                return Result([{
+                    "published_url": "",
+                    "published_at": datetime(2026, 7, 19, tzinfo=timezone.utc),
+                    "effect_payload": {"baseline": {}},
+                }])
+            raise AssertionError("effect row must not be updated without a public URL")
+
+    with pytest.raises(ValueError, match="正式公开地址"):
+        await service.mark_effect_published(
+            Session(),  # type: ignore[arg-type]
+            execution_task_id="execution",
+            article_id="article",
+            target_url=None,
+            action="new_article",
+        )
 
 
 @pytest.mark.asyncio
@@ -426,7 +780,11 @@ async def test_process_due_effect_finishes_day_90(monkeypatch: pytest.MonkeyPatc
     payload = {
         "published_at": (now - timedelta(days=90)).isoformat(),
         "query": "query",
+        "action": "update_article",
         "baseline": {
+            "kind": "measured",
+            "captured_at": (now - timedelta(days=91)).isoformat(),
+            "target_url": "/page",
             "metric_scope": {"gsc": "query", "ga4": "site"},
             "gsc": {"impressions": 200, "clicks": 10, "avg_position": 10},
             "ga4": {"sessions": 100, "conversions": 1},
@@ -468,6 +826,62 @@ async def test_process_due_effect_finishes_day_90(monkeypatch: pytest.MonkeyPatc
     assert writes[0]["status"] == "done"
     assert writes[0]["run_after"] is None
     assert session.committed is True
+
+
+@pytest.mark.asyncio
+async def test_due_effect_never_scores_late_or_unknown_baseline_as_winner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime.now(timezone.utc)
+    payload = {
+        "action": "update_article",
+        "published_at": (now - timedelta(days=90)).isoformat(),
+        "query": "query",
+        "baseline": {
+            "kind": "measured",
+            "captured_at": (now - timedelta(days=89)).isoformat(),
+            "metric_scope": {"gsc": "page", "ga4": "landing_page"},
+            "gsc": {"impressions": 200, "clicks": 10, "avg_position": 10},
+            "ga4": {"sessions": 100, "conversions": 1},
+        },
+        "checkpoints": [],
+        "next_checkpoint": {"day": 90, "due_at": now.isoformat()},
+    }
+    writes: list[dict] = []
+
+    class Session:
+        async def execute(self, statement, params=None):
+            sql = str(statement)
+            if "FOR UPDATE SKIP LOCKED" in sql:
+                return Result([{
+                    "id": "effect",
+                    "site_id": "site",
+                    "article_id": "article",
+                    "target_url": "/page",
+                    "payload": payload,
+                }])
+            if sql.lstrip().startswith("UPDATE seo_agent.tasks"):
+                writes.append(params)
+            return Result()
+
+        async def commit(self):
+            return None
+
+    async def metrics(*_args, **_kwargs):
+        return {
+            "gsc": {"impressions": 1000, "clicks": 100, "avg_position": 1},
+            "ga4": {"sessions": 1000, "conversions": 100},
+        }
+
+    async def clean(*_args, **_kwargs):
+        return False
+
+    monkeypatch.setattr(service, "capture_metrics", metrics)
+    monkeypatch.setattr(service, "_is_contaminated", clean)
+    result = await service.process_due_effects(Session(), limit=1)  # type: ignore[arg-type]
+
+    assert result["items"][0]["outcome"] == "inconclusive"
+    assert writes[0]["status"] == "done"
 
 
 @pytest.mark.asyncio

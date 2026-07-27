@@ -151,8 +151,17 @@ async def generate_article_pipeline(
     if not approved_strategy:
         return fail("strategy", "校验已审核策略", "正式生文必须来自已审核的今日计划")
     strategy_type = approved_strategy.get("strategy_type")
-    if not keyword_id and strategy_type != "update_article":
-        return fail("keyword", "校验关键词", "新文章策略必须关联关键词")
+    if (
+        not keyword_id
+        and strategy_type != "update_article"
+        and not (
+            keyword_context
+            and keyword_context.get("execution_evidence")
+            and keyword_context.get("evidence_sources")
+            and keyword_context.get("evidence_snapshot")
+        )
+    ):
+        return fail("keyword", "校验关键词", "无关键词 ID 的新文章必须携带已验证的策略证据快照")
 
     keyword = await get_keyword(session, keyword_id) if keyword_id else dict(keyword_context or {})
     if not keyword or not keyword.get("keyword"):

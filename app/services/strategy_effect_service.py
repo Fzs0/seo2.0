@@ -5,7 +5,7 @@ import hashlib
 import json
 from datetime import datetime, timedelta, timezone
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -13,8 +13,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 POLICY_VERSION = "strategy_policy_v1"
 CHECKPOINT_DAYS = (7, 14, 28, 56, 90)
+DEFAULT_TOPIC_COOLDOWN_DAYS = 21
+MIN_TOPIC_COOLDOWN_DAYS = 14
+MAX_TOPIC_COOLDOWN_DAYS = 28
 URL_CHANGE_BASELINE_NOTE = (
     "文章公开 URL 已切换为 canonical 地址；旧 URL 的发布前基线不可直接比较。"
+)
+LATE_BASELINE_NOTE = "发布前基线的采集时间不早于文章发布时间；该数据可能在发布后产生，不能用于前后对比。"
+NEW_ARTICLE_ZERO_BASELINE_NOTE = (
+    "新文章发布前不存在该公开页面；页面级基线为结构性零值，不是发布后补录的历史数据。"
 )
 
 
@@ -57,7 +64,7 @@ def reconcile_effect_target_url(
     initial_new_article = (
         reconciled.get("action") == "new_article"
         and not (reconciled.get("checkpoints") or [])
-        and _has_zero_landing_page_baseline(reconciled)
+        and _has_structural_zero_baseline(reconciled)
     )
     if url_changed and not initial_new_article:
         reconciled["baseline_valid"] = False
@@ -68,12 +75,8 @@ def reconcile_effect_target_url(
     return reconciled
 
 
-def _has_zero_landing_page_baseline(payload: dict[str, Any]) -> bool:
-    ga4 = ((payload.get("baseline") or {}).get("ga4") or {})
-    try:
-        return float(ga4.get("sessions")) == 0 and float(ga4.get("conversions")) == 0
-    except (TypeError, ValueError):
-        return False
+def _has_structural_zero_baseline(payload: dict[str, Any]) -> bool:
+    return (payload.get("baseline") or {}).get("kind") == "structural_zero"
 
 
 def _effect_url_key(value: Any) -> tuple[str, str, str]:
@@ -92,9 +95,88 @@ def _is_page_url(value: Any) -> bool:
     return isinstance(value, str) and str(value).strip().startswith(("https://", "http://", "/"))
 
 
+def _is_absolute_page_url(value: Any) -> bool:
+    return isinstance(value, str) and str(value).strip().startswith(("https://", "http://"))
+
+
+def _captured_before_publication(
+    baseline: dict[str, Any],
+    published_at: datetime,
+) -> bool:
+    raw = baseline.get("captured_at")
+    if not raw:
+        return False
+    try:
+        captured_at = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if captured_at.tzinfo is None:
+        captured_at = captured_at.replace(tzinfo=timezone.utc)
+    if published_at.tzinfo is None:
+        published_at = published_at.replace(tzinfo=timezone.utc)
+    return captured_at < published_at
+
+
 def _hash(parts: list[Any]) -> str:
     value = "|".join(str(part or "").strip().lower() for part in parts)
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _canonical_host(value: str) -> str:
+    host = value.casefold().rstrip(".")
+    return host[4:] if host.startswith("www.") else host
+
+
+def normalize_canonical_url(
+    value: Any,
+    *,
+    site_url: Any = None,
+    site_domain: Any = None,
+    query_policy: str = "drop",
+) -> str:
+    """Normalize a public page identity and validate its owning site."""
+    parsed = urlsplit(str(value or "").strip())
+    if parsed.scheme.casefold() not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("canonical URL must be an absolute HTTP(S) URL")
+    host = _canonical_host(parsed.hostname)
+    allowed_raw = str(site_url or site_domain or "").strip()
+    if allowed_raw:
+        allowed = urlsplit(
+            allowed_raw if "://" in allowed_raw else f"https://{allowed_raw}"
+        )
+        if host != _canonical_host(allowed.hostname or ""):
+            raise ValueError("canonical URL does not belong to the target site")
+    port = parsed.port
+    netloc = host if port in {None, 80, 443} else f"{host}:{port}"
+    path = parsed.path or "/"
+    if path != "/":
+        path = path.rstrip("/")
+    if query_policy == "drop":
+        query = ""
+    elif query_policy == "keep":
+        query = urlencode(sorted(parse_qsl(parsed.query, keep_blank_values=True)))
+    else:
+        raise ValueError("query_policy must be 'drop' or 'keep'")
+    return urlunsplit(("https", netloc, path, query, ""))
+
+
+def topic_cooldown_until(
+    published_at: datetime, days: int = DEFAULT_TOPIC_COOLDOWN_DAYS
+) -> datetime:
+    if not MIN_TOPIC_COOLDOWN_DAYS <= int(days) <= MAX_TOPIC_COOLDOWN_DAYS:
+        raise ValueError("topic cooldown must be between 14 and 28 days")
+    return published_at + timedelta(days=int(days))
+
+
+def should_lock_topic_cluster(
+    *,
+    relation: str | None,
+    observation_active: bool,
+    cannibalization_detected: bool = False,
+) -> bool:
+    if cannibalization_detected:
+        return True
+    return bool(observation_active and relation in {"same", "similar", "overlapping"})
 
 
 def strategy_identity(
@@ -110,19 +192,38 @@ def strategy_identity(
     action: Any = None,
     objective: Any = None,
     evidence: Any = None,
+    target_url: Any = None,
+    site_url: Any = None,
+    site_domain: Any = None,
+    query_policy: str = "drop",
 ) -> dict[str, str]:
+    is_update = action == "update_article"
+    canonical_url = ""
+    if is_update and target_url:
+        canonical_url = normalize_canonical_url(
+            target_url,
+            site_url=site_url,
+            site_domain=site_domain,
+            query_policy=query_policy,
+        )
     target = (
-        post_id or article_id or topic_cluster_id or query
-        if action == "update_article"
+        canonical_url
+        if is_update
         else topic_cluster_id or query or post_id or article_id
     )
-    scope_key = _hash([business_id, site_id, market, language_code, target])
+    lock_scope = "url" if is_update and target else (
+        "unresolved_url" if is_update else "topic_cluster"
+    )
+    scope_key = _hash([business_id, site_id, market, language_code, target]) if target else ""
     strategy_fingerprint = _hash([business_id, site_id, market, language_code, target, action, objective])
     evidence_fingerprint = hashlib.sha256(
         json.dumps(evidence or {}, sort_keys=True, ensure_ascii=False, default=str, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
     return {
         "scope_key": scope_key,
+        "lock_scope": lock_scope,
+        "lock_key": scope_key,
+        "canonical_url": canonical_url,
         "strategy_fingerprint": strategy_fingerprint,
         "evidence_fingerprint": evidence_fingerprint,
         "policy_version": POLICY_VERSION,
@@ -201,6 +302,7 @@ async def capture_metrics(
         ).mappings().one()
     return {
         "captured_at": datetime.now(timezone.utc).isoformat(),
+        "target_url": target_url,
         "window_days": 28,
         "metric_scope": scope,
         "gsc": {"clicks": int(gsc["clicks"] or 0), "impressions": int(gsc["impressions"] or 0), "avg_position": float(gsc["avg_position"] or 0)},
@@ -255,16 +357,28 @@ async def load_scope_locks(session: AsyncSession, *, business_id: str) -> dict[s
     rows = await session.execute(
         text(
             """
-            SELECT status, payload->>'scope_key' AS scope_key, payload->>'action' AS action,
+            SELECT status, payload->>'scope_key' AS scope_key,
+                   payload->>'lock_scope' AS lock_scope,
+                   payload->>'lock_key' AS lock_key,
+                   payload->>'action' AS action,
                    payload->>'target_url' AS target_url,
+                   payload->>'topic_relation' AS topic_relation,
+                   COALESCE((payload->>'cannibalization_detected')::boolean, false)
+                       AS cannibalization_detected,
                    COALESCE((payload->>'cooldown_until')::timestamptz > now(), false) AS cooling
               FROM seo_agent.tasks
              WHERE task_type = 'review' AND payload->>'kind' = 'strategy_effect'
                AND payload->>'business_id' = :business_id
             UNION ALL
             SELECT status, payload->>'scope_key' AS scope_key,
+                   payload->>'lock_scope' AS lock_scope,
+                   payload->>'lock_key' AS lock_key,
                    payload#>>'{strategy,strategy_type}' AS action,
-                   NULL AS target_url, false AS cooling
+                   NULL AS target_url,
+                   payload#>>'{strategy,topic_relation}' AS topic_relation,
+                   COALESCE((payload#>>'{strategy,cannibalization_detected}')::boolean, false)
+                       AS cannibalization_detected,
+                   false AS cooling
               FROM seo_agent.tasks
              WHERE task_type IN ('new_article', 'update_article') AND status IN ('queued', 'running')
                AND payload#>>'{strategy,business_id}' = :business_id
@@ -274,15 +388,20 @@ async def load_scope_locks(session: AsyncSession, *, business_id: str) -> dict[s
     )
     locks: dict[str, str] = {}
     for row in rows.mappings().all():
-        scope_key = str(row["scope_key"] or "")
-        if not scope_key:
+        lock_scope = str(row.get("lock_scope") or "")
+        lock_key = str(row.get("lock_key") or row["scope_key"] or "")
+        if not lock_key or lock_scope == "unresolved_url":
             continue
         if row["status"] in {"queued", "running"} and not row["target_url"]:
-            locks[scope_key] = "同一页面或意图已有策略正在执行或观察"
+            locks[lock_key] = "同一页面或意图已有策略正在执行或观察"
         elif row["action"] == "update_article" and row["cooling"]:
-            locks[scope_key] = "同一页面仍在 28 天更新冷却期"
-        elif row["action"] == "new_article" and row["target_url"]:
-            locks[scope_key] = "同一意图已有已发布页面，禁止重复新写"
+            locks[lock_key] = "同一页面仍在 28 天更新冷却期"
+        elif row["action"] == "new_article" and should_lock_topic_cluster(
+            relation=str(row.get("topic_relation") or "same"),
+            observation_active=bool(row["cooling"]),
+            cannibalization_detected=bool(row.get("cannibalization_detected")),
+        ):
+            locks[lock_key] = "主题仍在观察期，或已确认存在搜索意图重叠/关键词蚕食"
     return locks
 
 
@@ -296,6 +415,9 @@ async def ensure_effect(
     strategy: dict[str, Any],
 ) -> dict[str, Any]:
     await session.execute(text("SELECT pg_advisory_xact_lock(hashtext(:key))"), {"key": f"strategy-effect:{execution_task_id}"})
+    target_url = resolve_strategy_target_url(strategy)
+    if strategy.get("strategy_type") == "update_article" and not _is_absolute_page_url(target_url):
+        raise ValueError("更新旧文章前必须确认正式公开地址，请先同步目标站点文章")
     existing = (
         await session.execute(
             text(
@@ -308,6 +430,46 @@ async def ensure_effect(
         )
     ).mappings().first()
     if existing:
+        existing_payload = dict(existing["payload"] or {})
+        if strategy.get("strategy_type") == "update_article" and (
+            _effect_url_key(existing_payload.get("target_url")) != _effect_url_key(target_url)
+            or _effect_url_key((existing_payload.get("baseline") or {}).get("target_url"))
+            != _effect_url_key(target_url)
+            or (existing_payload.get("baseline") or {}).get("kind") != "measured"
+        ):
+            if existing_payload.get("published_at"):
+                existing_payload = reconcile_effect_target_url(
+                    existing_payload,
+                    current_target_url=existing_payload.get("target_url"),
+                    new_target_url=target_url,
+                )
+            else:
+                baseline = await capture_metrics(
+                    session,
+                    site_id=site_id,
+                    query=str(strategy.get("query") or "") or None,
+                    target_url=target_url,
+                )
+                baseline.update({"kind": "measured", "target_url": target_url})
+                existing_payload.update({
+                    "target_url": target_url,
+                    "baseline": baseline,
+                    "baseline_valid": True,
+                })
+                existing_payload.pop("baseline_note", None)
+                existing_payload.pop("previous_target_url", None)
+            await session.execute(
+                text(
+                    "UPDATE seo_agent.tasks SET target_url = :target_url, "
+                    "payload = CAST(:payload AS jsonb), updated_at = now() "
+                    "WHERE id = CAST(:id AS uuid)"
+                ),
+                {
+                    "id": existing["id"],
+                    "target_url": target_url,
+                    "payload": json.dumps(existing_payload, ensure_ascii=False),
+                },
+            )
         if existing["status"] == "canceled":
             await session.execute(
                 text(
@@ -322,17 +484,28 @@ async def ensure_effect(
                     "decision": json.dumps({"outcome": "observing"}),
                 },
             )
-        return {"id": existing["id"], **dict(existing["payload"] or {}), "outcome": "observing"}
-    identity = {key: strategy.get(key) for key in ("scope_key", "strategy_fingerprint", "evidence_fingerprint", "policy_version")}
+        return {"id": existing["id"], **existing_payload, "outcome": "observing"}
+    scope_key = strategy.get("scope_key")
+    identity = {
+        "scope_key": scope_key,
+        # Legacy approved decisions remain executable; newly generated
+        # decisions persist these fields explicitly.
+        "lock_scope": strategy.get("lock_scope")
+        or ("url" if strategy.get("strategy_type") == "update_article" else "topic_cluster"),
+        "lock_key": strategy.get("lock_key") or scope_key,
+        "strategy_fingerprint": strategy.get("strategy_fingerprint"),
+        "evidence_fingerprint": strategy.get("evidence_fingerprint"),
+        "policy_version": strategy.get("policy_version"),
+    }
     if not all(identity.values()):
         raise ValueError("策略缺少生命周期指纹，请重新生成并审核策略")
-    target_url = resolve_strategy_target_url(strategy)
     baseline = await capture_metrics(
         session,
         site_id=site_id,
         query=str(strategy.get("query") or "") or None,
         target_url=target_url,
     )
+    baseline.update({"kind": "measured", "target_url": target_url})
     payload = {
         "kind": "strategy_effect",
         "business_id": strategy.get("business_id"),
@@ -344,9 +517,12 @@ async def ensure_effect(
         "query": strategy.get("query"),
         "target_url": target_url,
         "baseline": baseline,
+        "baseline_valid": True,
         "checkpoints": [],
         "outcome": "observing",
         "cooldown_until": None,
+        "topic_relation": strategy.get("topic_relation"),
+        "cannibalization_detected": bool(strategy.get("cannibalization_detected")),
         "next_checkpoint": None,
     }
     inserted = await session.execute(
@@ -398,6 +574,7 @@ async def mark_effect_published(
     article_id: str,
     target_url: str | None,
     action: str | None = None,
+    topic_cooldown_days: int = DEFAULT_TOPIC_COOLDOWN_DAYS,
 ) -> None:
     article = (
         await session.execute(
@@ -412,15 +589,28 @@ async def mark_effect_published(
         )
     ).mappings().first()
     published_at = (article or {}).get("published_at") or datetime.now(timezone.utc)
-    effect_target_url = ((article or {}).get("effect_payload") or {}).get("target_url")
-    url = next((str(value).strip() for value in (target_url, (article or {}).get("published_url"), effect_target_url) if _is_page_url(value)), None)
-    cooldown_until = published_at + timedelta(days=28) if action == "update_article" else None
+    effect_payload = dict((article or {}).get("effect_payload") or {})
+    effect_target_url = effect_payload.get("target_url")
+    candidates = (
+        (effect_target_url, (article or {}).get("published_url"), target_url)
+        if action == "update_article"
+        else ((article or {}).get("published_url"), target_url, effect_target_url)
+    )
+    url = next(
+        (str(value).strip() for value in candidates if _is_page_url(value)),
+        None,
+    )
+    if action == "new_article" and not url:
+        raise ValueError("新文章发布后缺少正式公开地址，无法创建效果观察")
+    cooldown_until = (
+        published_at + timedelta(days=28)
+        if action == "update_article"
+        else topic_cooldown_until(published_at, topic_cooldown_days)
+        if action == "new_article"
+        else None
+    )
     next_due = published_at + timedelta(days=CHECKPOINT_DAYS[0])
-    baseline = dict(((article or {}).get("effect_payload") or {}).get("baseline") or {})
-    if action == "new_article" and baseline:
-        metric_scope = dict(baseline.get("metric_scope") or {})
-        metric_scope["ga4"] = "landing_page"
-        baseline.update({"metric_scope": metric_scope, "ga4": {"sessions": 0, "conversions": 0}})
+    baseline = dict(effect_payload.get("baseline") or {})
     patch = {
         "article_id": article_id,
         "target_url": url,
@@ -428,8 +618,26 @@ async def mark_effect_published(
         "cooldown_until": cooldown_until.isoformat() if cooldown_until else None,
         "next_checkpoint": {"day": CHECKPOINT_DAYS[0], "due_at": next_due.isoformat()},
     }
-    if baseline:
+    if action == "new_article":
+        if baseline:
+            patch["baseline_context"] = baseline
+        patch["baseline"] = {
+            "kind": "structural_zero",
+            "effective_at": published_at.isoformat(),
+            "target_url": url,
+            "window_days": 0,
+            "metric_scope": {"gsc": "page", "ga4": "landing_page"},
+            "gsc": {"clicks": 0, "impressions": 0, "avg_position": 0},
+            "ga4": {"sessions": 0, "conversions": 0},
+        }
+        patch["baseline_valid"] = True
+        patch["baseline_note"] = NEW_ARTICLE_ZERO_BASELINE_NOTE
+    elif baseline:
+        baseline.setdefault("kind", "measured")
         patch["baseline"] = baseline
+        if not _captured_before_publication(baseline, published_at):
+            patch["baseline_valid"] = False
+            patch["baseline_note"] = LATE_BASELINE_NOTE
     await session.execute(
         text(
             """
@@ -510,21 +718,19 @@ async def backfill_missing_effect_target_urls(session: AsyncSession, *, business
 
 
 async def _is_contaminated(session: AsyncSession, *, site_id: str, article_id: str | None, target_url: str | None, published_at: datetime) -> bool:
+    del article_id  # Local article bookkeeping is not evidence of a remote content edit.
     result = await session.execute(
         text(
             """
             SELECT EXISTS (
-                SELECT 1 FROM seo_agent.articles
-                 WHERE id = CAST(:article_id AS uuid) AND updated_at > :published_at + interval '1 hour'
-                UNION ALL
                 SELECT 1 FROM seo_agent.posts
                  WHERE site_id = CAST(:site_id AS uuid) AND :target_url <> ''
                    AND lower(rtrim(url, '/')) = lower(rtrim(:target_url, '/'))
-                   AND modified_at > :published_at + interval '1 hour'
+                   AND modified_at > CAST(:published_at AS timestamptz) + interval '1 hour'
             ) AS contaminated
             """
         ),
-        {"site_id": site_id, "article_id": article_id, "target_url": target_url or "", "published_at": published_at},
+        {"site_id": site_id, "target_url": target_url or "", "published_at": published_at},
     )
     return bool(result.scalar_one())
 
@@ -533,6 +739,31 @@ def _as_datetime(value: Any) -> datetime:
     if isinstance(value, datetime):
         return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
     return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+
+
+def _baseline_is_comparable(
+    payload: dict[str, Any],
+    *,
+    published_at: datetime,
+    target_url: Any,
+) -> bool:
+    if payload.get("baseline_valid") is False:
+        return False
+    baseline = dict(payload.get("baseline") or {})
+    kind = baseline.get("kind")
+    if (
+        not target_url
+        or _effect_url_key(baseline.get("target_url")) != _effect_url_key(target_url)
+    ):
+        return False
+    if kind == "structural_zero":
+        return payload.get("action") == "new_article"
+    if kind == "measured":
+        return (
+            payload.get("action") == "update_article"
+            and _captured_before_publication(baseline, published_at)
+        )
+    return False
 
 
 async def process_due_effects(session: AsyncSession, *, limit: int = 3) -> dict[str, Any]:
@@ -577,7 +808,11 @@ async def process_due_effects(session: AsyncSession, *, limit: int = 3) -> dict[
             snapshot,
             delta,
             contaminated=contaminated,
-            baseline_valid=payload.get("baseline_valid") is not False,
+            baseline_valid=_baseline_is_comparable(
+                payload,
+                published_at=published_at,
+                target_url=row["target_url"],
+            ),
             day=day,
         )
         checkpoint = {"day": day, "snapshot": snapshot, "delta": delta, "outcome": outcome}
@@ -669,7 +904,10 @@ __all__ = [
     "load_scope_locks",
     "mark_effect_published",
     "metric_delta",
+    "normalize_canonical_url",
     "process_due_effects",
     "resolve_strategy_target_url",
+    "should_lock_topic_cluster",
     "strategy_identity",
+    "topic_cooldown_until",
 ]

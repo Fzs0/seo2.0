@@ -5,6 +5,7 @@ import json
 import re
 from datetime import datetime
 from typing import Any
+from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import text
@@ -23,6 +24,53 @@ from app.services.strategy_effect_service import (
     resolve_strategy_target_url,
     strategy_identity,
 )
+from app.services.strategy_evidence_refresh_service import (
+    refresh_default_strategy_evidence,
+)
+from app.services.strategy_decision_service import (
+    build_on_page_candidates,
+    load_on_page_assets,
+)
+from app.services.strategy_hold_service import (
+    EXPANDED_EVIDENCE_SOURCES,
+    EvidenceCollector,
+    claim_hold_evidence_refresh,
+    complete_hold_evidence_refresh,
+    evolve_hold_state,
+    finalize_hold_run,
+    refresh_hold_evidence,
+    wait_for_hold_evidence_refresh,
+)
+
+
+async def _load_latest_source_audit(
+    session: AsyncSession,
+    *,
+    business_id: str,
+) -> dict[str, Any] | None:
+    row = (
+        await session.execute(
+            text(
+                "SELECT id, payload->>'scanned_at' AS scanned_at FROM seo_agent.tasks "
+                "WHERE task_type = 'review' AND payload->>'kind' = 'content_audit_batch' "
+                "AND payload->>'business_id' = :business_id "
+                "ORDER BY (payload->>'scanned_at')::timestamptz DESC NULLS LAST, created_at DESC LIMIT 1"
+            ),
+            {"business_id": business_id},
+        )
+    ).mappings().first()
+    return dict(row) if row else None
+
+
+async def _load_latest_source_audit_after_refresh(
+    session: AsyncSession,
+    *,
+    business_id: str,
+    evidence_refreshes: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    # Always read this boundary again after collectors finish. A collector may
+    # have created a newer content-audit batch even when another source degraded.
+    return await _load_latest_source_audit(session, business_id=business_id)
 
 
 async def generate_strategies(
@@ -34,43 +82,84 @@ async def generate_strategies(
     action_budget: int | None = None,
     site_quotas: dict[str, int] | None = None,
     min_impressions: int = 20,
+    evidence_refreshers: dict[str, EvidenceCollector] | None = None,
 ) -> dict[str, Any]:
     budget = max(0, min(action_budget if action_budget is not None else limit, 200))
     scope = await session.execute(
         text(
-            "SELECT id, name, site_type FROM seo_agent.sites "
-            "WHERE business_id = :business_id AND strategy_enabled = true AND status = 'active' "
+            "SELECT id, name, site_type, strategy_enabled, market, language_code, "
+            "domain, base_url, api_base_url FROM seo_agent.sites "
+            "WHERE business_id = :business_id AND status = 'active' "
             "AND (CAST(:site_id AS uuid) IS NULL OR id = CAST(:site_id AS uuid)) ORDER BY name"
         ),
         {"business_id": business_id, "site_id": site_id},
     )
     site_scope = [dict(row) for row in scope.mappings().all()]
+    scope_by_id = {str(site["id"]): site for site in site_scope}
     if not site_scope:
         raise ValueError(f"业务 {business_id} 没有符合条件的已启用策略站点")
-    source_audit = (
-        await session.execute(
-            text(
-                "SELECT id, payload->>'scanned_at' AS scanned_at FROM seo_agent.tasks "
-                "WHERE task_type = 'review' AND payload->>'kind' = 'content_audit_batch' "
-                "AND payload->>'business_id' = :business_id "
-                "ORDER BY (payload->>'scanned_at')::timestamptz DESC NULLS LAST, created_at DESC LIMIT 1"
-            ),
-            {"business_id": business_id},
-        )
-    ).mappings().first()
+    source_audit = await _load_latest_source_audit(session, business_id=business_id)
     if not source_audit:
         raise ValueError("请先运行当前业务的全站内容扫描")
+    strategy_run_id = str(uuid4())
+    refresh_claim = await claim_hold_evidence_refresh(
+        session,
+        business_id=business_id,
+        run_id=strategy_run_id,
+    )
+    evidence_refreshes: list[dict[str, Any]] = []
+    if refresh_claim["should_refresh"]:
+        try:
+            if evidence_refreshers is None:
+                evidence_refreshes = await refresh_default_strategy_evidence(
+                    session,
+                    business_id=business_id,
+                    sites=site_scope,
+                )
+            else:
+                refresh_now = datetime.now(ZoneInfo("UTC"))
+                for scoped_site in site_scope:
+                    evidence_refreshes.append(
+                        await refresh_hold_evidence(
+                            site_id=str(scoped_site["id"]),
+                            collectors=evidence_refreshers,
+                            now=refresh_now,
+                        )
+                    )
+        except Exception as error:  # catastrophic collector/orchestrator failure
+            evidence_refreshes = _failed_hold_refresh_records(
+                site_scope,
+                error=error,
+                now=datetime.now(ZoneInfo("UTC")),
+            )
+        refresh_token = str(refresh_claim["refresh_token"])
+        completed = await complete_hold_evidence_refresh(
+            session,
+            business_id=business_id,
+            refresh_token=refresh_token,
+            refresh_results=evidence_refreshes,
+        )
+        if not completed:
+            raise RuntimeError("Hold evidence refresh token was already consumed or replaced.")
+    elif refresh_claim.get("wait_for_refresh"):
+        evidence_refreshes = await wait_for_hold_evidence_refresh(
+            session,
+            business_id=business_id,
+            refresh_token=str(refresh_claim["pending_refresh_token"]),
+        )
+    if evidence_refreshes:
+        source_audit = await _load_latest_source_audit_after_refresh(
+            session,
+            business_id=business_id,
+            evidence_refreshes=evidence_refreshes,
+        )
+        if not source_audit:
+            raise ValueError("Evidence refresh completed without a current content audit batch.")
     quarantined = await _quarantine_invalid_assignments(session, business_id)
 
     rows = await session.execute(
         text(
             """
-            WITH latest_audit_scan AS (
-                SELECT max((payload->>'scanned_at')::timestamptz) AS scanned_at
-                 FROM seo_agent.tasks
-                 WHERE task_type = 'review' AND payload->>'kind' = 'content_audit_batch'
-                   AND payload->>'business_id' = :business_id
-            )
             SELECT s.id AS site_id, s.name AS site_name, s.site_type, s.business_id, s.market, s.language_code,
                    s.content_role, s.content_scope,
                    COALESCE(s.knowledge_profile, '{}'::jsonb) AS knowledge_profile,
@@ -137,8 +226,7 @@ async def generate_strategies(
                AND (audit.post_id IS NULL OR p.id IS NOT NULL)
                AND audit.payload->>'kind' = 'content_audit'
                AND audit.payload->>'business_id' = :business_id
-               AND (audit.payload->>'scanned_at')::timestamptz = (SELECT scanned_at FROM latest_audit_scan)
-               AND (p.id IS NOT NULL OR k.id IS NOT NULL)
+               AND (audit.payload->>'scanned_at')::timestamptz = CAST(:source_audit_scanned_at AS timestamptz)
                AND audit.decision->>'action' IN ('new_article', 'update_article', 'hold')
                AND s.status = 'active'
                AND s.business_id = :business_id
@@ -156,6 +244,7 @@ async def generate_strategies(
         {
             "site_id": site_id,
             "business_id": business_id,
+            "source_audit_scanned_at": source_audit["scanned_at"],
         },
     )
     candidate_rows = [dict(row) for row in rows.mappings().all()]
@@ -169,6 +258,7 @@ async def generate_strategies(
     )
     ga4_by_site = {str(row["site_id"]): dict(row) for row in ga4_rows.mappings().all()}
     site_content = await _load_site_content(session)
+    on_page_assets = await load_on_page_assets(session, business_id=business_id)
     scope_locks = await load_scope_locks(session, business_id=business_id)
 
     analysis = await session.execute(
@@ -188,7 +278,10 @@ async def generate_strategies(
                     "site_scope": site_scope,
                     "source_audit_batch_id": str(source_audit["id"]),
                     "source_audit_scanned_at": source_audit["scanned_at"],
+                    "strategy_run_id": strategy_run_id,
+                    "hold_refresh_claim": refresh_claim,
                     "min_impressions": max(1, min_impressions),
+                    "evidence_refreshes": evidence_refreshes,
                 },
                 ensure_ascii=False,
                 default=str,
@@ -199,10 +292,17 @@ async def generate_strategies(
     candidates: list[dict[str, Any]] = []
     seen_candidate_keys: set[str] = set()
     for row in candidate_rows:
+        site_meta = scope_by_id.get(str(row["site_id"]), {})
         links = _build_internal_link_plan(row["query"], site_content.get(str(row["site_id"]), []))
         strategy = _build_strategy(row, ga4_by_site.get(str(row["site_id"])), links)
         if not strategy:
             continue
+        strategy["site_configuration_ready"] = bool(
+            site_meta.get("strategy_enabled")
+            and (site_meta.get("base_url") or site_meta.get("domain"))
+            and site_meta.get("market")
+            and site_meta.get("language_code")
+        )
         identity = strategy_identity(
             business_id,
             site_id=row.get("site_id"),
@@ -215,6 +315,9 @@ async def generate_strategies(
             action=strategy.get("strategy_type"),
             objective=strategy.get("recommended_action"),
             evidence=strategy.get("evidence"),
+            target_url=row.get("article_published_url") or row.get("post_url"),
+            site_url=site_meta.get("base_url"),
+            site_domain=site_meta.get("domain"),
         )
         candidate_key, evidence_key = identity["strategy_fingerprint"], identity["evidence_fingerprint"]
         if candidate_key in seen_candidate_keys:
@@ -230,6 +333,7 @@ async def generate_strategies(
                 "evidence_level": "insufficient",
                 "reason": f"{scope_locks[identity['scope_key']]}；{strategy.get('reason') or ''}",
             })
+        required_data = _required_strategy_data(strategy["strategy_type"])
         inserted = await session.execute(
             text(
                 """
@@ -260,7 +364,7 @@ async def generate_strategies(
                     **identity,
                     "evidence": strategy["evidence"],
                 }, ensure_ascii=False),
-                "required_data": ["gsc_28d", "ga4_28d", "site_content", "site_knowledge", "content_audit"],
+                "required_data": required_data,
                 "decision": json.dumps({**strategy, "candidate_status": "hold" if strategy["strategy_type"] == "hold" else "available"}, ensure_ascii=False),
             },
         )
@@ -275,20 +379,145 @@ async def generate_strategies(
             **strategy,
         })
 
+    for candidate in [
+        candidate
+        for site_key, assets in on_page_assets.items()
+        if (site := scope_by_id.get(site_key))
+        and site.get("strategy_enabled")
+        for candidate in build_on_page_candidates(site={**site, "business_id": business_id}, assets=assets)
+    ]:
+        candidate["site_configuration_ready"] = bool(
+            site.get("strategy_enabled")
+            and (site.get("base_url") or site.get("domain"))
+            and site.get("market")
+            and site.get("language_code")
+        )
+        if candidate["strategy_fingerprint"] in seen_candidate_keys:
+            continue
+        seen_candidate_keys.add(candidate["strategy_fingerprint"])
+        if candidate["lock_key"] in scope_locks:
+            candidate.update(
+                {
+                    "in_cooldown": True,
+                    "cooldown_reason": scope_locks[candidate["lock_key"]],
+                    "candidate_status": "hold",
+                }
+            )
+        inserted = await session.execute(
+            text(
+                """
+                INSERT INTO seo_agent.tasks
+                  (task_type, status, priority, score, site_id, title, payload, required_data, decision)
+                VALUES
+                  ('review', 'done', :priority, :score, CAST(:site_id AS uuid), :title,
+                   CAST(:payload AS jsonb), :required_data, CAST(:decision AS jsonb))
+                RETURNING id
+                """
+            ),
+            {
+                "priority": candidate["priority"],
+                "score": candidate["score"],
+                "site_id": candidate["site_id"],
+                "title": candidate["title"],
+                "payload": json.dumps(
+                    {
+                        "kind": "strategy_candidate",
+                        "business_id": business_id,
+                        "analysis_batch_id": analysis_batch_id,
+                        "candidate_key": candidate["strategy_fingerprint"],
+                        "evidence_key": candidate["evidence_fingerprint"],
+                        "scope_key": candidate["scope_key"],
+                        "lock_scope": candidate["lock_scope"],
+                        "lock_key": candidate["lock_key"],
+                        "strategy_fingerprint": candidate["strategy_fingerprint"],
+                        "evidence_fingerprint": candidate["evidence_fingerprint"],
+                        "policy_version": candidate["policy_version"],
+                        "evidence": candidate["evidence"],
+                    },
+                    ensure_ascii=False,
+                ),
+                "required_data": ["site_asset", "seo_audit"],
+                "decision": json.dumps(candidate, ensure_ascii=False),
+            },
+        )
+        candidates.append({**candidate, "id": str(inserted.scalar_one())})
+
     selected = _select_daily_candidates(candidates, budget, site_quotas)
+    coverage_matrix = _build_site_coverage(site_scope, candidates, selected)
+    if not coverage_matrix["complete"]:
+        raise RuntimeError("Strategy coverage is incomplete; every discovered active site must have one decision.")
+    hold_state = evolve_hold_state(
+        coverage_matrix["decisions"],
+        previous_site_counts=refresh_claim.get("site_consecutive_hold_counts") or {},
+        previous_business_count=int(refresh_claim.get("business_consecutive_hold_count") or 0),
+        now=datetime.now(ZoneInfo("UTC")),
+    )
+    coverage_matrix["decisions"] = hold_state["decisions"]
     plan = await _replace_strategy_plan(
         session,
         business_id=business_id,
         analysis_batch_id=analysis_batch_id,
+        source_audit_batch_id=str(source_audit["id"]),
+        source_audit_scanned_at=source_audit["scanned_at"],
         action_budget=budget,
         site_quotas=site_quotas or {},
         candidates=selected,
     )
+    site_hold_flags = {
+        str(decision.get("site_id") or ""): decision.get("action") == "hold"
+        for decision in coverage_matrix["decisions"]
+    }
+    coordination = await finalize_hold_run(
+        session,
+        business_id=business_id,
+        run_id=strategy_run_id,
+        all_hold=bool(site_hold_flags) and all(site_hold_flags.values()),
+        site_hold_flags=site_hold_flags,
+        commit=False,
+    )
+    hold_state.update(
+        {
+            "site_consecutive_hold_counts": coordination[
+                "site_consecutive_hold_counts"
+            ],
+            "business_consecutive_hold_count": coordination[
+                "business_consecutive_hold_count"
+            ],
+            "anomalies": (
+                [
+                    {
+                        "kind": "strategy_stagnation",
+                        "severity": "P2",
+                        "consecutive_hold_count": coordination[
+                            "business_consecutive_hold_count"
+                        ],
+                    }
+                ]
+                if coordination["emit_strategy_stagnation"]
+                else []
+            ),
+            "refresh": coordination.get("refresh"),
+        }
+    )
+    for decision in coverage_matrix["decisions"]:
+        if decision.get("action") == "hold":
+            decision["consecutive_hold_count"] = coordination[
+                "site_consecutive_hold_counts"
+            ].get(str(decision.get("site_id") or ""), 0)
     await session.execute(
         text("UPDATE seo_agent.tasks SET decision = CAST(:decision AS jsonb), updated_at = now() WHERE id = CAST(:id AS uuid)"),
         {
             "id": analysis_batch_id,
-            "decision": json.dumps({"total_candidates": len(candidates), "planned_actions": len(selected)}, ensure_ascii=False),
+            "decision": json.dumps(
+                {
+                    "total_candidates": len(candidates),
+                    "planned_actions": len(selected),
+                    "coverage_matrix": coverage_matrix,
+                    "hold_state": hold_state,
+                    "evidence_refreshes": evidence_refreshes,
+                },
+                ensure_ascii=False,
+            ),
         },
     )
     await session.commit()
@@ -304,6 +533,180 @@ async def generate_strategies(
         "planned_actions": len(plan["items"]),
         "unassigned": 0,
         "quarantined": quarantined,
+        "coverage_matrix": coverage_matrix,
+        "decisions": coverage_matrix["decisions"],
+        "hold_state": hold_state,
+        "evidence_refreshes": evidence_refreshes,
+    }
+
+
+def _failed_hold_refresh_records(
+    sites: list[dict[str, Any]], *, error: Exception, now: datetime
+) -> list[dict[str, Any]]:
+    refreshed_at = now.isoformat()
+    message = str(error)[:1000]
+    return [
+        {
+            "site_id": str(site.get("id") or ""),
+            "refreshed_at": refreshed_at,
+            "degraded": True,
+            "sources": {
+                source: {
+                    "status": "failed",
+                    "refreshed_at": refreshed_at,
+                    "snapshot_id": None,
+                    "error": message,
+                    "decision_impact": (
+                        "candidate confidence may be reduced; refresh failure "
+                        "cannot bypass quality or safety gates"
+                    ),
+                }
+                for source in EXPANDED_EVIDENCE_SOURCES
+            },
+        }
+        for site in sites
+    ]
+
+
+def _build_site_coverage(
+    site_scope: list[dict[str, Any]],
+    candidates: list[dict[str, Any]],
+    selected: list[dict[str, Any]],
+) -> dict[str, Any]:
+    candidates_by_site: dict[str, list[dict[str, Any]]] = {}
+    selected_by_site: dict[str, dict[str, Any]] = {}
+    for candidate in candidates:
+        candidates_by_site.setdefault(str(candidate.get("site_id")), []).append(candidate)
+    for candidate in selected:
+        selected_by_site[str(candidate.get("site_id"))] = candidate
+
+    decisions: list[dict[str, Any]] = []
+    discovered_ids: set[str] = set()
+    for site in site_scope:
+        site_id = str(site["id"])
+        discovered_ids.add(site_id)
+        site_candidates = candidates_by_site.get(site_id, [])
+        selected_candidate = selected_by_site.get(site_id)
+        missing_configuration = [
+            field
+            for field, value in (
+                ("base_url", site.get("base_url") or site.get("domain")),
+                ("market", site.get("market")),
+                ("language_code", site.get("language_code")),
+            )
+            if not value
+        ]
+        if not site.get("strategy_enabled"):
+            decisions.append(
+                {
+                    "site_id": site_id,
+                    "site_name": site.get("name"),
+                    "action": "configuration_repair",
+                    "reason": "Site strategy is disabled.",
+                    "block_reason": "Site strategy is disabled.",
+                    "unlock_condition": "Enable the site strategy after its configuration is reviewed.",
+                    "responsibility_type": "site_configuration_owner",
+                    "review_by": datetime.now(ZoneInfo("UTC")).date().isoformat(),
+                    "alternative_evidence": [
+                        "approved site configuration",
+                        "verified read-only connector check",
+                    ],
+                    "consecutive_hold_count": 0,
+                    "missing_configuration": ["strategy_enabled"],
+                    "reevaluation_trigger": "next_strategy_run",
+                    "reevaluation_status": "configuration_incomplete",
+                    "last_checked_at": datetime.now(ZoneInfo("UTC")).isoformat(),
+                    "candidate_count": len(site_candidates),
+                    "selected_candidate_id": None,
+                }
+            )
+        elif missing_configuration:
+            decisions.append(
+                {
+                    "site_id": site_id,
+                    "site_name": site.get("name"),
+                    "action": "configuration_repair",
+                    "reason": "Required site strategy configuration is incomplete.",
+                    "block_reason": "Required site strategy configuration is incomplete.",
+                    "unlock_condition": f"Provide: {', '.join(missing_configuration)}.",
+                    "responsibility_type": "site_configuration_owner",
+                    "review_by": datetime.now(ZoneInfo("UTC")).date().isoformat(),
+                    "alternative_evidence": [
+                        "verified domain ownership",
+                        "approved market/language configuration",
+                    ],
+                    "consecutive_hold_count": 0,
+                    "missing_configuration": missing_configuration,
+                    "reevaluation_trigger": "next_strategy_run",
+                    "reevaluation_status": "configuration_incomplete",
+                    "last_checked_at": datetime.now(ZoneInfo("UTC")).isoformat(),
+                    "candidate_count": len(site_candidates),
+                    "selected_candidate_id": None,
+                }
+            )
+        elif selected_candidate:
+            decisions.append(
+                {
+                    "site_id": site_id,
+                    "site_name": site.get("name"),
+                    "action": selected_candidate.get("strategy_type"),
+                    "reason": selected_candidate.get("reason") or "Selected by the daily strategy plan.",
+                    "candidate_count": len(site_candidates),
+                    "selected_candidate_id": str(selected_candidate.get("id")),
+                }
+            )
+        elif site_candidates:
+            blocked = [
+                candidate
+                for candidate in site_candidates
+                if candidate.get("strategy_type") == "hold"
+                or candidate.get("priority") == "Hold"
+                or candidate.get("in_cooldown")
+                or candidate.get("risk_gate_passed", True) is False
+            ]
+            fully_blocked = len(blocked) == len(site_candidates)
+            first_blocked = blocked[0] if blocked else {}
+            decisions.append(
+                {
+                    "site_id": site_id,
+                    "site_name": site.get("name"),
+                    "action": "hold",
+                    "reason": (
+                        first_blocked.get("block_reason")
+                        or first_blocked.get("reason")
+                        or "Every candidate is blocked by an evidence, safety, or cooldown gate."
+                        if fully_blocked
+                        else "Candidate exists but is not in the current action budget."
+                    ),
+                    "unlock_condition": (
+                        first_blocked.get("unlock_condition")
+                        or "Satisfy the candidate evidence and safety requirements, then re-evaluate."
+                        if fully_blocked
+                        else "Increase or free the site action budget, then re-evaluate the candidate."
+                    ),
+                    "candidate_count": len(site_candidates),
+                    "selected_candidate_id": None,
+                }
+            )
+        else:
+            decisions.append(
+                {
+                    "site_id": site_id,
+                    "site_name": site.get("name"),
+                    "action": "hold",
+                    "reason": "No executable candidate was found for this site.",
+                    "unlock_condition": "Refresh site evidence and candidate discovery, then re-evaluate the site.",
+                    "candidate_count": 0,
+                    "selected_candidate_id": None,
+                }
+            )
+
+    decided_ids = {decision["site_id"] for decision in decisions}
+    return {
+        "complete": decided_ids == discovered_ids and len(decisions) == len(discovered_ids),
+        "discovered_sites": len(discovered_ids),
+        "decided_sites": len(decided_ids),
+        "decisions": decisions,
     }
 
 
@@ -320,6 +723,9 @@ def _candidate_keys(business_id: str, row: dict[str, Any], strategy: dict[str, A
         action=strategy.get("strategy_type"),
         objective=strategy.get("recommended_action"),
         evidence={key: row.get(key) for key in ("audit_task_id", "serp_snapshot_id", "post_analysis_id")},
+        target_url=row.get("article_published_url") or row.get("post_url") or strategy.get("target_url"),
+        site_url=row.get("base_url") or row.get("site_url"),
+        site_domain=row.get("domain") or row.get("site_domain"),
     )
     return identity["strategy_fingerprint"], identity["evidence_fingerprint"]
 
@@ -337,6 +743,18 @@ def _select_daily_candidates(
     selected: list[dict[str, Any]] = []
     seen_sites: set[str] = set()
     site_counts: dict[str, int] = {}
+    priority_weight = {"P0": 4, "P1": 3, "P2": 2, "P3": 1}
+
+    def rank(row: dict[str, Any]) -> tuple[float, float, float, float, float]:
+        return (
+            float(priority_weight.get(str(row.get("priority") or "P2"), 0)),
+            float(row.get("opportunity_score", row.get("score", 0)) or 0),
+            float(row.get("readiness_score", row.get("confidence", 0.5)) or 0),
+            -float(row.get("risk_score", 0) or 0),
+            float(row.get("days_since_last_action", 0) or 0),
+        )
+
+    ranked = sorted(rows, key=rank, reverse=True)
 
     def allowed(row: dict[str, Any]) -> bool:
         site_id = str(row.get("site_id") or "")
@@ -345,6 +763,9 @@ def _select_daily_candidates(
             and row.get("priority") != "Hold"
             and row.get("candidate_status") != "executed"
             and not row.get("executed")
+            and not row.get("in_cooldown")
+            and row.get("risk_gate_passed", True) is not False
+            and row.get("site_configuration_ready", True) is not False
             and site_counts.get(site_id, 0) < quotas.get(site_id, wanted)
         )
 
@@ -353,14 +774,14 @@ def _select_daily_candidates(
         site_id = str(row.get("site_id") or "")
         site_counts[site_id] = site_counts.get(site_id, 0) + 1
 
-    for row in rows:
+    for row in ranked:
         site_id = str(row.get("site_id") or "")
         if site_id not in seen_sites and allowed(row):
             add(row)
             seen_sites.add(site_id)
         if len(selected) >= wanted:
             return selected
-    for row in rows:
+    for row in ranked:
         if row not in selected and allowed(row):
             add(row)
         if len(selected) >= wanted:
@@ -368,11 +789,21 @@ def _select_daily_candidates(
     return selected[:wanted]
 
 
+def _required_strategy_data(strategy_type: str) -> list[str]:
+    if strategy_type == "new_article":
+        return ["site_content", "site_knowledge", "content_audit", "serp"]
+    if strategy_type == "on_page_fix":
+        return ["site_asset", "seo_audit"]
+    return ["gsc_28d", "ga4_28d", "site_content", "site_knowledge", "content_audit"]
+
+
 async def _replace_strategy_plan(
     session: AsyncSession,
     *,
     business_id: str,
     analysis_batch_id: str,
+    source_audit_batch_id: str,
+    source_audit_scanned_at: Any,
     action_budget: int,
     site_quotas: dict[str, int],
     candidates: list[dict[str, Any]],
@@ -402,6 +833,8 @@ async def _replace_strategy_plan(
                 "kind": "strategy_plan",
                 "business_id": business_id,
                 "analysis_batch_id": analysis_batch_id,
+                "source_audit_batch_id": source_audit_batch_id,
+                "source_audit_scanned_at": source_audit_scanned_at,
             }, ensure_ascii=False),
             "decision": json.dumps({
                 "action_budget": action_budget,
@@ -450,7 +883,7 @@ async def _replace_strategy_plan(
                     "policy_version": strategy.get("policy_version"),
                     "evidence": strategy.get("evidence") or {},
                 }, ensure_ascii=False),
-                "required_data": ["gsc_28d", "ga4_28d", "site_content", "site_knowledge", "content_audit"],
+                "required_data": _required_strategy_data(str(strategy.get("strategy_type") or "")),
                 "decision": json.dumps(strategy, ensure_ascii=False),
             },
         )
@@ -467,6 +900,8 @@ async def _replace_strategy_plan(
         "id": plan_id,
         "business_id": business_id,
         "analysis_batch_id": analysis_batch_id,
+        "source_audit_batch_id": source_audit_batch_id,
+        "source_audit_scanned_at": source_audit_scanned_at,
         "action_budget": action_budget,
         "site_quotas": site_quotas,
         "selected_candidate_ids": selected_ids,
@@ -583,6 +1018,8 @@ async def get_strategy_plan(session: AsyncSession, *, business_id: str) -> dict[
         "id": plan_id,
         "business_id": business_id,
         "analysis_batch_id": payload.get("analysis_batch_id"),
+        "source_audit_batch_id": payload.get("source_audit_batch_id"),
+        "source_audit_scanned_at": payload.get("source_audit_scanned_at"),
         "action_budget": int(decision.get("action_budget") or 0),
         "site_quotas": decision.get("site_quotas") or {},
         "selected_candidate_ids": decision.get("selected_candidate_ids") or [],
@@ -606,19 +1043,22 @@ async def save_strategy_plan(
     budget = max(0, min(action_budget, 200))
     quotas = {str(key): max(0, int(value)) for key, value in (site_quotas or {}).items()}
     await session.execute(text("SELECT pg_advisory_xact_lock(hashtext(:business_id))"), {"business_id": business_id})
-    analysis_batch_id = (
+    analysis_batch = (
         await session.execute(
             text(
-                "SELECT id::text FROM seo_agent.tasks WHERE task_type = 'review' "
+                "SELECT id::text AS id, payload->>'source_audit_batch_id' AS source_audit_batch_id, "
+                "payload->>'source_audit_scanned_at' AS source_audit_scanned_at "
+                "FROM seo_agent.tasks WHERE task_type = 'review' "
                 "AND status = 'done' AND payload->>'kind' = 'strategy_analysis_batch' "
                 "AND payload->>'business_id' = :business_id "
                 "ORDER BY created_at DESC LIMIT 1"
             ),
             {"business_id": business_id},
         )
-    ).scalar_one_or_none()
-    if not analysis_batch_id:
+    ).mappings().first()
+    if not analysis_batch:
         raise ValueError("请先生成策略候选池")
+    analysis_batch_id = str(analysis_batch["id"])
     rows = await session.execute(
         text(
             """
@@ -666,7 +1106,9 @@ async def save_strategy_plan(
     plan = await _replace_strategy_plan(
         session,
         business_id=business_id,
-        analysis_batch_id=str(analysis_batch_id),
+        analysis_batch_id=analysis_batch_id,
+        source_audit_batch_id=str(analysis_batch["source_audit_batch_id"]),
+        source_audit_scanned_at=str(analysis_batch["source_audit_scanned_at"]),
         action_budget=budget,
         site_quotas=quotas,
         candidates=selected,
@@ -814,6 +1256,36 @@ async def review_strategy(session: AsyncSession, *, task_id: str, approved: bool
     if not row:
         raise ValueError("strategy task not found")
     decision = dict(row["decision"] or {})
+    if approved and decision.get("strategy_type") == "on_page_fix":
+        if (
+            row["site_status"] != "active"
+            or not row["strategy_enabled"]
+            or not row["business_id"]
+            or row["task_business_id"] != row["business_id"]
+        ):
+            raise ValueError("目标站点已退出当前业务策略范围，请重新扫描并生成策略")
+        decision.update(
+            {
+                "approved": True,
+                "execution_task_id": None,
+                "execution_status": "blocked_pending_preview",
+                "requires_publish": True,
+                "blocker": "A safe on-page preview and explicit confirmation are required before execution.",
+                "unlock_condition": f"Call /workflow/strategies/{task_id}/on-page/preview, review the snapshot hash, then confirm through the on-page execute API.",
+            }
+        )
+        await session.execute(
+            text(
+                "UPDATE seo_agent.tasks SET status = 'done', decision = CAST(:decision AS jsonb), "
+                "finished_at = now(), updated_at = now() WHERE id = CAST(:id AS uuid)"
+            ),
+            {
+                "id": task_id,
+                "decision": json.dumps(decision, ensure_ascii=False),
+            },
+        )
+        await session.commit()
+        return _strategy_row({**dict(row), "status": "done", "decision": decision})
     if approved:
         await _validate_current_strategy(session, row=dict(row), decision=decision)
         if decision.get("strategy_type") == "hold" or decision.get("priority") == "Hold":
@@ -1029,12 +1501,48 @@ def _build_strategy(row: dict[str, Any], ga4: dict[str, Any] | None, internal_li
     audit = row.get("audit_decision") or {}
     audit_action = str(audit.get("action") or "")
     profile = row.get("knowledge_profile") or {}
+    policy = profile.get("generation_policy") or {}
+    risk_level = str(policy.get("risk_level") or "standard").casefold()
+    high_risk = risk_level in {"regulated", "ymyl"}
+    risk_failures: list[str] = []
+    if high_risk:
+        if not row.get("market"):
+            risk_failures.append("market")
+        if not row.get("language_code"):
+            risk_failures.append("language")
+        if not audit.get("product_facts"):
+            risk_failures.append("product_facts")
+        if not policy.get("allowed_sources") or not audit.get("authority_sources"):
+            risk_failures.append("authoritative_sources")
+    explicit_new_evidence = any(
+        key in audit
+        for key in (
+            "product_or_category_match",
+            "content_gap",
+            "serp_intent_confirmed",
+            "cannibalization_risk",
+            "product_facts",
+        )
+    )
+    if audit_action == "new_article" and explicit_new_evidence:
+        if not audit.get("product_or_category_match"):
+            risk_failures.append("business_match")
+        if not audit.get("content_gap"):
+            risk_failures.append("content_gap")
+        if not audit.get("serp_intent_confirmed"):
+            risk_failures.append("serp_intent")
+        if str(audit.get("cannibalization_risk") or "").casefold() not in {"none", "low", "clear"}:
+            risk_failures.append("cannibalization")
+        if not audit.get("product_facts"):
+            risk_failures.append("product_facts")
+    risk_failures = list(dict.fromkeys(risk_failures))
+    risk_gate_passed = not risk_failures
     knowledge_confirmed = "knowledge_profile" not in row or profile.get("status") == "confirmed"
     existing_target_without_analysis = bool((row.get("article_id") or row.get("post_id")) and not row.get("post_analysis_id"))
     existing_content = bool(row.get("article_id") or row.get("post_id"))
     evidence_level = "confirmed" if impressions >= 100 and clicks >= 5 else "directional"
     confidence = 0.82 if evidence_level == "confirmed" else 0.58
-    if not knowledge_confirmed or audit_action == "hold" or existing_target_without_analysis:
+    if not knowledge_confirmed or audit_action == "hold" or existing_target_without_analysis or not risk_gate_passed:
         strategy_type = "hold"
     elif row.get("article_id"):
         strategy_type = "update_article"
@@ -1092,6 +1600,36 @@ def _build_strategy(row: dict[str, Any], ga4: dict[str, Any] | None, internal_li
         else "站点库存事实与候选诊断冲突，已按库存事实纠正动作"
     )
     reason = f"{audit_note.rstrip('；。') + '；' if audit_note else ''}{gsc_note}；GA4 会话 {sessions}、转化 {conversions:g}；{serp_note}；{knowledge_note}。"
+    execution_evidence = {
+        "search_intent": {
+            "status": "confirmed" if audit.get("serp_intent_confirmed") else "missing",
+            "source": "live_serp" if row.get("serp_snapshot_id") else None,
+            "snapshot_id": str(row["serp_snapshot_id"]) if row.get("serp_snapshot_id") else None,
+        },
+        "topic_basis": {
+            "product_or_category_match": bool(audit.get("product_or_category_match")),
+            "content_gap": bool(audit.get("content_gap")),
+        },
+        "cannibalization": {
+            "status": str(audit.get("cannibalization_risk") or "unknown").casefold(),
+        },
+        "product_facts": list(audit.get("product_facts") or []),
+        "authority_sources": list(audit.get("authority_sources") or []),
+        "evidence_sources": [
+            source
+            for source, present in (
+                ("products_or_collections", audit.get("product_or_category_match")),
+                ("live_serp", row.get("serp_snapshot_id")),
+                ("content_audit", row.get("audit_task_id")),
+            )
+            if present
+        ],
+        "snapshots": {
+            "serp": str(row["serp_snapshot_id"]) if row.get("serp_snapshot_id") else None,
+            "content_audit": str(row["audit_task_id"]) if row.get("audit_task_id") else None,
+            "post_analysis": str(row["post_analysis_id"]) if row.get("post_analysis_id") else None,
+        },
+    }
     return {
         "business_id": row.get("business_id"),
         "topic_cluster_id": row.get("topic_cluster_id"),
@@ -1100,6 +1638,24 @@ def _build_strategy(row: dict[str, Any], ga4: dict[str, Any] | None, internal_li
         "query": row["query"],
         "priority": priority,
         "score": score,
+        "opportunity_score": score,
+        "readiness_score": confidence if risk_gate_passed else 0.0,
+        "risk_score": 0.8 if high_risk else 0.2,
+        "risk_level": risk_level,
+        "risk_gate_passed": risk_gate_passed,
+        "risk_gate_failures": risk_failures,
+        "block_reason": (
+            f"Strategy safety/evidence gate failed: {', '.join(risk_failures)}"
+            if risk_failures
+            else None
+        ),
+        "unlock_condition": (
+            "Provide every missing business fact, locale, SERP-intent, cannibalization and authoritative-source requirement."
+            if risk_failures
+            else None
+        ),
+        "days_since_last_action": int(row.get("days_since_last_action") or 0),
+        "execution_evidence": execution_evidence,
         "confidence": confidence,
         "evidence_level": evidence_level,
         "reason": reason,

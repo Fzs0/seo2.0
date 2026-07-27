@@ -179,6 +179,8 @@
 | POST | `/api/v1/connectors/{connector_id}/home-seo/update/preview` | 首页 SEO patch | 实时读取首页 SEO，返回字段差异和快照哈希，不写外部站点。 |
 | POST | `/api/v1/connectors/{connector_id}/home-seo/update/execute` | 首页 SEO patch、`expected_snapshot_hash`、`confirm=true` | 仅发送三个 SEO 字段到 `/seoplans`，写后回读并保存前后审计。 |
 | GET | `/api/v1/connectors/{connector_id}/home-seo-update-runs` | `limit?` | 查看首页 SEO 写回记录和验证结果。 |
+| POST | `/api/v1/workflow/strategies/{task_id}/on-page/preview` | `{patch, generationMode, generationProvider?, generationModel?, generationRunId?}` | 将已批准的 `on_page_fix` 策略路由到现有首页、产品或分类 SEO 预览服务；`generationMode` 必须明确为 `manual` 或 `model`。模型生成时必须提供精确厂商和模型 ID；人工提交时模型字段保存为 `null`。 |
+| POST | `/api/v1/workflow/strategies/{task_id}/on-page/execute` | `{patch, generationMode, generationProvider?, generationModel?, generationRunId?, expectedSnapshotHash, confirm, confirmVariantRecreation?, confirmMembershipTopReset?}` | 使用预览快照执行受保护的 SEO 写入并回读验证；执行 provenance 必须与预览一致，缺少精确模型信息会在 PUT 前阻塞。商品变体重建和分类成员置顶重置必须分别显式确认，失败不会标记成功。 |
 
 网络保护包括：仅允许 HTTPS 443、逐次校验跳转目标、DNS 解析结果必须全部为公网地址、精确主机白名单、超时和响应大小限制、JSON 内容类型校验。通用自定义连接器保持只读；只有固定域名的 OEMApps 适配器提供显式 SEO 写回，且要求连接器已激活、单商品预览、快照匹配、variant 重建确认、完整审计和写后回读。
 
@@ -186,9 +188,9 @@
 
 | 方法 | 路径 | 请求 | 响应/说明 |
 | --- | --- | --- | --- |
-| GET | `/api/v1/analytics/sources` | 无 | 脱敏后的 Google 数据源 `{items, total, configError}`，不暴露 SA 私钥。 |
+| GET | `/api/v1/analytics/sources` | 无 | 脱敏后的 Google 数据源 `{items, total, configError}`；每项包含实际生效的 `ga4Hostnames`，不暴露 SA 私钥。 |
 | GET | `/api/v1/analytics/sources/by-site/{site_id}` | 路径：`site_id` | `{site, source, configured, recentSyncLog}`；站点不存在返回 404。 |
-| POST | `/api/v1/analytics/sync` | `AnalyticsSyncBody` | 手动同步单个 source、单个站点或全部 source；会调用 Google API。 |
+| POST | `/api/v1/analytics/sync` | `AnalyticsSyncBody` | 手动同步单个 source、单个站点或全部 source；GA4 三类报告强制使用该 source 的 hostname 白名单，全部成功后才按日期范围事务性替换本地数据。 |
 | GET | `/api/v1/analytics/sync-log` | 查询：`site_id`、`source_id`、`limit=50`（1..500） | `{items, total}`，按最新开始时间倒序。 |
 | GET | `/api/v1/analytics/dashboard/{site_id}` | 路径：`site_id` | 站点元信息、GSC/GA4 28 天汇总、7 天趋势和最近同步记录。 |
 | GET | `/api/v1/analytics/gsc/queries` | 查询：必填 `site_id`；`days=28`（1..90）、`limit=100`（1..500）、`min_impressions=0` | `{items, total, days}`。当前实现固定读取 28 天视图并返回 `days: 28`。 |
@@ -199,6 +201,8 @@
 | GET | `/api/v1/analytics/ga4/channels` | 查询：必填 `site_id`；`days=28`（1..90） | 渠道聚合。当前实现固定使用 28 天。 |
 | GET | `/api/v1/analytics/ga4/landing-pages` | 查询：必填 `site_id`；`days=28`（1..90）、`limit=50`（1..500） | 落地页聚合。 |
 | GET | `/api/v1/analytics/ping` | 无 | 对每个数据源执行 GSC 和 GA4 鉴权/探活，会调用 Google API。 |
+
+GA4 数据源可在本地配置中提供 `ga4Hostnames: string[]`。未显式配置时，后端只允许 GSC 主域名及其 `www` 形式，不再读取整个 Property 的混合 hostname 数据。报告超过 100,000 行，或总览有数据但落地页报告异常为空时，同步失败并保留原数据。
 
 ### 2.10 社媒内容、连接与发布
 

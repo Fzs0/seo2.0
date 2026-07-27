@@ -20,6 +20,8 @@
 | `migrations/017_keyword_business_import_scope.sql` | 把关键词导入唯一键纳入 `business_id`，避免不同业务导入相同市场关键词时互相覆盖 |
 | `migrations/029_strategy_effect_baseline_validity.sql` | 把缺少原始目标 URL 的旧文更新效果基线标记为不可比较，避免产生伪效果结论 |
 | `migrations/030_classify_legacy_serp_failures.sql` | 将旧客户端留下的无错误类型 SERP 失败标记为 `legacy_unclassified`，避免与当前故障混淆 |
+| `migrations/031_invalidate_late_strategy_effect_baselines.sql` | 备份并作废发布后才采集的“发布前基线”，保留原始指标且将结论改为 `inconclusive` |
+| `migrations/032_classify_legacy_new_article_zero_baselines.sql` | 把证据明确的旧版新文章零值基线标记为 `structural_zero`，避免与晚采集实测数据混淆 |
 | `scripts/seed_rule_baseline.mjs` | 把 `workflows/seo-standard.json` 灌入一次 baseline 的 Node.js 脚本 |
 
 ---

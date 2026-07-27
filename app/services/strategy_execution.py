@@ -14,12 +14,15 @@ from typing import Any, Callable, Protocol
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.article_urls import resolve_article_public_url
 from app.core.database import SessionLocal
 from app.services.strategy_effect_service import (
     cancel_unpublished_effect,
     ensure_effect,
     mark_effect_published,
 )
+from app.services.strategy_decision_service import build_keywordless_new_article_context
+from app.core.config import get_settings
 
 
 class _ArticleGeneratorAdapter(Protocol):
@@ -153,7 +156,7 @@ async def _validate_current_strategy(
                                    latest_audit.created_at DESC LIMIT 1
                        )
                   ) AS analysis_ok,
-                  CASE WHEN :strategy_type = 'update_article' THEN true ELSE EXISTS (
+                   CASE WHEN :strategy_type = 'update_article' OR CAST(:keyword_id AS uuid) IS NULL THEN true ELSE EXISTS (
                     SELECT 1 FROM seo_agent.keywords keyword
                      WHERE keyword.id = CAST(:keyword_id AS uuid) AND keyword.business_id = :business_id
                        AND keyword.assigned_site_id = CAST(:site_id AS uuid)
@@ -299,7 +302,11 @@ async def _execute_strategy(
         return {"ok": False, "status": "blocked", "execution_task_id": str(execution_id), "error": str(error)}
     site_scope = (
         await session.execute(
-            text("SELECT name, status, business_id, strategy_enabled, market, language_code FROM seo_agent.sites WHERE id = CAST(:id AS uuid)"),
+            text(
+                "SELECT name, status, business_id, strategy_enabled, market, language_code, "
+                "site_type, domain, base_url, api_base_url, api_config "
+                "FROM seo_agent.sites WHERE id = CAST(:id AS uuid)"
+            ),
             {"id": execution["site_id"]},
         )
     ).mappings().first()
@@ -314,16 +321,20 @@ async def _execute_strategy(
         await _finish_execution_task(session, execution_id, status="blocked", error_message=message)
         await session.commit()
         return {"ok": False, "status": "blocked", "execution_task_id": str(execution_id), "error": message}
-    if not execution["site_id"] or (execution["task_type"] == "new_article" and not execution["keyword_id"]):
-        message = "新文章策略缺少关键词或目标站点" if execution["task_type"] == "new_article" else "更新策略缺少目标站点"
+    if not execution["site_id"]:
+        message = "文章策略缺少目标站点"
         await _finish_execution_task(session, execution_id, status="failed", error_message=message)
         await session.commit()
         return {"ok": False, "status": "failed", "execution_task_id": str(execution_id), "error": message}
     update_post_id = None
+    update_post_url = None
     if execution["task_type"] == "update_article":
         post = (
             await session.execute(
-                text("SELECT external_id FROM seo_agent.posts WHERE id = CAST(:id AS uuid) AND site_id = CAST(:site_id AS uuid)"),
+                text(
+                    "SELECT external_id, url, slug FROM seo_agent.posts "
+                    "WHERE id = CAST(:id AS uuid) AND site_id = CAST(:site_id AS uuid)"
+                ),
                 {"id": execution["post_id"], "site_id": execution["site_id"]},
             )
         ).mappings().first()
@@ -332,24 +343,47 @@ async def _execute_strategy(
             await _finish_execution_task(session, execution_id, status="failed", error_message="旧文缺少远端文章 ID")
             await session.commit()
             return {"ok": False, "status": "failed", "execution_task_id": str(execution_id), "error": "旧文缺少远端文章 ID"}
+        update_post_url = resolve_article_public_url(
+            dict(site_scope),
+            slug=post["slug"] if post else None,
+            article_id=update_post_id,
+            remote_url=post["url"] if post else None,
+        )
+        if not update_post_url:
+            message = "旧文缺少正式公开地址，请先同步目标站点文章"
+            await _finish_execution_task(session, execution_id, status="blocked", error_message=message)
+            await session.commit()
+            return {"ok": False, "status": "blocked", "execution_task_id": str(execution_id), "error": message}
 
     keyword_context = None
-    if execution["task_type"] == "update_article" and not execution["keyword_id"]:
-        query = str(approved_decision.get("query") or "").strip()
-        if not query:
-            message = "更新策略缺少查询词"
-            await _finish_execution_task(session, execution_id, status="failed", error_message=message)
-            await session.commit()
-            return {"ok": False, "status": "failed", "execution_task_id": str(execution_id), "error": message}
-        keyword_context = {
-            "id": None,
-            "keyword": query,
-            "business_id": site_scope["business_id"],
-            "assigned_site_id": str(execution["site_id"]),
-            "assigned_site_label": site_scope["name"],
-            "market": site_scope["market"],
-            "language_code": site_scope["language_code"],
-        }
+    if not execution["keyword_id"]:
+        if execution["task_type"] == "new_article":
+            try:
+                keyword_context = build_keywordless_new_article_context(
+                    approved_decision,
+                    site={**dict(site_scope), "id": str(execution["site_id"])},
+                )
+            except ValueError as error:
+                message = str(error)
+                await _finish_execution_task(session, execution_id, status="blocked", error_message=message)
+                await session.commit()
+                return {"ok": False, "status": "blocked", "execution_task_id": str(execution_id), "error": message}
+        else:
+            query = str(approved_decision.get("query") or "").strip()
+            if not query:
+                message = "更新策略缺少查询词"
+                await _finish_execution_task(session, execution_id, status="failed", error_message=message)
+                await session.commit()
+                return {"ok": False, "status": "failed", "execution_task_id": str(execution_id), "error": message}
+            keyword_context = {
+                "id": None,
+                "keyword": query,
+                "business_id": site_scope["business_id"],
+                "assigned_site_id": str(execution["site_id"]),
+                "assigned_site_label": site_scope["name"],
+                "market": site_scope["market"],
+                "language_code": site_scope["language_code"],
+            }
 
     if execution["status"] == "queued":
         claimed = await session.execute(
@@ -364,13 +398,16 @@ async def _execute_strategy(
             raise ValueError("execution task was claimed by another worker")
         await session.commit()
     try:
+        effect_strategy = dict(approved_decision)
+        if update_post_url:
+            effect_strategy["target_url"] = update_post_url
         await ensure_effect(
             session,
             execution_task_id=str(execution_id),
             strategy_task_id=str(task_id),
             site_id=str(execution["site_id"]),
             article_id=None,
-            strategy=approved_decision,
+            strategy=effect_strategy,
         )
         await session.commit()
     except Exception as error:  # noqa: BLE001
@@ -456,6 +493,7 @@ async def _execute_strategy(
                     article_id=str(article_id),
                     target_url=published.get("url"),
                     action=approved_decision.get("strategy_type"),
+                    topic_cooldown_days=get_settings().strategy_topic_cooldown_days,
                 )
             except Exception as error:  # noqa: BLE001
                 await session.rollback()

@@ -86,6 +86,7 @@ class Settings(BaseSettings):
     automation_interval_seconds: int = 3600
     automation_batch_size: int = 1
     automation_min_impressions: int = 20
+    strategy_topic_cooldown_days: int = Field(default=21, ge=14, le=28)
 
     def is_ai_stage_configured(self, stage: str) -> bool:
         """判断某个 AI 阶段是否真正配置了外部供应商（不配置就回退本地 brief）。"""
