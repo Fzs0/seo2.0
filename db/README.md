@@ -2,7 +2,7 @@
 
 本目录包含 PostgreSQL 记忆库的所有 schema migration 与 seed 脚本。
 
-所有 DDL 在 `migrations/` 下按编号顺序执行。所有脚本都假设目标 PG 版本 ≥ 14（与 `001_agent_memory_schema.sql` 顶部声明一致）。
+所有 DDL 在 `migrations/` 下按编号顺序执行。当前应用和发布门禁仅支持 PostgreSQL 17；应用启动时会拒绝其他主版本。
 
 > 当前以 `db/migrations/*.sql` 为权威部署入口；Alembic 仅保留到 v6，不能单独用于部署当前应用。
 
@@ -118,6 +118,19 @@ SELECT id, rule_set_id, action, actor, created_at
 ## 5. 回滚
 
 当前 raw SQL migration 为前向幂等脚本，不提供统一 downgrade；生产回滚请走数据库备份恢复。
+
+## PostgreSQL 17 发布门禁
+
+只允许连接数据库名包含 `test`、`temp` 或 `tmp` 的临时库：
+
+```powershell
+$env:SEO_PG17_TEST_DSN = "postgresql://seo:password@127.0.0.1:5432/seo_ci_test"
+.\scripts\test-pg17-release-gate.ps1
+```
+
+该命令验证 PostgreSQL 主版本、全量 migration、031/032 重复执行、Hold
+并发与 Token 超时接管、最新审计批次门禁，以及并发幂等动作创建。未提供
+`SEO_PG17_TEST_DSN` 时命令必定失败，不能用 skip 代替发布验收。
 
 **仅测试环境手写 DROP**（生产禁用）：
 

@@ -14,6 +14,7 @@ from app.services.strategy_hold_service import (
     claim_hold_evidence_refresh,
     complete_hold_evidence_refresh,
     finalize_hold_run,
+    register_hold_decision_and_claim_refresh,
     wait_for_hold_evidence_refresh,
 )
 
@@ -218,6 +219,71 @@ async def test_concurrent_hold_runs_refresh_once_count_every_run_and_emit_one_st
                 {"source": "serp", "status": "fresh", "snapshot_id": "serp-recovery"}
             ],
         )
+
+    # PRD transition: request order is irrelevant. Only a decided all-Hold
+    # result advances the authoritative streak and the real 1->2 edge owns one
+    # token. A concurrent third decision waits without advancing the count.
+    decided_business = str(uuid4())
+    first_decided_run = str(uuid4())
+    async with factory() as session:
+        first = await register_hold_decision_and_claim_refresh(
+            session,
+            business_id=decided_business,
+            run_id=first_decided_run,
+            all_hold=True,
+            site_hold_flags={"main": True, "blog": True},
+        )
+    assert first["business_consecutive_hold_count"] == 1
+    assert first["should_refresh"] is False
+
+    concurrent_runs = [str(uuid4()), str(uuid4())]
+
+    async def register_decided(run_id: str):
+        async with factory() as session:
+            return await register_hold_decision_and_claim_refresh(
+                session,
+                business_id=decided_business,
+                run_id=run_id,
+                all_hold=True,
+                site_hold_flags={"main": True, "blog": True},
+            )
+
+    decided_results = list(
+        await __import__("asyncio").gather(
+            *(register_decided(run_id) for run_id in concurrent_runs)
+        )
+    )
+    owner = next(result for result in decided_results if result["should_refresh"])
+    waiter_result = next(
+        result for result in decided_results if result.get("wait_for_refresh")
+    )
+    assert owner["business_consecutive_hold_count"] == 2
+    assert waiter_result["business_consecutive_hold_count"] == 2
+    assert waiter_result["emit_strategy_stagnation"] is False
+    async with factory() as session:
+        assert await complete_hold_evidence_refresh(
+            session,
+            business_id=decided_business,
+            refresh_token=owner["refresh_token"],
+            refresh_results=[
+                {"source": "gsc", "status": "fresh", "snapshot_id": "decided-gsc"}
+            ],
+        )
+    waiting_run_id = next(
+        run_id
+        for run_id, result in zip(concurrent_runs, decided_results)
+        if result.get("wait_for_refresh")
+    )
+    async with factory() as session:
+        third = await register_hold_decision_and_claim_refresh(
+            session,
+            business_id=decided_business,
+            run_id=waiting_run_id,
+            all_hold=True,
+            site_hold_flags={"main": True, "blog": True},
+        )
+    assert third["business_consecutive_hold_count"] == 3
+    assert third["emit_strategy_stagnation"] is True
 
     async with engine.begin() as connection:
         await connection.exec_driver_sql("DROP SCHEMA IF EXISTS seo_agent CASCADE")

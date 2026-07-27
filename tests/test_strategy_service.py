@@ -7,6 +7,7 @@ from app.services.strategy_service import (
     _required_strategy_data,
     _finish_execution_task,
     _select_daily_candidates,
+    generate_strategies,
     review_strategy,
 )
 
@@ -15,6 +16,16 @@ def test_required_data_matches_the_selected_action_type():
     assert "gsc_28d" not in _required_strategy_data("new_article")
     assert _required_strategy_data("on_page_fix") == ["site_asset", "seo_audit"]
     assert "gsc_28d" in _required_strategy_data("update_article")
+
+
+def test_hold_refresh_is_claimed_only_after_coverage_decides_all_hold():
+    import inspect
+
+    source = inspect.getsource(generate_strategies)
+    assert source.index("coverage_matrix = _build_site_coverage") < source.index(
+        "register_hold_decision_and_claim_refresh"
+    )
+    assert "claim_hold_evidence_refresh(" not in source
 
 
 def test_finish_execution_task_uses_explicit_text_casts():

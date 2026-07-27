@@ -1,10 +1,8 @@
 """Disposable-PostgreSQL integration tests for strategy-effect repair migrations.
 
-Set SEO_MIGRATION_TEST_POSTGRES_DSN to a PostgreSQL database created solely for
-tests. Multiple disposable PostgreSQL versions can be supplied as a JSON array
-or semicolon-separated list in SEO_MIGRATION_TEST_POSTGRES_DSNS. The fixture
-recreates the ``seo_agent`` schema and must never target a development or
-production database.
+Set SEO_MIGRATION_TEST_POSTGRES_DSN to a PostgreSQL 17 database created solely
+for tests. The fixture recreates the ``seo_agent`` schema and must never target
+a development or production database.
 """
 
 from __future__ import annotations
@@ -55,10 +53,10 @@ def _disposable_postgres_dsn(dsn: str | None) -> str:
 
 
 @pytest.mark.asyncio
-async def test_acceptance_matrix_contains_postgresql_14_15_and_16():
+async def test_acceptance_database_is_postgresql_17():
     configured = _configured_postgres_dsns()
     if configured == [None]:
-        pytest.skip("set the disposable PostgreSQL 14/15/16 DSN matrix")
+        pytest.skip("set a disposable PostgreSQL 17 DSN")
     majors: set[int] = set()
     for raw_dsn in configured:
         connection = await asyncpg.connect(_disposable_postgres_dsn(raw_dsn))
@@ -66,16 +64,16 @@ async def test_acceptance_matrix_contains_postgresql_14_15_and_16():
             majors.add(int(await connection.fetchval("SHOW server_version_num")) // 10000)
         finally:
             await connection.close()
-    assert majors == {14, 15, 16}
+    assert majors == {17}
 
 
 @pytest_asyncio.fixture(params=_configured_postgres_dsns())
 async def postgres(request):
     connection = await asyncpg.connect(_disposable_postgres_dsn(request.param))
     version = int(await connection.fetchval("SHOW server_version_num"))
-    if version < 140000:
+    if version // 10000 != 17:
         await connection.close()
-        pytest.skip("migrations support PostgreSQL 14 and newer")
+        pytest.fail(f"migration acceptance requires PostgreSQL 17, got {version}")
     await connection.execute("DROP SCHEMA IF EXISTS seo_agent CASCADE")
     await connection.execute("CREATE SCHEMA seo_agent")
     await connection.execute(

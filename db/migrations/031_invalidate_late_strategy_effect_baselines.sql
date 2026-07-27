@@ -36,9 +36,9 @@ BEGIN
 END;
 $$;
 
--- PostgreSQL 14 has no pg_input_is_valid. A session-local conversion
--- helper safely maps null, empty, malformed, out-of-range and otherwise
--- unparseable values to NULL without leaving any persistent database function.
+-- A session-local conversion helper safely maps null, empty, malformed,
+-- out-of-range and otherwise unparseable values to NULL without leaving any
+-- persistent database function.
 CREATE OR REPLACE FUNCTION pg_temp.strategy_effect_try_timestamptz(_value text)
 RETURNS timestamptz
 LANGUAGE plpgsql

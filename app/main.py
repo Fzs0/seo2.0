@@ -10,7 +10,8 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.core.config import get_settings
-from app.core.database import SessionLocal
+from app.core.database import SessionLocal, engine
+from app.core.database_version import require_postgresql_17
 from app.core.google_config import get_store as get_google_store
 from app.core.logging import configure_logging, get_logger
 from app.core.runtime_identity import capture_runtime_identity, runtime_health
@@ -113,6 +114,8 @@ async def _periodic_effect_checks(stop_event: asyncio.Event) -> None:
 async def lifespan(app: FastAPI):
     configure_logging(settings.log_level, settings.log_json, settings.log_file)
     logger.info("startup_begin", env=settings.app_env, port=settings.app_port)
+    postgres_major = await require_postgresql_17(engine)
+    logger.info("database_version_gate_passed", postgres_major=postgres_major)
 
     store = get_store()
     try:
@@ -202,12 +205,18 @@ def create_app() -> FastAPI:
     from app.api.v1.connectors import router as v1_connectors_router
     from app.api.v1.endpoints import router as v1_router
     from app.api.v1.social import router as v1_social_router
+    from app.api.v1.site_capabilities import router as v1_site_capabilities_router
+    from app.api.v1.strategy_actions import router as v1_strategy_actions_router
+    from app.api.v1.strategy_runs import router as v1_strategy_runs_router
 
     app.include_router(v1_router, prefix="/api/v1")
     app.include_router(v1_business_router, prefix="/api/v1")
     app.include_router(v1_connectors_router, prefix="/api/v1")
     app.include_router(v1_social_router, prefix="/api/v1")
     app.include_router(v1_analytics_router, prefix="/api/v1")
+    app.include_router(v1_site_capabilities_router, prefix="/api/v1")
+    app.include_router(v1_strategy_actions_router, prefix="/api/v1")
+    app.include_router(v1_strategy_runs_router, prefix="/api/v1")
     app.include_router(admin_router, prefix="/admin")
 
     @app.get("/api/health")

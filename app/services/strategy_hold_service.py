@@ -202,6 +202,188 @@ async def claim_hold_evidence_refresh(
     }
 
 
+async def register_hold_decision_and_claim_refresh(
+    session: AsyncSession,
+    *,
+    business_id: str,
+    run_id: str,
+    all_hold: bool,
+    site_hold_flags: dict[str, bool],
+    now: datetime | None = None,
+    refresh_lease_seconds: int = _REFRESH_LEASE_SECONDS,
+) -> dict[str, Any]:
+    """Register a *decided* run and claim refresh only on the real 1→2 Hold edge.
+
+    Unlike the legacy preflight claimant, this transition never infers a Hold
+    from request order.  The caller must first finish the site coverage matrix.
+    """
+    await acquire_hold_state_lock(session, business_id=business_id)
+    task_id, state = await _load_or_create_coordination_state(
+        session, business_id=business_id
+    )
+    registered = list(state.get("registered_run_ids") or [])
+    if run_id in registered:
+        await session.commit()
+        return {
+            **state,
+            "should_refresh": False,
+            "refresh_token": None,
+            "already_registered": True,
+            "emit_strategy_stagnation": False,
+        }
+
+    transition_now = now or datetime.now(timezone.utc)
+    refresh = dict(state.get("refresh") or {})
+    if _refresh_lease_expired(
+        refresh, now=transition_now, lease_seconds=refresh_lease_seconds
+    ):
+        refresh.update(
+            {
+                "status": "failed",
+                "completed_at": transition_now.isoformat(),
+                "error": "refresh lease expired before completion",
+                "decision_impact": "expired evidence was not used; a later confirmed Hold may retry",
+            }
+        )
+        state["refresh"] = refresh
+    elif (
+        all_hold
+        and refresh.get("status") == "pending"
+        and refresh.get("claimed_by_run_id") != run_id
+    ):
+        await session.commit()
+        return {
+            **state,
+            "should_refresh": False,
+            "refresh_token": None,
+            "wait_for_refresh": True,
+            "pending_refresh_token": refresh.get("refresh_token"),
+            "already_registered": False,
+            "emit_strategy_stagnation": False,
+        }
+
+    previous_count = int(state.get("business_consecutive_hold_count") or 0)
+    next_count = previous_count + 1 if all_hold else 0
+    previous_sites = dict(state.get("site_consecutive_hold_counts") or {})
+    state["site_consecutive_hold_counts"] = {
+        site: int(previous_sites.get(site, 0)) + 1 if is_hold else 0
+        for site, is_hold in site_hold_flags.items()
+    }
+    state["business_consecutive_hold_count"] = next_count
+    state["registered_run_ids"] = [*registered, run_id][-100:]
+    state["last_registered_at"] = transition_now.isoformat()
+
+    should_refresh = all_hold and previous_count == 1 and next_count == 2
+    refresh_token: str | None = None
+    if should_refresh:
+        refresh_token = str(uuid4())
+        state["refresh"] = {
+            "status": "pending",
+            "refresh_token": refresh_token,
+            "trigger_hold_transition": "1_to_2",
+            "claimed_by_run_id": run_id,
+            "claimed_at": transition_now.isoformat(),
+            "expires_at": (
+                transition_now + timedelta(seconds=max(1, refresh_lease_seconds))
+            ).isoformat(),
+            "degraded": False,
+            "results": [],
+        }
+    if not all_hold:
+        state["refresh_claimed_for_counts"] = []
+
+    emitted = {
+        int(value) for value in state.get("stagnation_emitted_for_counts") or []
+    }
+    emit_stagnation = next_count == 3 and 3 not in emitted
+    if emit_stagnation:
+        emitted.add(3)
+        await _insert_stagnation_task(
+            session, business_id=business_id, run_id=run_id, count=next_count
+        )
+    state["stagnation_emitted_for_counts"] = sorted(emitted)
+    await _save_coordination_state(session, task_id=task_id, state=state)
+    await session.commit()
+    return {
+        **state,
+        "should_refresh": should_refresh,
+        "refresh_token": refresh_token,
+        "already_registered": False,
+        "emit_strategy_stagnation": emit_stagnation,
+    }
+
+
+async def reconcile_refreshed_hold_decision(
+    session: AsyncSession,
+    *,
+    business_id: str,
+    run_id: str,
+    all_hold: bool,
+    site_hold_flags: dict[str, bool],
+) -> dict[str, Any]:
+    """Replace the provisional second-Hold result with the refreshed decision."""
+    await acquire_hold_state_lock(session, business_id=business_id)
+    task_id, state = await _load_or_create_coordination_state(
+        session, business_id=business_id
+    )
+    refresh = dict(state.get("refresh") or {})
+    if (
+        refresh.get("claimed_by_run_id") != run_id
+        or refresh.get("status") != "completed"
+    ):
+        await session.commit()
+        raise ValueError("completed Hold refresh is required before reconciliation")
+    if not all_hold:
+        state["business_consecutive_hold_count"] = 0
+        state["site_consecutive_hold_counts"] = {
+            site: 0 if not is_hold else int(
+                dict(state.get("site_consecutive_hold_counts") or {}).get(site, 0)
+            )
+            for site, is_hold in site_hold_flags.items()
+        }
+        state["refresh_claimed_for_counts"] = []
+    state["refreshed_decision"] = {
+        "run_id": run_id,
+        "all_hold": all_hold,
+        "completed_at": datetime.now(timezone.utc).isoformat(),
+    }
+    await _save_coordination_state(session, task_id=task_id, state=state)
+    await session.commit()
+    return state
+
+
+async def _insert_stagnation_task(
+    session: AsyncSession, *, business_id: str, run_id: str, count: int
+) -> None:
+    await session.execute(
+        text(
+            """
+            INSERT INTO seo_agent.tasks
+              (task_type, status, priority, title, payload, decision)
+            VALUES ('review', 'done', 'P2', :title,
+                    CAST(:payload AS jsonb), CAST(:decision AS jsonb))
+            """
+        ),
+        {
+            "title": f"Strategy stagnation: {business_id}",
+            "payload": json.dumps(
+                {
+                    "kind": "strategy_stagnation",
+                    "business_id": business_id,
+                    "strategy_run_id": run_id,
+                }
+            ),
+            "decision": json.dumps(
+                {
+                    "kind": "strategy_stagnation",
+                    "severity": "P2",
+                    "consecutive_hold_count": count,
+                }
+            ),
+        },
+    )
+
+
 def _refresh_lease_expired(
     refresh: dict[str, Any], *, now: datetime, lease_seconds: int
 ) -> bool:

@@ -516,3 +516,20 @@ curl -X POST http://127.0.0.1:8010/api/v1/knowledge/retrieve \
 - GSC opportunities 使用 camelCase 字段 `avgPosition`、`lastSeen`，其中 `lastSeen` 可为 null；GSC pages/breakdown 则保留 snake_case `avg_position`、`last_seen`。
 - 关键词 AI 状态由前端约每 1.5 秒轮询一次；知识批任务约每 3 秒轮询状态和条目。它们不是流式接口。
 - `frontend/dist` 当前构建产物落后于 `frontend/src`，未包含源码中已经接入的部分新接口。本文以当前源码和路由为准，不代表旧构建产物的可用功能集合。
+# SEO 自主运营接口
+
+完整契约、状态机和安全边界见
+`docs/SEO_AUTONOMOUS_OPERATIONS_BACKEND_V2.md`。
+
+- `POST /api/v1/strategy-runs`：创建幂等 dry-run。
+- `GET /api/v1/strategy-runs/{run_id}`：查询统一运行状态。
+- `GET /api/v1/strategy-runs/{run_id}/events`：查询结构化事件。
+- `POST /api/v1/strategy-runs/{run_id}/start`：幂等启动或恢复人工审批运行。
+- `POST /api/v1/strategy-runs/{run_id}/cancel|retry`：协作式取消或关联重试。
+- `/api/v1/strategy-actions/{action_id}/*`：统一预览、审批、执行、心跳、恢复和回滚门禁。
+- `/api/v1/businesses/{business_id}/sites/capabilities`：读取业务全站能力。
+- `/api/v1/sites/{site_id}/capabilities`：读取单站能力。
+
+以上 Run、Action 和 Capabilities 接口统一返回
+`{ok, request_id, data, error}`；所有写接口要求幂等键。生产真实写 adapter
+在全局身份认证与 business scope 授权完成前保持禁用。

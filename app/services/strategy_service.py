@@ -34,10 +34,10 @@ from app.services.strategy_decision_service import (
 from app.services.strategy_hold_service import (
     EXPANDED_EVIDENCE_SOURCES,
     EvidenceCollector,
-    claim_hold_evidence_refresh,
     complete_hold_evidence_refresh,
     evolve_hold_state,
-    finalize_hold_run,
+    reconcile_refreshed_hold_decision,
+    register_hold_decision_and_claim_refresh,
     refresh_hold_evidence,
     wait_for_hold_evidence_refresh,
 )
@@ -83,6 +83,8 @@ async def generate_strategies(
     site_quotas: dict[str, int] | None = None,
     min_impressions: int = 20,
     evidence_refreshers: dict[str, EvidenceCollector] | None = None,
+    _strategy_run_id: str | None = None,
+    _replanning_after_refresh: bool = False,
 ) -> dict[str, Any]:
     budget = max(0, min(action_budget if action_budget is not None else limit, 200))
     scope = await session.execute(
@@ -101,60 +103,13 @@ async def generate_strategies(
     source_audit = await _load_latest_source_audit(session, business_id=business_id)
     if not source_audit:
         raise ValueError("请先运行当前业务的全站内容扫描")
-    strategy_run_id = str(uuid4())
-    refresh_claim = await claim_hold_evidence_refresh(
-        session,
-        business_id=business_id,
-        run_id=strategy_run_id,
-    )
+    strategy_run_id = _strategy_run_id or str(uuid4())
+    refresh_claim: dict[str, Any] = {
+        "should_refresh": False,
+        "business_consecutive_hold_count": 0,
+        "site_consecutive_hold_counts": {},
+    }
     evidence_refreshes: list[dict[str, Any]] = []
-    if refresh_claim["should_refresh"]:
-        try:
-            if evidence_refreshers is None:
-                evidence_refreshes = await refresh_default_strategy_evidence(
-                    session,
-                    business_id=business_id,
-                    sites=site_scope,
-                )
-            else:
-                refresh_now = datetime.now(ZoneInfo("UTC"))
-                for scoped_site in site_scope:
-                    evidence_refreshes.append(
-                        await refresh_hold_evidence(
-                            site_id=str(scoped_site["id"]),
-                            collectors=evidence_refreshers,
-                            now=refresh_now,
-                        )
-                    )
-        except Exception as error:  # catastrophic collector/orchestrator failure
-            evidence_refreshes = _failed_hold_refresh_records(
-                site_scope,
-                error=error,
-                now=datetime.now(ZoneInfo("UTC")),
-            )
-        refresh_token = str(refresh_claim["refresh_token"])
-        completed = await complete_hold_evidence_refresh(
-            session,
-            business_id=business_id,
-            refresh_token=refresh_token,
-            refresh_results=evidence_refreshes,
-        )
-        if not completed:
-            raise RuntimeError("Hold evidence refresh token was already consumed or replaced.")
-    elif refresh_claim.get("wait_for_refresh"):
-        evidence_refreshes = await wait_for_hold_evidence_refresh(
-            session,
-            business_id=business_id,
-            refresh_token=str(refresh_claim["pending_refresh_token"]),
-        )
-    if evidence_refreshes:
-        source_audit = await _load_latest_source_audit_after_refresh(
-            session,
-            business_id=business_id,
-            evidence_refreshes=evidence_refreshes,
-        )
-        if not source_audit:
-            raise ValueError("Evidence refresh completed without a current content audit batch.")
     quarantined = await _quarantine_invalid_assignments(session, business_id)
 
     rows = await session.execute(
@@ -446,10 +401,145 @@ async def generate_strategies(
     coverage_matrix = _build_site_coverage(site_scope, candidates, selected)
     if not coverage_matrix["complete"]:
         raise RuntimeError("Strategy coverage is incomplete; every discovered active site must have one decision.")
+    site_hold_flags = {
+        str(decision.get("site_id") or ""): decision.get("action") == "hold"
+        for decision in coverage_matrix["decisions"]
+    }
+    all_hold = bool(site_hold_flags) and all(site_hold_flags.values())
+    if _replanning_after_refresh:
+        coordination = await reconcile_refreshed_hold_decision(
+            session,
+            business_id=business_id,
+            run_id=strategy_run_id,
+            all_hold=all_hold,
+            site_hold_flags=site_hold_flags,
+        )
+        coordination["emit_strategy_stagnation"] = False
+    else:
+        coordination = await register_hold_decision_and_claim_refresh(
+            session,
+            business_id=business_id,
+            run_id=strategy_run_id,
+            all_hold=all_hold,
+            site_hold_flags=site_hold_flags,
+        )
+        refresh_claim = coordination
+        if coordination.get("wait_for_refresh"):
+            evidence_refreshes = await wait_for_hold_evidence_refresh(
+                session,
+                business_id=business_id,
+                refresh_token=str(coordination["pending_refresh_token"]),
+            )
+            replanned = await generate_strategies(
+                session,
+                business_id=business_id,
+                site_id=site_id,
+                limit=limit,
+                action_budget=action_budget,
+                site_quotas=site_quotas,
+                min_impressions=min_impressions,
+                evidence_refreshers=evidence_refreshers,
+                _strategy_run_id=strategy_run_id,
+            )
+            replanned["evidence_refreshes"] = evidence_refreshes
+            replanned["replanned_after_waited_hold_refresh"] = True
+            return replanned
+        if coordination.get("should_refresh"):
+            try:
+                if evidence_refreshers is None:
+                    evidence_refreshes = await refresh_default_strategy_evidence(
+                        session,
+                        business_id=business_id,
+                        sites=site_scope,
+                    )
+                else:
+                    refresh_now = datetime.now(ZoneInfo("UTC"))
+                    for scoped_site in site_scope:
+                        evidence_refreshes.append(
+                            await refresh_hold_evidence(
+                                site_id=str(scoped_site["id"]),
+                                collectors=evidence_refreshers,
+                                now=refresh_now,
+                            )
+                        )
+            except Exception as error:
+                evidence_refreshes = _failed_hold_refresh_records(
+                    site_scope,
+                    error=error,
+                    now=datetime.now(ZoneInfo("UTC")),
+                )
+            refresh_token = str(coordination["refresh_token"])
+            if not await complete_hold_evidence_refresh(
+                session,
+                business_id=business_id,
+                refresh_token=refresh_token,
+                refresh_results=evidence_refreshes,
+            ):
+                raise RuntimeError(
+                    "Hold evidence refresh token was already consumed or replaced."
+                )
+            refreshed_audit = await _load_latest_source_audit_after_refresh(
+                session,
+                business_id=business_id,
+                evidence_refreshes=evidence_refreshes,
+            )
+            if not refreshed_audit:
+                raise ValueError(
+                    "Evidence refresh completed without a current content audit batch."
+                )
+            await session.execute(
+                text(
+                    """
+                    UPDATE seo_agent.tasks
+                       SET decision = decision || CAST(:marker AS jsonb),
+                           updated_at = now()
+                     WHERE id = CAST(:analysis_id AS uuid)
+                        OR payload->>'analysis_batch_id' = :analysis_id
+                    """
+                ),
+                {
+                    "analysis_id": analysis_batch_id,
+                    "marker": json.dumps(
+                        {
+                            "candidate_status": "superseded",
+                            "superseded_reason": "hold_evidence_refresh",
+                        }
+                    ),
+                },
+            )
+            await session.commit()
+            replanned = await generate_strategies(
+                session,
+                business_id=business_id,
+                site_id=site_id,
+                limit=limit,
+                action_budget=action_budget,
+                site_quotas=site_quotas,
+                min_impressions=min_impressions,
+                evidence_refreshers=evidence_refreshers,
+                _strategy_run_id=strategy_run_id,
+                _replanning_after_refresh=True,
+            )
+            replanned["evidence_refreshes"] = evidence_refreshes
+            replanned["replanned_after_hold_refresh"] = True
+            return replanned
     hold_state = evolve_hold_state(
         coverage_matrix["decisions"],
-        previous_site_counts=refresh_claim.get("site_consecutive_hold_counts") or {},
-        previous_business_count=int(refresh_claim.get("business_consecutive_hold_count") or 0),
+        previous_site_counts={
+            scoped_site: max(
+                0,
+                int(
+                    (coordination.get("site_consecutive_hold_counts") or {}).get(
+                        scoped_site, 0
+                    )
+                )
+                - (1 if site_hold_flags.get(scoped_site) else 0),
+            )
+            for scoped_site in site_hold_flags
+        },
+        previous_business_count=max(
+            0, int(coordination.get("business_consecutive_hold_count") or 0) - (1 if all_hold else 0)
+        ),
         now=datetime.now(ZoneInfo("UTC")),
     )
     coverage_matrix["decisions"] = hold_state["decisions"]
@@ -462,18 +552,6 @@ async def generate_strategies(
         action_budget=budget,
         site_quotas=site_quotas or {},
         candidates=selected,
-    )
-    site_hold_flags = {
-        str(decision.get("site_id") or ""): decision.get("action") == "hold"
-        for decision in coverage_matrix["decisions"]
-    }
-    coordination = await finalize_hold_run(
-        session,
-        business_id=business_id,
-        run_id=strategy_run_id,
-        all_hold=bool(site_hold_flags) and all(site_hold_flags.values()),
-        site_hold_flags=site_hold_flags,
-        commit=False,
     )
     hold_state.update(
         {
