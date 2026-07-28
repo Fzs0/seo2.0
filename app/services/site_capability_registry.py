@@ -7,6 +7,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from app.core.article_urls import is_oemapps_site
+
 
 FORBIDDEN_ACTIONS = {
     "delete_content": "forbidden",
@@ -61,8 +63,6 @@ ARTICLE_CONTRACT: dict[str, Any] = {
             "body",
             "meta_title",
             "meta_description",
-            "images",
-            "image_alts",
         ]
     },
     "side_effects": {},
@@ -75,7 +75,7 @@ def contract_for_site(site: dict[str, Any], adapters: set[str]) -> dict[str, Any
     if "oemapps" in adapters:
         contracts.append(OEMAPPS_CONTRACT)
     connector_type = str((site.get("api_config") or {}).get("connector_type") or "").casefold()
-    if site.get("site_type") in {"wp", "blog", "shopify"} or connector_type in {
+    if is_oemapps_site(site) or site.get("site_type") in {"wp", "blog", "shopify"} or connector_type in {
         "wp",
         "wordpress",
         "shopify",
@@ -93,6 +93,12 @@ def contract_for_site(site: dict[str, Any], adapters: set[str]) -> dict[str, Any
     for contract in contracts:
         for key in merged:
             merged[key].update(contract.get(key) or {})
+    if merged["supported_fields"].get("articles") and is_oemapps_site(site):
+        merged["supported_fields"]["articles"] = [
+            *merged["supported_fields"]["articles"],
+            "images",
+            "image_alts",
+        ]
     return merged
 
 

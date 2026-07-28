@@ -5,6 +5,7 @@ from typing import Any
 from uuid import uuid4
 
 from fastapi import Request
+from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.routing import APIRoute
 from fastapi.responses import JSONResponse
@@ -21,12 +22,14 @@ def request_id_for(request: Request) -> str:
 def success(request: Request, data: Any, *, status_code: int = 200) -> JSONResponse:
     return JSONResponse(
         status_code=status_code,
-        content={
-            "ok": True,
-            "request_id": request_id_for(request),
-            "data": data,
-            "error": None,
-        },
+        content=jsonable_encoder(
+            {
+                "ok": True,
+                "request_id": request_id_for(request),
+                "data": data,
+                "error": None,
+            }
+        ),
     )
 
 
@@ -41,17 +44,19 @@ def failure(
 ) -> JSONResponse:
     return JSONResponse(
         status_code=status_code,
-        content={
-            "ok": False,
-            "request_id": request_id_for(request),
-            "data": None,
-            "error": {
-                "code": code,
-                "message": message,
-                "retryable": retryable,
-                "details": details or {},
-            },
-        },
+        content=jsonable_encoder(
+            {
+                "ok": False,
+                "request_id": request_id_for(request),
+                "data": None,
+                "error": {
+                    "code": code,
+                    "message": message,
+                    "retryable": retryable,
+                    "details": details or {},
+                },
+            }
+        ),
     )
 
 

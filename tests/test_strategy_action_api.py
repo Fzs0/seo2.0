@@ -2,7 +2,8 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from typing import get_type_hints
 
-from app.api.v1.strategy_actions import router
+from app.api.v1.strategy_actions import get_action_adapter, router
+from app.services.strategy_action_service import BlockedActionAdapter
 
 
 def test_strategy_action_routes_expose_complete_safe_contract() -> None:
@@ -12,6 +13,7 @@ def test_strategy_action_routes_expose_complete_safe_contract() -> None:
     base = "/api/v1/strategy-actions/{action_id}"
     assert {
         base,
+        f"{base}/generation-context",
         f"{base}/preview",
         f"{base}/approve",
         f"{base}/execute",
@@ -57,3 +59,9 @@ def test_write_validation_error_uses_stable_envelope() -> None:
     assert response.status_code == 422
     assert response.json()["ok"] is False
     assert response.json()["error"]["code"] == "REQUEST_VALIDATION_FAILED"
+
+
+def test_runtime_action_adapter_is_not_the_permanent_blocked_default() -> None:
+    adapter = get_action_adapter(session=object())
+
+    assert not isinstance(adapter, BlockedActionAdapter)

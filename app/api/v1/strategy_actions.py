@@ -10,7 +10,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.database import get_db
 from app.services.strategy_action_service import (
     ActionAdapter,
-    BlockedActionAdapter,
     SQLActionStore,
     approve_action,
     execute_action,
@@ -21,6 +20,10 @@ from app.services.strategy_action_service import (
     rollback_action,
     rollback_preview,
 )
+from app.services.strategy_article_action_adapter import (
+    StrategyArticleActionAdapter,
+    get_article_generation_context,
+)
 from app.api.v1.response_contract import ContractRoute, failure, success
 
 router = APIRouter(
@@ -30,9 +33,11 @@ router = APIRouter(
 )
 
 
-def get_action_adapter() -> ActionAdapter:
-    """Override at application composition time with a reviewed article/on-page adapter."""
-    return BlockedActionAdapter()
+def get_action_adapter(
+    session: AsyncSession = Depends(get_db),
+) -> ActionAdapter:
+    """Use the guarded article adapter; unsupported action types remain blocked."""
+    return StrategyArticleActionAdapter(session)
 
 
 class PreviewBody(BaseModel):
@@ -64,6 +69,27 @@ async def get_strategy_action(
     action_id: str, request: Request, session: AsyncSession = Depends(get_db)
 ) -> dict[str, Any]:
     return await _call(request, get_action, SQLActionStore(session), action_id=action_id)
+
+
+@router.get("/{action_id}/generation-context")
+async def get_strategy_action_generation_context(
+    action_id: str,
+    request: Request,
+    session: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    try:
+        return success(
+            request,
+            await get_article_generation_context(session, action_id=action_id),
+        )
+    except ValueError as error:
+        return failure(
+            request,
+            status_code=409,
+            code="STRATEGY_ACTION_CONTEXT_UNAVAILABLE",
+            message=str(error),
+            retryable=False,
+        )
 
 
 @router.post("/{action_id}/preview")

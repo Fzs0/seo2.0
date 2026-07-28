@@ -273,7 +273,13 @@ async def register_hold_decision_and_claim_refresh(
     state["registered_run_ids"] = [*registered, run_id][-100:]
     state["last_registered_at"] = transition_now.isoformat()
 
-    should_refresh = all_hold and previous_count == 1 and next_count == 2
+    # The normal escalation is the 1→2 Hold edge. A failed/expired refresh must
+    # also be claimable by the next confirmed Hold; otherwise the state machine
+    # permanently promises a retry that can never occur once the count is > 2.
+    should_refresh = all_hold and (
+        (previous_count == 1 and next_count == 2)
+        or refresh.get("status") == "failed"
+    )
     refresh_token: str | None = None
     if should_refresh:
         refresh_token = str(uuid4())

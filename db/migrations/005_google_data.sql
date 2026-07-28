@@ -8,7 +8,7 @@ CREATE TABLE IF NOT EXISTS seo_agent.google_sync_log (
   range_start     date        NOT NULL,
   range_end       date        NOT NULL,
   status          varchar(16) NOT NULL DEFAULT 'running',
-  trigger         varchar(16) NOT NULL DEFAULT 'manual',
+  trigger         text        NOT NULL DEFAULT 'manual',
   rows_fetched    integer     NOT NULL DEFAULT 0,
   rows_written    integer     NOT NULL DEFAULT 0,
   duration_ms     integer,
@@ -17,7 +17,8 @@ CREATE TABLE IF NOT EXISTS seo_agent.google_sync_log (
   finished_at     timestamptz,
   CONSTRAINT google_sync_log_type_chk CHECK (source_type IN ('gsc', 'ga4')),
   CONSTRAINT google_sync_log_status_chk CHECK (status IN ('running', 'done', 'failed', 'cancelled')),
-  CONSTRAINT google_sync_log_trigger_chk CHECK (trigger IN ('manual', 'scheduled', 'retry')),
+  CONSTRAINT google_sync_log_trigger_chk
+    CHECK (trigger IN ('manual', 'scheduled', 'retry', 'strategy_hold_refresh')),
   CONSTRAINT google_sync_log_id_positive_chk CHECK (id > 0)
 );
 

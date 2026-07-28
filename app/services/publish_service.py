@@ -12,6 +12,10 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.clients.publishers import PublishRequest, PublishResult
+from app.core.article_urls import resolve_article_public_url
+from app.core.remote_outcomes import policy_for_remote_outcome
+from app.services.article_url_reconciliation_service import reconcile_article_public_url
+from app.services.strategy_exception_service import record_exception
 from app.services.shopify_connection_service import publisher_for_site_runtime
 from app.services.article_qa import assess_article_qa
 
@@ -55,7 +59,7 @@ async def publish_article(
     s = (
         await session.execute(
             text(
-                "SELECT id, site_key, name, site_type, domain, base_url, api_base_url, status, api_config, "
+                "SELECT id, business_id, site_key, name, site_type, domain, base_url, api_base_url, status, api_config, "
                 "content_role, market, language_code FROM seo_agent.sites WHERE id = CAST(:id AS uuid)"
             ),
             {"id": target_site_id},
@@ -145,7 +149,13 @@ async def publish_article(
             )
             if verification["ok"]:
                 result.post_id = remote_id
-                result.url = verification["remote"]["url"] or result.url
+                result.url = resolve_article_public_url(
+                    dict(s),
+                    slug=req.slug,
+                    article_id=remote_id,
+                    remote_url=verification["remote"]["url"],
+                    canonical_url=result.url,
+                ) or result.url
             else:
                 result.ok = False
                 result.error = "remote verification failed: " + ", ".join(
@@ -156,7 +166,21 @@ async def publish_article(
             result.error = "remote publish did not return a post ID"
     except Exception as error:  # noqa: BLE001 - connector errors must become an auditable failed task
         verification["error"] = str(error)
-        result = PublishResult(ok=False, dry_run=False, error=str(error))
+        identity_conflict = "SHOPIFY_ARTICLE_IDENTITY_CONFLICT" in str(error)
+        result = PublishResult(
+            ok=False,
+            dry_run=False,
+            error=str(error),
+            remote_outcome="identity_conflict" if identity_conflict else None,
+            raw=(
+                {
+                    "error_code": "SHOPIFY_ARTICLE_IDENTITY_CONFLICT",
+                    "retry_policy": "manual_identity_resolution_required",
+                }
+                if identity_conflict
+                else {}
+            ),
+        )
 
     decision = {
         "adapter": publisher.__class__.__name__,
@@ -165,6 +189,7 @@ async def publish_article(
         "action": action,
         "idempotent": idempotent,
         "reused": reused,
+        "remote_outcome": result.remote_outcome,
         "remote_verification": verification,
     }
     task_id = await _save_publish_task(
@@ -178,6 +203,14 @@ async def publish_article(
         approval=approval,
         result=result,
         decision=decision,
+    )
+    exception_id = await _record_uncertain_publish_exception(
+        session,
+        result=result,
+        task_id=task_id,
+        approval=approval,
+        site=dict(s),
+        target_url=result.url or a["target_url"] or "",
     )
     if result.ok:
         await session.execute(
@@ -197,6 +230,11 @@ async def publish_article(
                 "id": article_id,
             },
         )
+        await reconcile_article_public_url(
+            session,
+            article_id=article_id,
+            remote_url=result.url,
+        )
     await session.commit()
     return _response(
         result,
@@ -207,6 +245,7 @@ async def publish_article(
         idempotent=idempotent,
         reused=reused,
         remote_verification=verification,
+        exception_id=exception_id,
     )
 
 
@@ -237,7 +276,7 @@ async def sync_article_seo_metadata(
     site = (
         await session.execute(
             text(
-                "SELECT id, site_key, name, site_type, domain, base_url, api_base_url, status, api_config, "
+                "SELECT id, business_id, site_key, name, site_type, domain, base_url, api_base_url, status, api_config, "
                 "content_role, market, language_code FROM seo_agent.sites WHERE id = CAST(:id AS uuid)"
             ),
             {"id": article["site_id"]},
@@ -291,6 +330,144 @@ async def sync_article_seo_metadata(
     )
 
 
+async def _record_uncertain_publish_exception(
+    session: AsyncSession,
+    *,
+    result: PublishResult,
+    task_id: Any,
+    approval: dict[str, Any],
+    site: dict[str, Any],
+    target_url: str,
+) -> str | None:
+    policy = policy_for_remote_outcome(result.remote_outcome)
+    if not policy or policy.task_status != "blocked":
+        return None
+    exception = await record_exception(
+        session,
+        {
+            "run_id": approval.get("strategy_run_id"),
+            "action_id": approval.get("strategy_action_id"),
+            "business_id": site.get("business_id"),
+            "site_id": str(site["id"]),
+            "publish_task_id": str(task_id),
+            "execution_task_id": approval.get("execution_task_id"),
+            "target_url": target_url,
+            "type": "remote_write_uncertain",
+            "error_code": policy.error_code,
+            "stage": "publishing",
+            "severity": policy.severity,
+            "summary": "Remote publish outcome requires manual readback before retry.",
+            "remote_write_occurred": policy.remote_write_occurred,
+            "retryable": policy.auto_retry_allowed,
+            "responsibility_type": "human_operator",
+            "unlock_condition": "Complete a fresh remote readback and resolve the exception.",
+        },
+    )
+    await session.execute(
+        text(
+            "UPDATE seo_agent.tasks SET payload = payload || "
+            "jsonb_build_object('exception_id', CAST(:exception_id AS text)), updated_at=now() "
+            "WHERE id=CAST(:task_id AS uuid)"
+        ),
+        {"task_id": task_id, "exception_id": exception["exception_id"]},
+    )
+    await session.execute(
+        text(
+            """
+            UPDATE seo_agent.tasks
+               SET status='blocked',
+                   payload=payload || jsonb_build_object(
+                     'remote_outcome', CAST(:remote_outcome AS text),
+                     'publish_task_id', CAST(:publish_task_id AS text),
+                     'exception_id', CAST(:exception_id AS text)
+                   ),
+                   error_message=COALESCE(error_message, :error_message),
+                   finished_at=COALESCE(finished_at, now()),
+                   updated_at=now()
+             WHERE id=CAST(:execution_task_id AS uuid)
+            """
+        ),
+        {
+            "execution_task_id": approval.get("execution_task_id"),
+            "remote_outcome": result.remote_outcome,
+            "publish_task_id": str(task_id),
+            "exception_id": exception["exception_id"],
+            "error_message": result.error,
+        },
+    )
+    if approval.get("strategy_action_id"):
+        await session.execute(
+            text(
+                """
+                UPDATE seo_agent.tasks
+                   SET status='blocked',
+                       payload=payload || jsonb_build_object(
+                         'status', 'blocked',
+                         'result', 'blocked',
+                         'recovery_status', CAST(:remote_outcome AS text),
+                         'publish_task_id', CAST(:publish_task_id AS text),
+                         'execution_task_id', CAST(:execution_task_id AS text),
+                         'exception_id', CAST(:exception_id AS text)
+                       ),
+                       decision=decision || jsonb_build_object(
+                         'status', 'blocked',
+                         'result', 'blocked',
+                         'remote_outcome', CAST(:remote_outcome AS text)
+                       ),
+                       finished_at=COALESCE(finished_at, now()),
+                       updated_at=now()
+                 WHERE id=CAST(:action_id AS uuid)
+                   AND payload->>'kind'='strategy_action'
+                """
+            ),
+            {
+                "action_id": approval["strategy_action_id"],
+                "remote_outcome": result.remote_outcome,
+                "publish_task_id": str(task_id),
+                "execution_task_id": approval.get("execution_task_id"),
+                "exception_id": exception["exception_id"],
+            },
+        )
+    if approval.get("strategy_run_id"):
+        await session.execute(
+            text(
+                """
+                UPDATE seo_agent.tasks
+                   SET status=CASE
+                         WHEN decision->>'status'='awaiting_approval' THEN 'blocked'
+                         ELSE 'done'
+                       END,
+                       decision=decision || jsonb_build_object(
+                         'status', CASE
+                           WHEN decision->>'status'='awaiting_approval' THEN 'blocked'
+                           ELSE 'partial'
+                         END,
+                         'current_stage', CASE
+                           WHEN decision->>'status'='awaiting_approval' THEN 'blocked'
+                           ELSE 'partial'
+                         END,
+                         'remote_outcome', CAST(:remote_outcome AS text),
+                         'exception_id', CAST(:exception_id AS text),
+                         'next_action', 'resolve_remote_state'
+                       ),
+                       finished_at=COALESCE(finished_at, now()),
+                       updated_at=now()
+                 WHERE id=CAST(:run_id AS uuid)
+                   AND payload->>'kind'='strategy_run'
+                   AND decision->>'status' IN (
+                     'awaiting_approval', 'executing', 'verifying', 'observing'
+                   )
+                """
+            ),
+            {
+                "run_id": approval["strategy_run_id"],
+                "remote_outcome": result.remote_outcome,
+                "exception_id": exception["exception_id"],
+            },
+        )
+    return str(exception["exception_id"])
+
+
 async def _approved_execution(session: AsyncSession, task_id: Any, site_id: Any) -> dict[str, Any] | None:
     if not task_id:
         return None
@@ -299,7 +476,10 @@ async def _approved_execution(session: AsyncSession, task_id: Any, site_id: Any)
             text(
                 """
                 SELECT strategy.id::text AS strategy_task_id, execution.id::text AS execution_task_id,
-                       execution.task_type AS execution_type, post.external_id AS approved_remote_id
+                       execution.task_type AS execution_type, post.external_id AS approved_remote_id,
+                       COALESCE(execution.payload->>'strategy_run_id', strategy.payload->>'strategy_run_id')
+                         AS strategy_run_id,
+                       execution.payload->>'strategy_action_id' AS strategy_action_id
                   FROM seo_agent.tasks execution
                   JOIN seo_agent.tasks strategy
                     ON strategy.id::text = execution.payload->>'strategy_task_id'
@@ -350,7 +530,7 @@ async def _save_publish_task(
                 """
             ),
             {
-                "status": "done" if result.ok else "failed",
+                "status": _publish_task_status(result),
                 "site_id": site_id,
                 "article_id": article_id,
                 "target_url": target_url,
@@ -362,6 +542,9 @@ async def _save_publish_task(
                         "update_post_id": update_post_id,
                         "strategy_task_id": approval["strategy_task_id"],
                         "execution_task_id": approval["execution_task_id"],
+                        "strategy_run_id": approval.get("strategy_run_id"),
+                        "remote_outcome": result.remote_outcome,
+                        "remote_evidence": result.raw,
                     },
                     ensure_ascii=False,
                 ),
@@ -400,7 +583,7 @@ async def _save_seo_metadata_sync_task(
                 """
             ),
             {
-                "status": "done" if result.ok else "failed",
+                "status": _publish_task_status(result),
                 "site_id": site_id,
                 "article_id": article_id,
                 "target_url": target_url,
@@ -436,7 +619,14 @@ def _verify_remote(
     return {
         "ok": all(checks.values()),
         "checks": checks,
-        "remote": {"id": remote_id, "title": title, "slug": slug, "url": url, "status": status},
+        "remote": {
+            "id": remote_id,
+            "title": title,
+            "slug": slug,
+            "url": url,
+            "status": status,
+            "raw_status": remote.get("raw_status", remote.get("status")),
+        },
     }
 
 
@@ -465,6 +655,13 @@ def _normal_text(value: str) -> str:
     return " ".join(value.split()).casefold()
 
 
+def _publish_task_status(result: PublishResult) -> str:
+    if result.ok:
+        return "done"
+    policy = policy_for_remote_outcome(result.remote_outcome)
+    return policy.task_status if policy else "failed"
+
+
 def _response(
     result: PublishResult,
     article_id: str,
@@ -475,6 +672,7 @@ def _response(
     idempotent: bool = False,
     reused: bool = False,
     remote_verification: dict[str, Any] | None = None,
+    exception_id: str | None = None,
 ) -> dict[str, Any]:
     return {
         "ok": result.ok,
@@ -482,6 +680,7 @@ def _response(
         "post_id": result.post_id,
         "url": result.url,
         "error": result.error,
+        "remote_outcome": result.remote_outcome,
         "raw": result.raw,
         "task_id": task_id,
         "article_id": article_id,
@@ -490,6 +689,7 @@ def _response(
         "idempotent": idempotent,
         "reused": reused,
         "remote_verification": remote_verification,
+        "exception_id": exception_id,
     }
 
 

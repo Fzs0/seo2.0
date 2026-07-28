@@ -55,6 +55,7 @@ class PublishResult:
     post_id: str | None = None
     url: str | None = None
     error: str | None = None
+    remote_outcome: str | None = None
     raw: dict[str, Any] = field(default_factory=dict)
 
 
@@ -320,7 +321,18 @@ class OpenAPIPublisher(PublisherBase):
     """
 
     connector_type = "custom_openapi"
-    capabilities = ("read_articles", "get_article", "find_article_by_slug", "publish_article", "update_article", "upload_image")
+    capabilities = (
+        "read_articles",
+        "get_article",
+        "find_article_by_slug",
+        "publish_article",
+        "update_article",
+    )
+
+    def __init__(self, site: dict[str, Any], dry_run: bool = True) -> None:
+        super().__init__(site, dry_run=dry_run)
+        if self._is_oemapps():
+            self.capabilities = (*self.capabilities, "upload_image")
 
     def _is_oemapps(self) -> bool:
         return is_oemapps_site(self.site)
@@ -405,7 +417,11 @@ class OpenAPIPublisher(PublisherBase):
                 timeout=60,
             )
             items, pagination = _openapi_page(data)
-            collected.extend(item for item in items if isinstance(item, dict))
+            collected.extend(
+                self._normalize_article_item(item)
+                for item in items
+                if isinstance(item, dict)
+            )
             total_pages = int(pagination.get("pageTotal") or pagination.get("totalPages") or 0) if pagination else 0
             next_page = int(pagination.get("next") or 0) if pagination else 0
             if not items or (total_pages and page >= total_pages) or (not total_pages and not next_page):
@@ -429,7 +445,7 @@ class OpenAPIPublisher(PublisherBase):
             )
             item = _openapi_item(data)
             if item:
-                return item
+                return self._normalize_article_item(item)
         except ExternalCallError:
             pass
         wanted = str(post_id)
@@ -441,6 +457,19 @@ class OpenAPIPublisher(PublisherBase):
             ),
             None,
         )
+
+    def _normalize_article_item(self, item: dict[str, Any]) -> dict[str, Any]:
+        if not self._is_oemapps() or "status" not in item:
+            return item
+        raw_status = item.get("status")
+        token = str(raw_status).strip().casefold()
+        if token in {"1", "publish", "published", "public"}:
+            status = "published"
+        elif token in {"0", "draft", "unpublished", "private"}:
+            status = "draft"
+        else:
+            status = token
+        return {**item, "status": status, "raw_status": raw_status}
 
     async def find_article_by_slug(self, slug: str) -> dict[str, Any] | None:
         wanted = str(slug).strip().strip("/").casefold()
@@ -515,10 +544,40 @@ class OpenAPIPublisher(PublisherBase):
             )
         except ExternalCallError as error:
             return PublishResult(ok=False, dry_run=False, error=str(error), raw={"body_sent": body})
-        item = _openapi_item(data) or data
-        remote_id = str(item.get("id") or data.get("data") or post_id)
+        item = _openapi_item(data)
+        remote_outcome = None
+        if self._is_oemapps():
+            acknowledged = data.get("data")
+            if data.get("code") not in (0, "0") or acknowledged in (None, False):
+                return PublishResult(
+                    ok=False,
+                    dry_run=False,
+                    error=str(data.get("msg") or "OEMApps did not acknowledge the article update"),
+                    raw=data,
+                )
+            if acknowledged is True:
+                remote_id = str(post_id)
+                remote_outcome = "acknowledged"
+            else:
+                remote_id = str(
+                    (item or {}).get("id")
+                    or (item or {}).get("post_id")
+                    or (item or {}).get("articleId")
+                    or post_id
+                )
+        else:
+            item = item or data
+            remote_id = str(item.get("id") or data.get("data") or post_id)
+        item = item or {}
         slug = str(item.get("handle") or item.get("slug") or req.slug)
-        return PublishResult(ok=True, dry_run=False, post_id=remote_id, url=self._public_article_url(slug, remote_id), raw=data)
+        return PublishResult(
+            ok=True,
+            dry_run=False,
+            post_id=remote_id,
+            url=self._public_article_url(slug, remote_id),
+            remote_outcome=remote_outcome,
+            raw=data,
+        )
 
     def _public_article_url(self, slug: str, post_id: str) -> str | None:
         return resolve_article_public_url(
@@ -777,6 +836,7 @@ class WordPressPublisher(PublisherBase):
 
 
 _SHOPIFY_TOKEN_CACHE: dict[str, tuple[float, str, str]] = {}
+_SHOPIFY_ARTICLE_IDENTITY_CONFLICT = "SHOPIFY_ARTICLE_IDENTITY_CONFLICT"
 
 
 def evict_shopify_token_cache(site_id: str) -> None:
@@ -792,6 +852,7 @@ class ShopifyPublisher(PublisherBase):
     capabilities = (
         "read_articles",
         "get_article",
+        "find_article_by_slug",
         "publish_article",
         "update_article",
         "sync_seo_metadata",
@@ -967,7 +1028,22 @@ class ShopifyPublisher(PublisherBase):
         data = await self._graphql(
             """
             query Article($id: ID!) {
-              article(id: $id) { id title handle body summary isPublished }
+              article(id: $id) {
+                id
+                title
+                handle
+                body
+                summary
+                isPublished
+                titleTag: metafield(namespace: "global", key: "title_tag") {
+                  key
+                  value
+                }
+                descriptionTag: metafield(namespace: "global", key: "description_tag") {
+                  key
+                  value
+                }
+              }
             }
             """,
             {"id": post_id},
@@ -976,6 +1052,115 @@ class ShopifyPublisher(PublisherBase):
         if not isinstance(article, dict) or not article.get("id"):
             return None
         return {**article, "url": self._article_url(str(article.get("handle") or ""))}
+
+    async def find_article_by_slug(self, slug: str) -> dict[str, Any] | None:
+        outcome, article, evidence = await self._inspect_article_by_slug(slug)
+        if outcome == "identity_conflict":
+            raise ExternalCallError(
+                f"{_SHOPIFY_ARTICLE_IDENTITY_CONFLICT}: "
+                f"{evidence.get('mismatch') or 'article identity is ambiguous'}"
+            )
+        return article if outcome == "confirmed_applied" else None
+
+    async def _inspect_article_by_slug(
+        self,
+        slug: str,
+        *,
+        expected_title: str | None = None,
+    ) -> tuple[str, dict[str, Any] | None, dict[str, Any]]:
+        wanted = str(slug).strip().strip("/").casefold()
+        if not wanted:
+            return "confirmed_absent", None, {"search_exhausted": True, "pages": 0}
+        wanted_blog = str(self._config("blogHandle", "blog_handle") or "news").strip().casefold()
+        configured_blog_id = str(self._config("blogId", "blog_id") or "").strip()
+        blog_numeric_id = configured_blog_id.rsplit("/", 1)[-1] if configured_blog_id else ""
+        search_query = f"handle:{wanted}"
+        if blog_numeric_id:
+            search_query += f" AND blog_id:{blog_numeric_id}"
+        after: str | None = None
+        pages = 0
+        same_handle_elsewhere: list[dict[str, Any]] = []
+        matching_articles: list[dict[str, Any]] = []
+        identity_conflicts: list[dict[str, Any]] = []
+        while True:
+            data = await self._graphql(
+                """
+                query ArticleByHandle($first: Int!, $after: String, $query: String!) {
+                  articles(first: $first, after: $after, query: $query) {
+                    nodes {
+                      id
+                      title
+                      handle
+                      body
+                      summary
+                      isPublished
+                      blog { id handle }
+                    }
+                    pageInfo { hasNextPage endCursor }
+                  }
+                }
+                """,
+                {"first": 50, "after": after, "query": search_query},
+            )
+            pages += 1
+            connection = data.get("articles") or {}
+            for item in connection.get("nodes") or []:
+                if not isinstance(item, dict):
+                    continue
+                item_blog_data = item.get("blog") or {}
+                item_blog = str(item_blog_data.get("handle") or "").strip().casefold()
+                item_blog_id = str(item_blog_data.get("id") or "").strip()
+                item_handle = str(item.get("handle") or "").strip().casefold()
+                if item_handle != wanted:
+                    if (
+                        (configured_blog_id and item_blog_id == configured_blog_id)
+                        or (not configured_blog_id and item_blog == wanted_blog)
+                    ):
+                        identity_conflicts.append(item)
+                    continue
+                if configured_blog_id and (
+                    item_blog_id != configured_blog_id or item_blog != wanted_blog
+                ):
+                    identity_conflicts.append(item)
+                    continue
+                if item_blog != wanted_blog:
+                    same_handle_elsewhere.append(item)
+                    continue
+                matching_articles.append(item)
+            page_info = connection.get("pageInfo") or {}
+            if not page_info.get("hasNextPage"):
+                break
+            next_cursor = page_info.get("endCursor")
+            if not next_cursor or next_cursor == after:
+                raise ExternalCallError("Shopify article lookup returned an invalid pagination cursor")
+            after = str(next_cursor)
+        evidence = {"search_exhausted": True, "pages": pages}
+        if identity_conflicts:
+            return "identity_conflict", None, {
+                **evidence,
+                "error_code": _SHOPIFY_ARTICLE_IDENTITY_CONFLICT,
+                "mismatch": "blog_gid_or_handle",
+                "candidates": identity_conflicts,
+            }
+        if len(matching_articles) > 1:
+            return "identity_conflict", None, {
+                **evidence,
+                "error_code": _SHOPIFY_ARTICLE_IDENTITY_CONFLICT,
+                "mismatch": "duplicate_article_handle",
+                "candidates": matching_articles,
+            }
+        if matching_articles:
+            article = {**matching_articles[0], "url": self._article_url(wanted)}
+            matched = {**evidence, "article": article}
+            if (
+                expected_title is not None
+                and str(article.get("title") or "").strip() != expected_title.strip()
+            ):
+                return "partially_applied", article, {**matched, "mismatch": "title"}
+            return "confirmed_applied", article, matched
+        if same_handle_elsewhere:
+            return "partially_applied", None, {**evidence, "mismatch": "blog", "candidates": same_handle_elsewhere}
+        return "confirmed_absent", None, evidence
 
     async def publish(self, req: PublishRequest) -> PublishResult:
         if self.dry_run:
@@ -1006,9 +1191,74 @@ class ShopifyPublisher(PublisherBase):
                 }
                 """,
                 {"article": article},
+                max_attempts=1,
             )
         except ExternalCallError as e:
-            return PublishResult(ok=False, dry_run=False, error=str(e), raw={"article": article})
+            try:
+                outcome, recovered, evidence = await self._inspect_article_by_slug(
+                    req.slug,
+                    expected_title=req.title,
+                )
+            except ExternalCallError as readback_error:
+                return PublishResult(
+                    ok=False,
+                    dry_run=False,
+                    error=str(e),
+                    remote_outcome="unknown_remote_state",
+                    raw={
+                        "create_error": str(e),
+                        "readback_error": str(readback_error),
+                        "retry_policy": "manual_readback_required",
+                        "article": article,
+                    },
+                )
+            if outcome == "confirmed_applied" and recovered:
+                return PublishResult(
+                    ok=True,
+                    dry_run=False,
+                    post_id=str(recovered["id"]),
+                    url=str(recovered.get("url") or self._article_url(req.slug)),
+                    remote_outcome=outcome,
+                    raw={
+                        "recovered_after_error": True,
+                        "create_error": str(e),
+                        "article": article,
+                        "readback": recovered,
+                        "readback_evidence": evidence,
+                    },
+                )
+            if outcome == "identity_conflict":
+                return PublishResult(
+                    ok=False,
+                    dry_run=False,
+                    error=_SHOPIFY_ARTICLE_IDENTITY_CONFLICT,
+                    remote_outcome=outcome,
+                    raw={
+                        "recovered_after_error": False,
+                        "create_error": str(e),
+                        "article": article,
+                        "readback_evidence": evidence,
+                        "error_code": _SHOPIFY_ARTICLE_IDENTITY_CONFLICT,
+                        "retry_policy": "manual_identity_resolution_required",
+                    },
+                )
+            return PublishResult(
+                ok=False,
+                dry_run=False,
+                error=str(e),
+                remote_outcome=outcome,
+                raw={
+                    "recovered_after_error": False,
+                    "create_error": str(e),
+                    "article": article,
+                    "readback_evidence": evidence,
+                    "retry_policy": (
+                        "fresh_execution_token"
+                        if outcome == "confirmed_absent"
+                        else "manual_readback_required"
+                    ),
+                },
+            )
 
         result = data.get("articleCreate", {})
         errors = result.get("userErrors") or []
@@ -1228,7 +1478,12 @@ class ShopifyPublisher(PublisherBase):
 
     def _article_url(self, handle: str) -> str:
         blog_handle = self._config("blogHandle", "blog_handle") or "news"
-        return f"https://{self._shop_domain()}/blogs/{blog_handle}/{handle}"
+        remote_url = f"https://{self._shop_domain()}/blogs/{blog_handle}/{handle}"
+        return resolve_article_public_url(
+            self.site,
+            slug=handle,
+            remote_url=remote_url,
+        ) or remote_url
 
 
 def _canonical_shopify_timestamp(value: Any) -> str:

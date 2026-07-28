@@ -290,7 +290,7 @@ async def test_keywordless_update_can_be_reviewed_and_executed(monkeypatch: pyte
 
     async def publish(*args, **kwargs):
         events.append("publish")
-        return {"ok": True}
+        return {"ok": True, "url": "https://example.com/blogs/guide"}
 
     effect_call: dict = {}
 
@@ -327,6 +327,101 @@ async def test_keywordless_update_can_be_reviewed_and_executed(monkeypatch: pyte
         "language_code": "en",
     }
     assert effect_call["strategy"]["target_url"] == "https://example.com/blogs/guide"
+    completed_execution = next(
+        params
+        for sql, params in execute_session.calls
+        if "SET status = 'done', article_id" in sql
+    )
+    assert completed_execution["target_url"] == "https://example.com/blogs/guide"
+
+
+@pytest.mark.asyncio
+async def test_execution_reuses_publish_exception_for_unknown_remote_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    decision = {
+        "business_id": "business-a",
+        "strategy_type": "update_article",
+        "query": "existing topic",
+        "target_url": "https://example.com/blogs/guide",
+        "strategy_run_id": "run-id",
+    }
+
+    class Session(_Session):
+        async def execute(self, statement, params=None):
+            sql = str(statement)
+            self.calls.append((sql, params or {}))
+            if "SELECT t.decision, t.site_id" in sql:
+                return _Rows([{
+                    "decision": {**decision, "execution_task_id": "execution-id"},
+                    "site_id": "site-id", "keyword_id": None, "post_id": "post-id",
+                    "site_status": "active", "business_id": "business-a", "strategy_enabled": True,
+                    "task_business_id": "business-a", "candidate_id": "candidate-id",
+                    "plan_id": "plan-id", "analysis_batch_id": "batch-id",
+                }])
+            if "SELECT id, task_type, status, site_id, keyword_id" in sql:
+                return _Rows([{
+                    "id": "execution-id", "task_type": "update_article", "status": "running",
+                    "site_id": "site-id", "keyword_id": None, "post_id": "post-id",
+                    "payload": {"strategy": decision, "auto_publish": True},
+                }])
+            if "SELECT name, status, business_id" in sql:
+                return _Rows([{
+                    "name": "Site", "status": "active", "business_id": "business-a",
+                    "strategy_enabled": True, "market": "US", "language_code": "en",
+                }])
+            if "SELECT external_id, url, slug FROM seo_agent.posts" in sql:
+                return _Rows([{
+                    "external_id": "remote-id",
+                    "url": "https://example.com/blogs/guide",
+                    "slug": "guide",
+                }])
+            if "AS candidate_ok" in sql:
+                return _Rows([{
+                    "candidate_ok": True, "plan_ok": True, "analysis_ok": True,
+                    "keyword_ok": True, "target_ok": True, "conflict_ok": True,
+                    "effect_ok": True,
+                }])
+            return _Rows([])
+
+    async def pipeline(*_args, **_kwargs):
+        return {"status": "done", "article": {"id": "article-id"}}
+
+    async def baseline(*_args, **_kwargs):
+        return {"id": "effect-id"}
+
+    async def publish(*_args, **_kwargs):
+        return {
+            "ok": False,
+            "task_id": "publish-id",
+            "exception_id": "shared-exception-id",
+            "remote_outcome": "unknown_remote_state",
+            "error": "create timeout; readback timeout",
+        }
+
+    async def unexpected_exception(*_args, **_kwargs):
+        raise AssertionError("execution must reuse the exception created by publish")
+
+    monkeypatch.setattr(article_generation_service, "generate_article_pipeline", pipeline)
+    monkeypatch.setattr(strategy_execution, "ensure_effect", baseline)
+    monkeypatch.setattr(strategy_execution, "cancel_unpublished_effect", baseline)
+    monkeypatch.setattr("app.services.publish_service.publish_article", publish)
+    monkeypatch.setattr(strategy_execution, "record_exception", unexpected_exception)
+
+    session = Session()
+    result = await strategy_execution.execute_strategy(
+        session,  # type: ignore[arg-type]
+        task_id="review-id",
+        execution_task_id="execution-id",
+        allow_running=True,
+    )
+
+    assert result["status"] == "blocked"
+    exception_updates = [
+        params for sql, params in session.calls
+        if "'exception_id', CAST(:exception_id AS text)" in sql
+    ]
+    assert exception_updates[-1]["exception_id"] == "shared-exception-id"
 
 
 @pytest.mark.asyncio

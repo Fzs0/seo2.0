@@ -11,6 +11,7 @@ from urllib.parse import urlsplit
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.content_signals import has_faq_signal
 from app.services.serp_competitor_service import parse_content_html
 
 
@@ -107,7 +108,7 @@ def _analyze_markdown(source: str, url: str) -> dict[str, Any]:
         "char_count": len(plain),
         "headings": headings[:40],
         "heading_counts": {f"h{level}": sum(item["level"] == level for item in headings) for level in range(1, 7)},
-        "faq_signal": bool(re.search(r"\bfaq\b|frequently asked|common questions|常见问题", plain, re.I)),
+        "faq_signal": has_faq_signal(plain),
         "paragraph_count": len([
             block for block in re.split(r"\n\s*\n", source)
             if block.strip() and not block.lstrip().startswith(("#", "-", "*", ">"))

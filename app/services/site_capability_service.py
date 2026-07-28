@@ -11,6 +11,7 @@ from urllib.parse import urlsplit
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.article_urls import is_oemapps_site
 from app.services.site_capability_registry import contract_for_site
 
 HEALTH_STATES = {"available", "degraded", "unavailable", "misconfigured", "forbidden"}
@@ -70,7 +71,6 @@ def build_site_capability(
 ) -> dict[str, Any]:
     safe_site = dict(site)
     api_config = _mapping(safe_site.get("api_config"))
-    raw = _mapping(safe_site.get("raw"))
     safe_site["api_config"] = api_config
     adapters = {str(item.get("adapter") or "").casefold() for item in connectors}
     contract = contract_for_site(safe_site, adapters)
@@ -94,7 +94,7 @@ def build_site_capability(
             checked_at=generated_at,
             missing_code="article_connector_configuration_missing",
         )
-    if api_config.get("imageUploadPath") or raw.get("imageUploadPath"):
+    if is_oemapps_site(safe_site):
         capability_health["images"] = _local_health(
             available=True, checked_at=generated_at, upload=True
         )

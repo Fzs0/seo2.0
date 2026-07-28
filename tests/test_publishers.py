@@ -300,6 +300,47 @@ async def test_oemapps_article_update_uses_site_token(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_oemapps_article_update_boolean_ack_preserves_approved_remote_id(monkeypatch):
+    calls: list[dict[str, object]] = []
+
+    async def fake_request_json(method: str, url: str, **kwargs):
+        calls.append({'method': method, 'url': url, **kwargs})
+        return {
+            'code': 0,
+            'msg': 'success',
+            'data': True,
+            'trace_id': 'trace-ack-only',
+        }
+
+    monkeypatch.setattr('app.clients.publishers.request_json', fake_request_json)
+    publisher = OpenAPIPublisher(
+        {
+            'site_type': 'main',
+            'base_url': 'https://avinoti.shop',
+            'api_base_url': 'https://openapi.oemapps.com',
+            'api_config': {'tokenB': 'site-token'},
+        },
+        dry_run=False,
+    )
+
+    result = await publisher.update(
+        '2588676',
+        PublishRequest(
+            title='Updated',
+            slug='updated',
+            content_md='# Updated',
+            status='publish',
+        ),
+    )
+
+    assert result.ok is True
+    assert result.post_id == '2588676'
+    assert result.remote_outcome == 'acknowledged'
+    assert result.raw['data'] is True
+    assert [call['method'] for call in calls] == ['PUT']
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(('token_key', 'token_value'), [('tokenA', 'exdivo-token'), ('tokenB', 'avinoti-token')])
 async def test_oemapps_sites_share_image_upload_adapter(monkeypatch, token_key, token_value):
     called: dict[str, object] = {}
@@ -313,6 +354,7 @@ async def test_oemapps_sites_share_image_upload_adapter(monkeypatch, token_key, 
         {'site_type': 'main', 'api_base_url': 'https://openapi.oemapps.com', 'api_config': {token_key: token_value}},
         dry_run=False,
     )
+    assert 'upload_image' in publisher.capabilities
 
     result = await publisher.upload_image(ImageUploadRequest(type='url', url='https://source.example.com/image.png'))
 
@@ -325,6 +367,28 @@ async def test_oemapps_sites_share_image_upload_adapter(monkeypatch, token_key, 
         'headers': {'token': token_value},
         'json': {'type': 'url', 'url': 'https://source.example.com/image.png'},
     }
+
+
+@pytest.mark.asyncio
+async def test_custom_openapi_does_not_declare_oemapps_image_upload():
+    publisher = OpenAPIPublisher(
+        {
+            'site_type': 'blog',
+            'api_base_url': 'https://api.example.com/api/open/v1',
+            'api_config': {
+                'openApiKey': 'key-1',
+                'imageUploadPath': '/media/upload',
+            },
+        },
+        dry_run=True,
+    )
+
+    assert 'upload_image' not in publisher.capabilities
+    result = await publisher.upload_image(
+        ImageUploadRequest(type='url', url='https://source.example.com/image.png')
+    )
+    assert result.ok is False
+    assert result.error == 'image upload is only configured for OEMApps sites'
 
 
 @pytest.mark.asyncio
@@ -389,6 +453,41 @@ async def test_openapi_publisher_gets_one_post_and_finds_slug(monkeypatch):
     assert item and item['id'] == 42
     assert found and found['id'] == 42
     assert calls[0][1] == 'https://api.example.com/api/open/v1/posts/42'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('remote_status', [1, '1', 'publish', 'published'])
+async def test_oemapps_article_status_is_normalized_at_the_connector_boundary(
+    monkeypatch,
+    remote_status,
+):
+    async def fake_request_json(method: str, url: str, **kwargs):
+        return {
+            'code': 0,
+            'data': {
+                'id': 42,
+                'title': 'Hello',
+                'handle': 'hello',
+                'status': remote_status,
+            },
+        }
+
+    monkeypatch.setattr('app.clients.publishers.request_json', fake_request_json)
+    publisher = OpenAPIPublisher(
+        {
+            'site_type': 'main',
+            'domain': 'https://exdivo.com',
+            'api_base_url': 'https://openapi.oemapps.com',
+            'api_config': {'tokenA': 'secret'},
+        },
+        dry_run=False,
+    )
+
+    item = await publisher.get_article('42')
+
+    assert item is not None
+    assert item['status'] == 'published'
+    assert item['raw_status'] == remote_status
 
 
 @pytest.mark.asyncio
@@ -598,6 +697,226 @@ async def test_shopify_publisher_updates_and_reads_an_existing_article(monkeypat
 
 
 @pytest.mark.asyncio
+async def test_shopify_publisher_finds_an_existing_article_by_handle(monkeypatch):
+    calls: list[dict] = []
+
+    async def fake_graphql(query: str, variables: dict | None = None, **kwargs):
+        calls.append({'query': query, 'variables': variables, **kwargs})
+        return {
+            'articles': {
+                'nodes': [
+                    {
+                        'id': 'gid://shopify/Article/16',
+                        'title': 'Hello elsewhere',
+                        'handle': 'hello',
+                        'blog': {'id': 'gid://shopify/Blog/8', 'handle': 'guides'},
+                        'isPublished': True,
+                    },
+                    {
+                        'id': 'gid://shopify/Article/17',
+                        'title': 'Hello',
+                        'handle': 'hello',
+                        'blog': {'id': 'gid://shopify/Blog/9', 'handle': 'news'},
+                        'isPublished': True,
+                    },
+                ],
+            },
+        }
+
+    publisher = ShopifyPublisher(
+        {
+            'id': 'site-1',
+            'domain': 'healthyoxy.com',
+            'api_config': {
+                'connector_type': 'shopify',
+                'shopDomain': 'healthyoxy.myshopify.com',
+                'blogHandle': 'news',
+            },
+        },
+        dry_run=False,
+        credentials={'client_id': 'client-id', 'client_secret': 'client-secret'},
+    )
+    monkeypatch.setattr(publisher, '_graphql', fake_graphql)
+
+    found = await publisher.find_article_by_slug('Hello')
+
+    assert found == {
+        'id': 'gid://shopify/Article/17',
+        'title': 'Hello',
+        'handle': 'hello',
+        'blog': {'id': 'gid://shopify/Blog/9', 'handle': 'news'},
+        'isPublished': True,
+        'url': 'https://healthyoxy.com/blogs/news/hello',
+    }
+    assert calls[0]['variables'] == {'first': 50, 'after': None, 'query': 'handle:hello'}
+
+
+@pytest.mark.asyncio
+async def test_shopify_lookup_pages_until_target_blog_and_uses_default_news(monkeypatch):
+    calls: list[dict] = []
+
+    async def fake_graphql(query: str, variables: dict | None = None, **kwargs):
+        calls.append(variables or {})
+        if variables and variables.get('after') is None:
+            return {
+                'articles': {
+                    'nodes': [
+                        {'id': 'gid://shopify/Article/1', 'handle': 'hello', 'blog': {'handle': 'guides'}},
+                        {'id': 'gid://shopify/Article/2', 'handle': 'hello', 'blog': {'handle': 'updates'}},
+                    ],
+                    'pageInfo': {'hasNextPage': True, 'endCursor': 'page-2'},
+                },
+            }
+        return {
+            'articles': {
+                'nodes': [{
+                    'id': 'gid://shopify/Article/3',
+                    'title': 'Hello',
+                    'handle': 'hello',
+                    'blog': {'id': 'gid://shopify/Blog/3', 'handle': 'news'},
+                    'isPublished': True,
+                }],
+                'pageInfo': {'hasNextPage': False, 'endCursor': None},
+            },
+        }
+
+    publisher = ShopifyPublisher(
+        {'id': 'site-1', 'domain': 'healthyoxy.com', 'api_config': {
+            'connector_type': 'shopify', 'shopDomain': 'healthyoxy.myshopify.com',
+        }},
+        dry_run=False,
+        credentials={'client_id': 'client-id', 'client_secret': 'client-secret'},
+    )
+    monkeypatch.setattr(publisher, '_graphql', fake_graphql)
+
+    found = await publisher.find_article_by_slug('hello')
+
+    assert found['id'] == 'gid://shopify/Article/3'
+    assert found['blog']['handle'] == 'news'
+    assert found['url'] == 'https://healthyoxy.com/blogs/news/hello'
+    assert [call['after'] for call in calls] == [None, 'page-2']
+
+
+@pytest.mark.asyncio
+async def test_shopify_lookup_rejects_configured_blog_gid_handle_conflict(monkeypatch):
+    async def fake_graphql(query: str, variables: dict | None = None, **kwargs):
+        return {
+            'articles': {
+                'nodes': [{
+                    'id': 'gid://shopify/Article/17',
+                    'title': 'Hello',
+                    'handle': 'hello',
+                    'blog': {'id': 'gid://shopify/Blog/2', 'handle': 'news'},
+                }],
+                'pageInfo': {'hasNextPage': False, 'endCursor': None},
+            },
+        }
+
+    publisher = ShopifyPublisher(
+        {
+            'id': 'site-1',
+            'domain': 'healthyoxy.com',
+            'api_config': {
+                'connector_type': 'shopify',
+                'shopDomain': 'healthyoxy.myshopify.com',
+                'blogId': 'gid://shopify/Blog/1',
+                'blogHandle': 'news',
+            },
+        },
+        dry_run=False,
+        credentials={'client_id': 'client-id', 'client_secret': 'client-secret'},
+    )
+    monkeypatch.setattr(publisher, '_graphql', fake_graphql)
+
+    with pytest.raises(
+        ExternalCallError,
+        match='SHOPIFY_ARTICLE_IDENTITY_CONFLICT',
+    ):
+        await publisher.find_article_by_slug('hello')
+
+
+@pytest.mark.asyncio
+async def test_shopify_lookup_rejects_duplicate_article_identity(monkeypatch):
+    async def fake_graphql(query: str, variables: dict | None = None, **kwargs):
+        return {
+            'articles': {
+                'nodes': [
+                    {
+                        'id': 'gid://shopify/Article/17',
+                        'handle': 'hello',
+                        'blog': {'id': 'gid://shopify/Blog/1', 'handle': 'news'},
+                    },
+                    {
+                        'id': 'gid://shopify/Article/18',
+                        'handle': 'hello',
+                        'blog': {'id': 'gid://shopify/Blog/1', 'handle': 'news'},
+                    },
+                ],
+                'pageInfo': {'hasNextPage': False, 'endCursor': None},
+            },
+        }
+
+    publisher = ShopifyPublisher(
+        {
+            'id': 'site-1',
+            'domain': 'healthyoxy.com',
+            'api_config': {
+                'connector_type': 'shopify',
+                'shopDomain': 'healthyoxy.myshopify.com',
+                'blogId': 'gid://shopify/Blog/1',
+                'blogHandle': 'news',
+            },
+        },
+        dry_run=False,
+        credentials={'client_id': 'client-id', 'client_secret': 'client-secret'},
+    )
+    monkeypatch.setattr(publisher, '_graphql', fake_graphql)
+
+    with pytest.raises(
+        ExternalCallError,
+        match='SHOPIFY_ARTICLE_IDENTITY_CONFLICT',
+    ):
+        await publisher.find_article_by_slug('hello')
+
+
+@pytest.mark.asyncio
+async def test_shopify_lookup_rejects_article_handle_mismatch(monkeypatch):
+    async def fake_graphql(query: str, variables: dict | None = None, **kwargs):
+        return {
+            'articles': {
+                'nodes': [{
+                    'id': 'gid://shopify/Article/17',
+                    'handle': 'different-handle',
+                    'blog': {'id': 'gid://shopify/Blog/1', 'handle': 'news'},
+                }],
+                'pageInfo': {'hasNextPage': False, 'endCursor': None},
+            },
+        }
+
+    publisher = ShopifyPublisher(
+        {
+            'id': 'site-1',
+            'domain': 'healthyoxy.com',
+            'api_config': {
+                'connector_type': 'shopify',
+                'shopDomain': 'healthyoxy.myshopify.com',
+                'blogId': 'gid://shopify/Blog/1',
+                'blogHandle': 'news',
+            },
+        },
+        dry_run=False,
+        credentials={'client_id': 'client-id', 'client_secret': 'client-secret'},
+    )
+    monkeypatch.setattr(publisher, '_graphql', fake_graphql)
+
+    with pytest.raises(
+        ExternalCallError,
+        match='SHOPIFY_ARTICLE_IDENTITY_CONFLICT',
+    ):
+        await publisher.find_article_by_slug('hello')
+
+
+@pytest.mark.asyncio
 async def test_shopify_publisher_syncs_only_seo_metafields(monkeypatch):
     called: list[tuple[str, str, dict]] = []
     monkeypatch.setattr('app.clients.publishers._SHOPIFY_TOKEN_CACHE', {})
@@ -673,6 +992,141 @@ async def test_shopify_publisher_uses_client_credentials_and_publishes(monkeypat
         {'namespace': 'global', 'key': 'title_tag', 'type': 'single_line_text_field', 'value': 'Search title'},
         {'namespace': 'global', 'key': 'description_tag', 'type': 'single_line_text_field', 'value': 'Search description'},
     ]
+
+
+@pytest.mark.asyncio
+async def test_shopify_publish_recovers_when_create_times_out_after_remote_success(monkeypatch):
+    calls: list[str] = []
+
+    async def fake_graphql(query: str, variables: dict | None = None, **kwargs):
+        calls.append(query)
+        if 'mutation CreateArticle' in query:
+            raise ExternalCallError('Shopify request timed out')
+        if 'query ArticleByHandle' in query:
+            return {
+                'articles': {
+                    'nodes': [{
+                        'id': 'gid://shopify/Article/17',
+                        'title': 'Hello',
+                        'handle': 'hello',
+                        'blog': {'id': 'gid://shopify/Blog/1', 'handle': 'news'},
+                        'isPublished': True,
+                    }],
+                },
+            }
+        raise AssertionError(query)
+
+    publisher = ShopifyPublisher(
+        {
+            'id': 'site-1',
+            'domain': 'healthyoxy.com',
+            'api_config': {
+                'connector_type': 'shopify',
+                'shopDomain': 'healthyoxy.myshopify.com',
+                'blogId': 'gid://shopify/Blog/1',
+                'blogHandle': 'news',
+            },
+        },
+        dry_run=False,
+        credentials={'client_id': 'client-id', 'client_secret': 'client-secret'},
+    )
+    monkeypatch.setattr(publisher, '_graphql', fake_graphql)
+
+    result = await publisher.publish(PublishRequest(
+        title='Hello',
+        slug='hello',
+        content_md='# Hello',
+        status='publish',
+    ))
+
+    assert result.ok is True
+    assert result.post_id == 'gid://shopify/Article/17'
+    assert result.url == 'https://healthyoxy.com/blogs/news/hello'
+    assert result.raw['recovered_after_error'] is True
+    assert result.raw['create_error'] == 'Shopify request timed out'
+    assert result.remote_outcome == 'confirmed_applied'
+    assert sum('mutation CreateArticle' in query for query in calls) == 1
+    assert sum('query ArticleByHandle' in query for query in calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_shopify_publish_classifies_failed_readback_as_unknown_remote_state(monkeypatch):
+    calls: list[str] = []
+
+    async def fake_graphql(query: str, variables: dict | None = None, **kwargs):
+        calls.append(query)
+        if 'mutation CreateArticle' in query:
+            raise ExternalCallError('Shopify request timed out')
+        raise ExternalCallError('Shopify readback timed out')
+
+    publisher = ShopifyPublisher(
+        {'id': 'site-1', 'domain': 'healthyoxy.com', 'api_config': {
+            'connector_type': 'shopify',
+            'shopDomain': 'healthyoxy.myshopify.com',
+            'blogId': 'gid://shopify/Blog/1',
+            'blogHandle': 'news',
+        }},
+        dry_run=False,
+        credentials={'client_id': 'client-id', 'client_secret': 'client-secret'},
+    )
+    monkeypatch.setattr(publisher, '_graphql', fake_graphql)
+
+    result = await publisher.publish(PublishRequest(title='Hello', slug='hello', content_md='# Hello'))
+
+    assert result.ok is False
+    assert result.remote_outcome == 'unknown_remote_state'
+    assert result.raw['retry_policy'] == 'manual_readback_required'
+    assert sum('mutation CreateArticle' in query for query in calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_shopify_publish_timeout_rejects_conflicting_readback_identity(monkeypatch):
+    calls: list[str] = []
+
+    async def fake_graphql(query: str, variables: dict | None = None, **kwargs):
+        calls.append(query)
+        if 'mutation CreateArticle' in query:
+            assert kwargs['max_attempts'] == 1
+            raise ExternalCallError('Shopify request timed out')
+        return {
+            'articles': {
+                'nodes': [{
+                    'id': 'gid://shopify/Article/17',
+                    'title': 'Hello',
+                    'handle': 'hello',
+                    'blog': {'id': 'gid://shopify/Blog/2', 'handle': 'news'},
+                }],
+                'pageInfo': {'hasNextPage': False, 'endCursor': None},
+            },
+        }
+
+    publisher = ShopifyPublisher(
+        {
+            'id': 'site-1',
+            'domain': 'healthyoxy.com',
+            'api_config': {
+                'connector_type': 'shopify',
+                'shopDomain': 'healthyoxy.myshopify.com',
+                'blogId': 'gid://shopify/Blog/1',
+                'blogHandle': 'news',
+            },
+        },
+        dry_run=False,
+        credentials={'client_id': 'client-id', 'client_secret': 'client-secret'},
+    )
+    monkeypatch.setattr(publisher, '_graphql', fake_graphql)
+
+    result = await publisher.publish(
+        PublishRequest(title='Hello', slug='hello', content_md='# Hello')
+    )
+
+    assert result.ok is False
+    assert result.remote_outcome == 'identity_conflict'
+    assert result.error == 'SHOPIFY_ARTICLE_IDENTITY_CONFLICT'
+    assert result.raw['error_code'] == 'SHOPIFY_ARTICLE_IDENTITY_CONFLICT'
+    assert result.raw['retry_policy'] == 'manual_identity_resolution_required'
+    assert sum('mutation CreateArticle' in query for query in calls) == 1
+    assert sum('query ArticleByHandle' in query for query in calls) == 1
 
 
 @pytest.mark.asyncio

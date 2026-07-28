@@ -4,6 +4,87 @@ import app.services.content_audit_service as audit_service
 from app.services.content_audit_service import _audit_post, _merge_content_candidates, _normalise_confidence, _page_cluster_candidates, _parse_ai_response
 
 
+class _MappingsResult:
+    def __init__(self, row=None):
+        self._row = row
+
+    def mappings(self):
+        return self
+
+    def first(self):
+        return self._row
+
+
+@pytest.mark.asyncio
+async def test_start_content_audit_reuses_running_batch(monkeypatch):
+    class Session:
+        def __init__(self):
+            self.calls = []
+
+        async def execute(self, statement, params=None):
+            self.calls.append((str(statement), params or {}))
+            if "pg_advisory_xact_lock" in str(statement):
+                return _MappingsResult()
+            return _MappingsResult(
+                {
+                    "id": "batch-running",
+                    "status": "running",
+                    "payload": {
+                        "kind": "content_audit_run",
+                        "business_id": "exdivo",
+                        "scanned_at": "2026-07-27T14:00:00+00:00",
+                    },
+                    "decision": {},
+                    "created_at": "2026-07-27T14:00:00+00:00",
+                    "updated_at": "2026-07-27T14:00:01+00:00",
+                }
+            )
+
+        async def commit(self):
+            raise AssertionError("复用进行中批次时不应创建新任务")
+
+    scheduled = []
+    monkeypatch.setattr(audit_service, "_schedule_content_audit", lambda *args, **kwargs: scheduled.append(args))
+
+    result = await audit_service.start_content_audit(Session(), business_id="exdivo")
+
+    assert result == {
+        "batch_id": "batch-running",
+        "business_id": "exdivo",
+        "status": "running",
+        "reused": True,
+        "poll_url": "/api/v1/workflow/content-audit/scans/batch-running",
+    }
+    assert scheduled == []
+
+
+@pytest.mark.asyncio
+async def test_get_content_audit_batch_returns_completed_result():
+    class Session:
+        async def execute(self, statement, params=None):
+            return _MappingsResult(
+                {
+                    "id": "batch-complete",
+                    "status": "done",
+                    "payload": {
+                        "kind": "content_audit_run",
+                        "business_id": "exdivo",
+                        "scanned_at": "2026-07-27T14:00:00+00:00",
+                    },
+                    "decision": {"result": {"summary": {"articles": 62}}},
+                    "created_at": "2026-07-27T14:00:00+00:00",
+                    "updated_at": "2026-07-27T14:02:00+00:00",
+                }
+            )
+
+    result = await audit_service.get_content_audit_batch(Session(), "batch-complete")
+
+    assert result["batch_id"] == "batch-complete"
+    assert result["business_id"] == "exdivo"
+    assert result["status"] == "completed"
+    assert result["result"]["summary"]["articles"] == 62
+
+
 def test_audit_reports_missing_metadata_with_evidence():
     item = _audit_post(
         {
@@ -49,6 +130,104 @@ def test_remote_fetch_failure_is_held():
     assert item is not None
     assert item["action"] == "hold"
     assert any(issue["code"] == "content_fetch_failed" for issue in item["issues"])
+
+
+def test_missing_public_url_is_held_until_sync_repairs_it():
+    item = _audit_post({
+        "id": "post-1",
+        "site_id": "site-1",
+        "site_name": "demo",
+        "title": "Missing URL",
+        "url": None,
+        "content_html": "<h2>Details</h2><p>" + ("body " * 200) + "</p>",
+        "content_md": None,
+        "meta_title": "Title",
+        "meta_description": "Description",
+        "primary_keyword": "keyword",
+        "raw": {},
+        "content_analysis": {"content_status": "available", "char_count": 1000},
+    })
+
+    assert item is not None
+    assert item["action"] == "hold"
+    assert item["priority"] == "Hold"
+    assert any(issue["code"] == "missing_url" for issue in item["issues"])
+
+
+def test_german_faq_heading_prevents_false_update_candidate():
+    item = _audit_post({
+        "id": "post-1",
+        "site_id": "site-1",
+        "site_name": "demo",
+        "title": "E-Zigarette für Anfänger",
+        "url": "https://demo.com/ratgeber",
+        "content_html": (
+            "<h2>Grundlagen</h2><p>"
+            + ("Hilfreicher Inhalt. " * 80)
+            + "</p><h2>Häufige Fragen</h2><h3>Welches Gerät passt?</h3><p>Antwort.</p>"
+        ),
+        "content_md": None,
+        "meta_title": "E-Zigarette für Anfänger: Ratgeber",
+        "meta_description": "Ein sachlicher Ratgeber für erwachsene Einsteiger.",
+        "primary_keyword": "e-zigarette für anfänger",
+        "meta_keywords": ["e-zigarette für anfänger"],
+        "raw": {},
+        "content_analysis": {
+            "content_status": "available",
+            "char_count": 1600,
+            "heading_counts": {"h2": 2, "h3": 1},
+            "faq_signal": False,
+        },
+    })
+
+    assert item is None
+
+
+@pytest.mark.parametrize(
+    ("content_html", "primary_keyword", "meta_keywords", "expected_issue"),
+    [
+        (
+            "<h2>Guide</h2><p>" + ("Useful content. " * 80) + "</p><h2>FAQ</h2>",
+            "",
+            [],
+            "missing_keyword",
+        ),
+        (
+            "<h2>Guide</h2><p>" + ("Useful content. " * 80) + "</p>",
+            "useful guide",
+            ["useful guide"],
+            "missing_faq_signal",
+        ),
+    ],
+)
+def test_keyword_or_faq_only_gap_is_held_not_rewritten(
+    content_html, primary_keyword, meta_keywords, expected_issue
+):
+    item = _audit_post({
+        "id": "post-1",
+        "site_id": "site-1",
+        "site_name": "demo",
+        "title": "Useful Guide",
+        "url": "https://demo.com/guide",
+        "content_html": content_html,
+        "content_md": None,
+        "meta_title": "Useful Guide",
+        "meta_description": "A complete description for this useful guide.",
+        "primary_keyword": primary_keyword,
+        "meta_keywords": meta_keywords,
+        "raw": {},
+        "content_analysis": {
+            "content_status": "available",
+            "char_count": 1600,
+            "heading_counts": {"h2": 2},
+            "faq_signal": False,
+        },
+    })
+
+    assert item is not None
+    assert item["action"] == "hold"
+    assert item["priority"] == "Hold"
+    assert {issue["code"] for issue in item["issues"]} == {expected_issue}
 
 
 def test_ai_response_parser_accepts_json_object_and_percentage_confidence():

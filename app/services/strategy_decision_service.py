@@ -114,6 +114,7 @@ def build_on_page_candidates(
                     "site_id": site_id,
                     "site_name": site.get("name") or "",
                     "strategy_type": "on_page_fix",
+                    "action_type": _on_page_action_type(page_type, subtype),
                     "page_type": page_type,
                     "subtype": subtype,
                     "target_url": url,
@@ -217,6 +218,16 @@ def _actionable_issues(audit: dict[str, Any]) -> list[tuple[str, dict[str, Any]]
 
 def _page_type_label(page_type: str) -> str:
     return {"home": "首页", "product": "产品页", "category": "分类页"}[page_type]
+
+
+def _on_page_action_type(page_type: str, subtype: str) -> str:
+    if page_type == "home":
+        return "homepage_seo"
+    if page_type == "category":
+        return "category_seo"
+    if subtype == "alt":
+        return "product_image_alt"
+    return "product_seo"
 
 
 def _reason_for(subtype: str, evidence: dict[str, Any]) -> str:

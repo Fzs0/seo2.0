@@ -6,14 +6,71 @@ from uuid import UUID
 
 import pytest
 
+from app.services import strategy_run_service as service
 from app.services.strategy_run_service import (
     TERMINAL_RUN_STATUSES,
+    _attach_action_bindings,
+    _restrict_plan_to_discovered_sites,
     create_strategy_run,
     derive_child_idempotency_key,
     run_strategy_run,
     transition_strategy_run,
     validate_run_transition,
 )
+
+
+def test_run_coverage_excludes_planner_sites_outside_enabled_discovery_snapshot():
+    discovered = [{"id": "enabled-a"}, {"id": "enabled-b"}]
+    planned = {
+        "site_scope": [*discovered, {"id": "disabled-main"}],
+        "coverage_matrix": {
+            "discovered_site_count": 3,
+            "decided_site_count": 3,
+            "decisions": [
+                {"site_id": "enabled-a", "action": "hold"},
+                {"site_id": "enabled-b", "action": "hold"},
+                {"site_id": "disabled-main", "action": "configuration_repair"},
+            ],
+        },
+    }
+
+    restricted = _restrict_plan_to_discovered_sites(planned, discovered)
+
+    assert restricted["coverage_matrix"]["discovered_site_count"] == 2
+    assert restricted["coverage_matrix"]["decided_site_count"] == 2
+    assert {item["site_id"] for item in restricted["coverage_matrix"]["decisions"]} == {
+        "enabled-a",
+        "enabled-b",
+    }
+
+
+def test_selected_coverage_decision_binds_the_exact_persisted_strategy_task():
+    coverage = {
+        "decisions": [
+            {
+                "site_id": "site-a",
+                "action": "update_article",
+                "selected_candidate_id": "candidate-a",
+            }
+        ]
+    }
+    plan = {
+        "id": "plan-a",
+        "items": [
+            {
+                "id": "strategy-a",
+                "candidate_id": "candidate-a",
+                "site_id": "site-a",
+                "post_id": "post-a",
+                "strategy_type": "update_article",
+            }
+        ],
+    }
+
+    bound = _attach_action_bindings(coverage, plan)
+
+    assert bound["decisions"][0]["source_strategy_task_id"] == "strategy-a"
+    assert bound["decisions"][0]["target_asset_id"] == "post-a"
 
 
 class _Mappings:
@@ -125,6 +182,48 @@ def test_child_idempotency_key_is_stable_and_scoped():
     first = derive_child_idempotency_key("run-1", "site-1", "product_seo", "url-lock")
     assert first == derive_child_idempotency_key("run-1", "site-1", "product_seo", "url-lock")
     assert first != derive_child_idempotency_key("run-1", "site-2", "product_seo", "url-lock")
+
+
+@pytest.mark.asyncio
+async def test_run_retry_rejects_unresolved_remote_uncertainty(monkeypatch):
+    class Result:
+        def scalar_one_or_none(self):
+            return "unknown_remote_state"
+
+    class Session:
+        async def execute(self, statement, params=None):
+            assert "remote_outcome" in str(statement)
+            assert params["root_run_id"] == "root-run"
+            return Result()
+
+    async def get_run(_session, *, run_id):
+        return {
+            "run_id": run_id,
+            "root_run_id": "root-run",
+            "business_id": "business",
+            "status": "partial",
+            "site_ids": None,
+            "scope": "all_sites",
+            "mode": "execute",
+            "action_budget": 1,
+            "site_quotas": {},
+            "approval_policy": "manual",
+            "attempt": 1,
+        }
+
+    async def create(*_args, **_kwargs):
+        raise AssertionError("an unresolved remote outcome must not create a retry run")
+
+    monkeypatch.setattr(service, "get_strategy_run", get_run)
+    monkeypatch.setattr(service, "create_strategy_run", create)
+
+    with pytest.raises(ValueError, match="REMOTE_STATE_REQUIRES_MANUAL_READBACK"):
+        await service.retry_strategy_run(
+            Session(),
+            run_id="run-1",
+            requested_by="human",
+            idempotency_key="retry-1",
+        )
 
 
 @pytest.mark.asyncio

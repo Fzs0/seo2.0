@@ -53,6 +53,21 @@ def resolve_article_public_url(
             return urljoin(f"{base.rstrip('/')}/", f"blogs/detail/{quote(clean_id, safe='')}")
         return None
 
+    if _is_shopify_site(site):
+        remote_candidate = raw_remote or raw_canonical
+        if remote_candidate:
+            return _rewrite_public_host(base, remote_candidate)
+        config = site.get("api_config") or {}
+        blog_handle = str(
+            config.get("blogHandle") or config.get("blog_handle") or "news"
+        ).strip().strip("/")
+        if clean_slug and blog_handle:
+            return _absolute_public_url(
+                base,
+                f"/blogs/{quote(blog_handle, safe='')}/{quote(clean_slug, safe='')}",
+            )
+        return None
+
     if raw_remote:
         return _rewrite_public_host(base, raw_remote)
 
@@ -78,6 +93,14 @@ def _is_known_content_openapi(site: dict[str, Any]) -> bool:
     raw = str(site.get("api_base_url") or "").strip()
     parsed = urlsplit(raw if "://" in raw else f"//{raw}")
     return parsed.path.rstrip("/").casefold() == "/api/open/v1"
+
+
+def _is_shopify_site(site: dict[str, Any]) -> bool:
+    config = site.get("api_config") or {}
+    return (
+        str(site.get("site_type") or "").strip().casefold() == "shopify"
+        or str(config.get("connector_type") or "").strip().casefold() == "shopify"
+    )
 
 
 def _rewrite_public_host(base: str, remote_url: str) -> str:

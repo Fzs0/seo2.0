@@ -10,7 +10,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.google_config import get_store
 from app.services.content_audit_service import scan_content
 from app.services.custom_connector_service import sync_connector_products
-from app.services.google_sync import sync_source
+from app.services.google_sync import (
+    GOOGLE_SYNC_TRIGGER_STRATEGY_HOLD_REFRESH,
+    sync_source,
+)
 from app.services.oemapps_collection_service import sync_oemapps_collections
 from app.services.oemapps_home_seo_service import sync_oemapps_home_seo
 from app.services.shopify_product_service import sync_shopify_products
@@ -73,9 +76,12 @@ async def _refresh_google(
                     session,
                     source.id,
                     days_back=28,
-                    trigger="strategy_hold_refresh",
+                    trigger=GOOGLE_SYNC_TRIGGER_STRATEGY_HOLD_REFRESH,
                 )
             except Exception as error:  # external read isolation
+                # A database error leaves PostgreSQL transactions aborted until
+                # rollback. Clear it before trying another source or site.
+                await session.rollback()
                 for source_type in ("gsc", "ga4"):
                     records[site_id]["sources"][source_type] = _source_record(
                         "failed", refreshed_at, error=str(error)

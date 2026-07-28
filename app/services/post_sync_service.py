@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.clients.http_client import ExternalCallError, request_text
 from app.clients.publishers import PublisherBase
 from app.core.article_urls import resolve_article_public_url
+from app.services.article_url_reconciliation_service import reconcile_article_public_url
 from app.services.shopify_connection_service import publisher_for_site_runtime
 from app.services.post_analysis_service import persist_post_analysis
 from app.services.strategy_effect_service import reconcile_effect_target_url
@@ -544,6 +545,12 @@ async def _sync_linked_article_url(
                     "url": str(url),
                     "payload": json.dumps(payload, ensure_ascii=False, default=str),
                 },
+            )
+        for article_id in article_ids:
+            await reconcile_article_public_url(
+                session,
+                article_id=article_id,
+                remote_url=str(url),
             )
     await session.execute(
         text(

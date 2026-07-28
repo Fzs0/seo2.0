@@ -62,7 +62,7 @@ from app.services.strategy_service import (
     review_strategy,
     save_strategy_plan,
 )
-from app.services.content_audit_service import list_ai_reviews, scan_content
+from app.services.content_audit_service import get_content_audit_batch, list_ai_reviews, start_content_audit
 from app.services.article_generation_service import generate_article_pipeline, generate_legacy_article_preview
 
 router = APIRouter()
@@ -443,7 +443,7 @@ class ContentAuditBody(BaseModel):
 @router.post("/workflow/content-audit/scan")
 async def scan_content_route(body: ContentAuditBody, session: AsyncSession = Depends(get_db)) -> dict[str, Any]:
     try:
-        return await scan_content(
+        return await start_content_audit(
             session,
             business_id=body.businessId.strip(),
             refresh=body.refresh,
@@ -455,6 +455,14 @@ async def scan_content_route(body: ContentAuditBody, session: AsyncSession = Dep
         )
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
+
+
+@router.get("/workflow/content-audit/scans/{batch_id}")
+async def get_content_audit_scan(batch_id: str, session: AsyncSession = Depends(get_db)) -> dict[str, Any]:
+    result = await get_content_audit_batch(session, batch_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail="内容审计批次不存在")
+    return result
 
 
 @router.get("/workflow/content-audit/reviews")

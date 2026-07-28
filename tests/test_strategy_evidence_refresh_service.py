@@ -17,8 +17,18 @@ class _Rows:
 
 
 class _Session:
+    def __init__(self):
+        self.poisoned = False
+        self.rollbacks = 0
+
     async def execute(self, statement, params=None):
+        if self.poisoned:
+            raise RuntimeError("current transaction is aborted")
         return _Rows([{"id": "connector-1", "site_id": "site-1"}])
+
+    async def rollback(self):
+        self.poisoned = False
+        self.rollbacks += 1
 
 
 class _Source:
@@ -122,3 +132,67 @@ async def test_default_second_hold_refreshes_real_read_boundaries(monkeypatch):
         "collections",
         "home",
     }
+
+
+@pytest.mark.asyncio
+async def test_google_failure_rolls_back_before_later_sources_and_sites(monkeypatch):
+    calls = []
+    session = _Session()
+    failed_once = False
+
+    async def google(current_session, source_id, **kwargs):
+        nonlocal failed_once
+        calls.append(("google", source_id))
+        if source_id == "google-1" and not failed_once:
+            failed_once = True
+            current_session.poisoned = True
+            raise RuntimeError("value too long for type character varying(16)")
+        return {
+            "ok": True,
+            "results": [
+                {"ok": True, "type": "gsc", "log_id": "gsc-2"},
+                {"ok": True, "type": "ga4", "log_id": "ga4-2"},
+            ],
+        }
+
+    async def content(current_session, **kwargs):
+        await current_session.execute("SELECT 1")
+        calls.append(("content", kwargs["business_id"]))
+        return {"scanned_at": "2026-07-27T00:00:00+00:00", "items": []}
+
+    class TwoSources:
+        def list_all(self):
+            first = _Source()
+            class SecondSource(_Source):
+                id = "google-2"
+
+                def gsc_host(self):
+                    return "other.example"
+
+            second = SecondSource()
+            return [first, second]
+
+    monkeypatch.setattr(
+        "app.services.strategy_evidence_refresh_service.get_store", lambda: TwoSources()
+    )
+    monkeypatch.setattr(
+        "app.services.strategy_evidence_refresh_service.sync_source", google
+    )
+    monkeypatch.setattr(
+        "app.services.strategy_evidence_refresh_service.scan_content", content
+    )
+
+    result = await refresh_default_strategy_evidence(
+        session,
+        business_id="business-1",
+        sites=[
+            {"id": "site-1", "domain": "example.com", "site_type": "other"},
+            {"id": "site-2", "domain": "other.example", "site_type": "other"},
+        ],
+    )
+
+    assert session.rollbacks == 1
+    assert calls.count(("google", "google-2")) == 1
+    assert ("content", "business-1") in calls
+    assert "character varying(16)" in result[0]["sources"]["gsc"]["error"]
+    assert result[1]["sources"]["ga4"]["status"] == "fresh"

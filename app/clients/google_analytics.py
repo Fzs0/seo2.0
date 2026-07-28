@@ -79,6 +79,7 @@ class GA4Client:
     def __init__(self, source: GoogleSource) -> None:
         self.source = source
         self._property_id = source.ga4_property_id
+        self._hostnames = source.ga4_hosts()
 
     @property
     def _proxy_url(self) -> str:
@@ -143,6 +144,8 @@ class GA4Client:
         channel_breakdown=True 时按 sessionDefaultChannelGroup 拆；
         landing_page_breakdown=True 时按 landingPagePlusQueryString 拆。
         """
+        if not self._hostnames:
+            raise GA4ClientError("GA4 hostname allowlist is empty")
         token = await self.get_access_token()
         dimensions = ["date"]
         if channel_breakdown:
@@ -167,8 +170,16 @@ class GA4Client:
             ],
             "limit": 100000,
             "keepEmptyRows": False,
+            "dimensionFilter": {
+                "filter": {
+                    "fieldName": "hostName",
+                    "inListFilter": {
+                        "values": list(self._hostnames),
+                        "caseSensitive": False,
+                    },
+                }
+            },
         }
-        # dimensionFilter: 限制 date 范围（API 自动按 dateRanges 切，这里不加额外 filter）
         url = _ANALYTICS_DATA_URL.format(property_id=self._property_id)
         try:
             async with self._httpx(timeout=90.0) as cli:
@@ -197,6 +208,11 @@ class GA4Client:
                         f"runReport {resp.status_code}: {resp.text[:400]}"
                     )
                 data = resp.json()
+                row_count = int(data.get("rowCount", 0) or 0)
+                if row_count > int(body["limit"]):
+                    raise GA4ClientError(
+                        f"runReport row limit exceeded: {row_count} > {body['limit']}"
+                    )
                 rows = data.get("rows", []) or []
                 # 把 GA4 的扁平结构转成 dict（dim_value_0, dim_value_1, ...）
                 result: list[dict[str, Any]] = []
@@ -257,6 +273,7 @@ class GA4Client:
                 "token_prefix": token[:12] + "...",
                 "rows_count": len(rows),
                 "property_id": self._property_id,
+                "hostnames": list(self._hostnames),
                 "proxy_url": self._proxy_url,
             }
         except Exception as e:  # noqa: BLE001
@@ -264,5 +281,6 @@ class GA4Client:
                 "ok": False,
                 "error": str(e),
                 "property_id": self._property_id,
+                "hostnames": list(self._hostnames),
                 "proxy_url": self._proxy_url,
             }

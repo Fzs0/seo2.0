@@ -78,12 +78,21 @@ class GoogleSource:
     default_end_date: str
     updated_at: str
     service_account: ServiceAccount
+    ga4_hostnames: tuple[str, ...] = ()
     created_at: str = ""
 
     def gsc_host(self) -> str:
         """从 gsc_site_url 提取 host（用于域名匹配）。"""
         parsed = urlparse(self.gsc_site_url)
-        return (parsed.netloc or parsed.path).lower().lstrip("www.")
+        return _normalize_hostname(parsed.netloc or parsed.path).removeprefix("www.")
+
+    def ga4_hosts(self) -> tuple[str, ...]:
+        """GA4 允许计入当前站点的 hostname；未显式配置时只认 GSC 主域名及 www。"""
+        configured = _normalize_hostnames(self.ga4_hostnames)
+        if configured:
+            return configured
+        host = self.gsc_host()
+        return (host, f"www.{host}") if host else ()
 
 
 class GoogleConfigStore:
@@ -116,6 +125,7 @@ class GoogleConfigStore:
                 "name": s.name,
                 "gscSiteUrl": s.gsc_site_url,
                 "ga4PropertyId": s.ga4_property_id,
+                "ga4Hostnames": list(s.ga4_hosts()),
                 "googleProxyUrl": s.google_proxy_url,
                 "defaultStartDate": s.default_start_date,
                 "defaultEndDate": s.default_end_date,
@@ -190,6 +200,9 @@ class GoogleConfigStore:
                         updated_at=entry.get("updatedAt", ""),
                         created_at=entry.get("createdAt", ""),
                         service_account=sa,
+                        ga4_hostnames=_normalize_hostnames(
+                            entry.get("ga4Hostnames")
+                        ),
                     )
                 )
             except Exception:  # noqa: BLE001
@@ -199,6 +212,27 @@ class GoogleConfigStore:
 
 _store: GoogleConfigStore | None = None
 _store_lock = threading.Lock()
+
+
+def _normalize_hostname(value: Any) -> str:
+    raw = str(value or "").strip().lower().rstrip(".")
+    if "://" in raw:
+        parsed = urlparse(raw)
+        raw = parsed.hostname or ""
+    return raw
+
+
+def _normalize_hostnames(values: Any) -> tuple[str, ...]:
+    if not isinstance(values, (list, tuple, set)):
+        return ()
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        host = _normalize_hostname(value)
+        if host and host not in seen:
+            normalized.append(host)
+            seen.add(host)
+    return tuple(normalized)
 
 
 def get_store() -> GoogleConfigStore:

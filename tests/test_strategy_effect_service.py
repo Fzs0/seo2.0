@@ -466,7 +466,15 @@ async def test_ensure_effect_reactivates_canceled_retry_without_inserting(monkey
             params = params or {}
             writes.append((sql, params))
             if sql.lstrip().startswith("SELECT id::text AS id"):
-                return Result([{"id": "effect-id", "status": "canceled", "payload": {"kind": "strategy_effect"}}])
+                return Result([{
+                    "id": "effect-id",
+                    "status": "canceled",
+                    "payload": {
+                        "kind": "strategy_effect",
+                        "outcome": "inconclusive",
+                        "canceled_reason": "remote verification failed",
+                    },
+                }])
             return Result()
 
     identity = service.strategy_identity("business", site_id="site", post_id=None, action="new_article", objective="create")
@@ -480,9 +488,13 @@ async def test_ensure_effect_reactivates_canceled_retry_without_inserting(monkey
     )
 
     assert result["id"] == "effect-id"
+    assert "canceled_reason" not in result
     assert not any(sql.lstrip().startswith("INSERT INTO seo_agent.tasks") for sql, _ in writes)
-    assert any("status = 'queued'" in sql for sql, _ in writes)
-    assert json.loads(next(params for sql, params in writes if "status = 'queued'" in sql)["payload"]) == {"outcome": "observing"}
+    reactivation_sql, reactivation_params = next(
+        (sql, params) for sql, params in writes if "status = 'queued'" in sql
+    )
+    assert "payload = (COALESCE(payload, '{}'::jsonb) - 'canceled_reason')" in reactivation_sql
+    assert json.loads(reactivation_params["payload"]) == {"outcome": "observing"}
 
 
 @pytest.mark.asyncio

@@ -18,7 +18,7 @@ from typing import Any
 
 import structlog
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.clients.google_analytics import GA4Client, GA4ClientError
 from app.clients.google_search_console import GSCClient, GSCClientError
@@ -28,6 +28,18 @@ logger = structlog.get_logger(__name__)
 _date = date
 
 _GSC_PAGE_DIMENSIONS = ["date", "query", "page", "country", "device"]
+GOOGLE_SYNC_TRIGGER_MANUAL = "manual"
+GOOGLE_SYNC_TRIGGER_SCHEDULED = "scheduled"
+GOOGLE_SYNC_TRIGGER_RETRY = "retry"
+GOOGLE_SYNC_TRIGGER_STRATEGY_HOLD_REFRESH = "strategy_hold_refresh"
+GOOGLE_SYNC_TRIGGERS = frozenset(
+    {
+        GOOGLE_SYNC_TRIGGER_MANUAL,
+        GOOGLE_SYNC_TRIGGER_SCHEDULED,
+        GOOGLE_SYNC_TRIGGER_RETRY,
+        GOOGLE_SYNC_TRIGGER_STRATEGY_HOLD_REFRESH,
+    }
+)
 
 async def _resolve_site_id_by_domain(
     session: AsyncSession, source: GoogleSource
@@ -149,17 +161,18 @@ async def _sync_gsc(
     end_date: str,
     trigger: str,
 ) -> dict[str, Any]:
-    log_id = await _log_start(
-        session,
-        source_id=source.id,
-        site_id=site_id,
-        source_type="gsc",
-        range_start=start_date,
-        range_end=end_date,
-        trigger=trigger,
-    )
     t0 = time.perf_counter()
+    log_id: int | None = None
     try:
+        log_id = await _log_start(
+            session,
+            source_id=source.id,
+            site_id=site_id,
+            source_type="gsc",
+            range_start=start_date,
+            range_end=end_date,
+            trigger=trigger,
+        )
         client = GSCClient(source)
         rows = await client.searchanalytics(
             start_date=start_date,
@@ -226,16 +239,17 @@ async def _sync_gsc(
             "rows_written": written,
             "duration_ms": int((time.perf_counter() - t0) * 1000),
         }
-    except (GSCClientError, Exception) as e:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001
         await session.rollback()
-        await _log_done(
-            session,
-            log_id,
-            rows_fetched=0,
-            rows_written=0,
-            duration_ms=int((time.perf_counter() - t0) * 1000),
-            error=str(e)[:1000],
-        )
+        if log_id is not None:
+            await _log_done(
+                session,
+                log_id,
+                rows_fetched=0,
+                rows_written=0,
+                duration_ms=int((time.perf_counter() - t0) * 1000),
+                error=str(e)[:1000],
+            )
         return {
             "ok": False,
             "type": "gsc",
@@ -255,17 +269,18 @@ async def _sync_ga4(
     end_date: str,
     trigger: str,
 ) -> dict[str, Any]:
-    log_id = await _log_start(
-        session,
-        source_id=source.id,
-        site_id=site_id,
-        source_type="ga4",
-        range_start=start_date,
-        range_end=end_date,
-        trigger=trigger,
-    )
     t0 = time.perf_counter()
+    log_id: int | None = None
     try:
+        log_id = await _log_start(
+            session,
+            source_id=source.id,
+            site_id=site_id,
+            source_type="ga4",
+            range_start=start_date,
+            range_end=end_date,
+            trigger=trigger,
+        )
         client = GA4Client(source)
         rows = await client.run_report(
             start_date=start_date,
@@ -277,17 +292,40 @@ async def _sync_ga4(
             end_date=end_date,
             channel_breakdown=True,
         )
-        landing_rows: list[dict[str, Any]] = []
-        landing_warning: str | None = None
-        try:
-            landing_rows = await client.run_report(
-                start_date=start_date,
-                end_date=end_date,
-                landing_page_breakdown=True,
+        landing_rows = await client.run_report(
+            start_date=start_date,
+            end_date=end_date,
+            landing_page_breakdown=True,
+        )
+        if rows and not landing_rows:
+            raise GA4ClientError(
+                "GA4 landing report is empty while overview has data"
             )
-        except GA4ClientError as error:
-            landing_warning = str(error)[:500]
-            logger.warning("ga4_landing_pages_unavailable", source_id=source.id, error=landing_warning)
+        range_params = {
+            "site_id": site_id,
+            "start_date": _date.fromisoformat(start_date),
+            "end_date": _date.fromisoformat(end_date),
+        }
+        await session.execute(
+            text(
+                """
+                DELETE FROM seo_agent.ga4_session_daily
+                 WHERE site_id = CAST(:site_id AS uuid)
+                   AND date BETWEEN CAST(:start_date AS date) AND CAST(:end_date AS date)
+                """
+            ),
+            range_params,
+        )
+        await session.execute(
+            text(
+                """
+                DELETE FROM seo_agent.ga4_landing_page_daily
+                 WHERE site_id = CAST(:site_id AS uuid)
+                   AND date BETWEEN CAST(:start_date AS date) AND CAST(:end_date AS date)
+                """
+            ),
+            range_params,
+        )
         written = 0
         for r in rows:
             d_raw = r.get("date", "")
@@ -405,19 +443,21 @@ async def _sync_ga4(
             "rows_fetched": total_fetched,
             "rows_written": total_written,
             "landing_pages_written": landing_written,
-            "warnings": [landing_warning] if landing_warning else [],
+            "hostname_scope": list(source.ga4_hosts()),
+            "warnings": [],
             "duration_ms": int((time.perf_counter() - t0) * 1000),
         }
-    except (GA4ClientError, Exception) as e:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001
         await session.rollback()
-        await _log_done(
-            session,
-            log_id,
-            rows_fetched=0,
-            rows_written=0,
-            duration_ms=int((time.perf_counter() - t0) * 1000),
-            error=str(e)[:1000],
-        )
+        if log_id is not None:
+            await _log_done(
+                session,
+                log_id,
+                rows_fetched=0,
+                rows_written=0,
+                duration_ms=int((time.perf_counter() - t0) * 1000),
+                error=str(e)[:1000],
+            )
         return {
             "ok": False,
             "type": "ga4",
@@ -449,6 +489,8 @@ async def sync_source(
     skip_ga4: bool = False,
 ) -> dict[str, Any]:
     """按 source.id 同步 GSC + GA4。"""
+    if trigger not in GOOGLE_SYNC_TRIGGERS:
+        raise ValueError(f"unsupported google sync trigger: {trigger}")
     source = get_store().get_by_id(source_id)
     if not source:
         return {"ok": False, "error": f"source not found: {source_id}"}
@@ -464,7 +506,9 @@ async def sync_source(
     results: list[dict[str, Any]] = []
     if not skip_gsc:
         results.append(
-            await _sync_gsc(
+            await _run_isolated_source(
+                "gsc",
+                _sync_gsc,
                 session,
                 source,
                 site_id,
@@ -475,7 +519,9 @@ async def sync_source(
         )
     if not skip_ga4:
         results.append(
-            await _sync_ga4(
+            await _run_isolated_source(
+                "ga4",
+                _sync_ga4,
                 session,
                 source,
                 site_id,
@@ -492,6 +538,38 @@ async def sync_source(
         "range": {"start": start_date, "end": end_date},
         "results": results,
     }
+
+
+async def _run_isolated_source(
+    source_type: str,
+    function: Any,
+    session: AsyncSession,
+    *args: Any,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    """Keep one failed source from poisoning the shared PostgreSQL session."""
+    bind = getattr(session, "bind", None)
+    if isinstance(session, AsyncSession) and bind is not None:
+        factory = async_sessionmaker(bind, expire_on_commit=False)
+        async with factory() as isolated_session:
+            try:
+                return await function(isolated_session, *args, **kwargs)
+            except Exception as error:
+                await isolated_session.rollback()
+                return {
+                    "ok": False,
+                    "type": source_type,
+                    "error": str(error)[:500],
+                }
+    try:
+        return await function(session, *args, **kwargs)
+    except Exception as error:  # defensive boundary around log/start/finalize failures
+        await session.rollback()
+        return {
+            "ok": False,
+            "type": source_type,
+            "error": str(error)[:500],
+        }
 
 
 async def sync_all_sources(

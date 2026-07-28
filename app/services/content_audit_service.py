@@ -1,11 +1,13 @@
 """全站内容体检：基于已同步文章和关键词生成可解释的行动建议。"""
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from collections import Counter
 from datetime import datetime, timezone
 from typing import Any
+from uuid import uuid4
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -16,9 +18,176 @@ from app.clients.serpapi import (
     is_terminal_serp_failure,
     is_usable_serp_result,
 )
+from app.core.content_signals import has_faq_signal
 from app.engine.semrush_strategy import _normalized_url
+from app.core.database import SessionLocal
 from app.services.post_sync_service import sync_all_site_posts
 from app.services.serp_competitor_service import fetch_competitor_pages
+
+_content_audit_tasks: set[asyncio.Task[Any]] = set()
+
+
+async def start_content_audit(
+    session: AsyncSession,
+    *,
+    business_id: str,
+    refresh: bool = True,
+    limit_per_site: int = 100,
+    limit: int = 200,
+    fetch_serp: bool = True,
+    use_ai: bool = True,
+    ai_limit: int = 20,
+) -> dict[str, Any]:
+    """Start a pollable audit, reusing the business' current unfinished batch."""
+    business_id = business_id.strip()
+    if not business_id:
+        raise ValueError("business_id 不能为空")
+    await session.execute(
+        text("SELECT pg_advisory_xact_lock(hashtext(:key))"),
+        {"key": f"content-audit:{business_id}"},
+    )
+    running = (
+        await session.execute(
+            text(
+                """
+                SELECT id::text AS id, status, payload, decision, created_at, updated_at
+                  FROM seo_agent.tasks
+                 WHERE task_type = 'review'
+                   AND payload->>'kind' = 'content_audit_run'
+                   AND payload->>'business_id' = :business_id
+                   AND status IN ('queued', 'running')
+                 ORDER BY created_at DESC
+                 LIMIT 1
+                """
+            ),
+            {"business_id": business_id},
+        )
+    ).mappings().first()
+    if running:
+        return _audit_batch_response(running, reused=True)
+
+    batch_id = str(uuid4())
+    requested_at = datetime.now(timezone.utc).isoformat()
+    payload = {
+        "kind": "content_audit_run",
+        "business_id": business_id,
+        "requested_at": requested_at,
+        "options": {
+            "refresh": refresh,
+            "limit_per_site": limit_per_site,
+            "limit": limit,
+            "fetch_serp": fetch_serp,
+            "use_ai": use_ai,
+            "ai_limit": ai_limit,
+        },
+    }
+    row = (
+        await session.execute(
+            text(
+                """
+                INSERT INTO seo_agent.tasks
+                  (id, task_type, status, priority, score, title, payload, decision)
+                VALUES
+                  (CAST(:id AS uuid), 'review', 'queued', 'P3', 0, 'content audit run',
+                   CAST(:payload AS jsonb), '{}'::jsonb)
+                RETURNING id::text AS id, status, payload, decision, created_at, updated_at
+                """
+            ),
+            {"id": batch_id, "payload": json.dumps(payload, ensure_ascii=False)},
+        )
+    ).mappings().first()
+    await session.commit()
+    _schedule_content_audit(batch_id, payload["options"])
+    return _audit_batch_response(row, reused=False)
+
+
+async def get_content_audit_batch(session: AsyncSession, batch_id: str) -> dict[str, Any] | None:
+    row = (
+        await session.execute(
+            text(
+                """
+                SELECT id::text AS id, status, payload, decision, created_at, updated_at
+                  FROM seo_agent.tasks
+                 WHERE id = CAST(:id AS uuid)
+                   AND task_type = 'review'
+                   AND payload->>'kind' = 'content_audit_run'
+                """
+            ),
+            {"id": batch_id},
+        )
+    ).mappings().first()
+    return _audit_batch_response(row, reused=False) if row else None
+
+
+def _audit_batch_response(row: Any, *, reused: bool) -> dict[str, Any]:
+    record = dict(row)
+    payload = record.get("payload") or {}
+    decision = record.get("decision") or {}
+    status = {"done": "completed", "canceled": "canceled"}.get(record.get("status"), record.get("status"))
+    response = {
+        "batch_id": str(record["id"]),
+        "business_id": payload.get("business_id"),
+        "status": status,
+        "reused": reused,
+        "poll_url": f"/api/v1/workflow/content-audit/scans/{record['id']}",
+    }
+    if status == "completed":
+        response["result"] = decision.get("result")
+    elif status == "failed":
+        response["error"] = decision.get("error")
+    return response
+
+
+def _schedule_content_audit(batch_id: str, options: dict[str, Any]) -> None:
+    task = asyncio.create_task(_run_content_audit(batch_id, options))
+    _content_audit_tasks.add(task)
+    task.add_done_callback(_content_audit_tasks.discard)
+
+
+async def _run_content_audit(batch_id: str, options: dict[str, Any]) -> None:
+    async with SessionLocal() as session:
+        await session.execute(
+            text(
+                "UPDATE seo_agent.tasks SET status='running', updated_at=now() "
+                "WHERE id=CAST(:id AS uuid) AND status='queued'"
+            ),
+            {"id": batch_id},
+        )
+        await session.commit()
+        try:
+            task = await get_content_audit_batch(session, batch_id)
+            if not task:
+                return
+            result = await scan_content(
+                session,
+                business_id=str(task["business_id"]),
+                refresh=bool(options.get("refresh", True)),
+                limit_per_site=int(options.get("limit_per_site", 100)),
+                limit=int(options.get("limit", 200)),
+                fetch_serp=bool(options.get("fetch_serp", True)),
+                use_ai=bool(options.get("use_ai", True)),
+                ai_limit=int(options.get("ai_limit", 20)),
+            )
+            await session.execute(
+                text(
+                    "UPDATE seo_agent.tasks SET status='done', "
+                    "decision=jsonb_build_object('result', CAST(:result AS jsonb)), updated_at=now() "
+                    "WHERE id=CAST(:id AS uuid) AND status='running'"
+                ),
+                {"id": batch_id, "result": json.dumps(result, ensure_ascii=False, default=str)},
+            )
+            await session.commit()
+        except Exception as error:
+            await session.rollback()
+            await session.execute(
+                text(
+                    "UPDATE seo_agent.tasks SET status='failed', "
+                    "decision=jsonb_build_object('error', CAST(:error AS text)), updated_at=now() "
+                    "WHERE id=CAST(:id AS uuid) AND status='running'"
+                ),
+                {"id": batch_id, "error": str(error)},
+            )
+            await session.commit()
 
 
 async def scan_content(
@@ -705,7 +874,11 @@ def _content_structure(value: Any) -> dict[str, Any]:
     text_value = _plain_text(raw)
     headings = [{"level": int(level), "text": _plain_text(title)} for level, title in re.findall(r"<h([1-6])[^>]*>(.*?)</h\1>", raw, re.I | re.S)]
     headings.extend({"level": len(markers), "text": _plain_text(title)} for markers, title in re.findall(r"^(#{1,6})\s+(.+)$", raw, re.M))
-    return {"word_count": len(re.findall(r"[A-Za-z0-9]+|[\u4e00-\u9fff]", text_value)), "headings": headings[:30], "has_faq": bool(re.search(r"\bfaq\b|frequently asked|常见问题", text_value, re.I))}
+    return {
+        "word_count": len(re.findall(r"[A-Za-z0-9]+|[\u4e00-\u9fff]", text_value)),
+        "headings": headings[:30],
+        "has_faq": has_faq_signal(text_value),
+    }
 
 
 def _item_key(item: dict[str, Any]) -> str:
@@ -809,14 +982,28 @@ def _audit_post(post: dict[str, Any]) -> dict[str, Any] | None:
     heading_counts = analysis.get("heading_counts") if isinstance(analysis.get("heading_counts"), dict) else {}
     if content and not (sum(int(heading_counts.get(f"h{level}") or 0) for level in range(2, 7)) or re.search(r"^#{2,6}\s|<h[2-6][^>]*>", raw_content, re.I | re.M)):
         issues.append(_issue("missing_subheadings", "缺少分段标题", "正文未检测到 H2-H6 或 Markdown 二级标题"))
-    if content and not (analysis.get("faq_signal") or re.search(r"\bfaq\b|frequently asked|常见问题", content, re.I)):
+    if content and not (analysis.get("faq_signal") or has_faq_signal(content)):
         issues.append(_issue("missing_faq_signal", "未检测到 FAQ", "正文没有明显 FAQ 段落或常见问题标记"))
 
     if not issues:
         return None
     confidence, factors = _post_confidence(post, issues, raw)
-    action = "hold" if any(issue["code"] in {"content_not_provided", "content_fetch_failed"} for issue in issues) else "update_article"
-    priority = "P1" if any(issue["code"] in {"missing_description", "missing_keyword", "missing_url"} for issue in issues) else "P2"
+    issue_codes = {issue["code"] for issue in issues}
+    low_signal_only = issue_codes <= {"missing_keyword", "missing_faq_signal"}
+    action = (
+        "hold"
+        if low_signal_only
+        or bool(
+            issue_codes
+            & {"content_not_provided", "content_fetch_failed", "missing_url"}
+        )
+        else "update_article"
+    )
+    priority = (
+        "P1"
+        if issue_codes & {"missing_description", "missing_url"}
+        else "P2"
+    )
     if action == "hold":
         priority = "Hold"
     return {

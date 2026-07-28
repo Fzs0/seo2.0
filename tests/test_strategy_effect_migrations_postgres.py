@@ -21,6 +21,7 @@ import pytest_asyncio
 ROOT = Path(__file__).resolve().parents[1]
 MIGRATION_031 = ROOT / "db/migrations/031_invalidate_late_strategy_effect_baselines.sql"
 MIGRATION_032 = ROOT / "db/migrations/032_classify_legacy_new_article_zero_baselines.sql"
+MIGRATION_034 = ROOT / "db/migrations/034_clear_stale_strategy_effect_cancel_reason.sql"
 
 
 def _configured_postgres_dsns() -> list[str | None]:
@@ -81,6 +82,7 @@ async def postgres(request):
         CREATE TABLE seo_agent.tasks (
           id uuid PRIMARY KEY,
           task_type text NOT NULL,
+          status text NOT NULL DEFAULT 'queued',
           target_url text,
           payload jsonb NOT NULL DEFAULT '{}'::jsonb,
           decision jsonb,
@@ -108,6 +110,66 @@ async def _insert_task(connection, *, action: str, payload: dict, target_url: st
         json.dumps(full_payload),
     )
     return task_id
+
+
+@pytest.mark.asyncio
+async def test_034_clears_only_active_effect_cancel_reasons_and_is_idempotent(postgres):
+    active_id = await _insert_task(
+        postgres,
+        action="new_article",
+        target_url="https://example.test/active",
+        payload={
+            "outcome": "observing",
+            "canceled_reason": "remote verification failed",
+        },
+    )
+    canceled_id = await _insert_task(
+        postgres,
+        action="new_article",
+        target_url="https://example.test/canceled",
+        payload={
+            "outcome": "inconclusive",
+            "canceled_reason": "publication failed",
+        },
+    )
+    await postgres.execute(
+        """
+        UPDATE seo_agent.tasks
+           SET decision='{"outcome":"observing","canceled_reason":"remote verification failed"}'
+         WHERE id=$1
+        """,
+        active_id,
+    )
+    await postgres.execute(
+        """
+        UPDATE seo_agent.tasks
+           SET status='canceled',
+               decision='{"outcome":"inconclusive","canceled_reason":"publication failed"}'
+         WHERE id=$1
+        """,
+        canceled_id,
+    )
+
+    sql = MIGRATION_034.read_text(encoding="utf-8")
+    await postgres.execute(sql)
+    await postgres.execute(sql)
+
+    active = await postgres.fetchrow(
+        "SELECT payload, decision FROM seo_agent.tasks WHERE id=$1",
+        active_id,
+    )
+    canceled = await postgres.fetchrow(
+        "SELECT payload, decision FROM seo_agent.tasks WHERE id=$1",
+        canceled_id,
+    )
+    active_payload = json.loads(active["payload"])
+    active_decision = json.loads(active["decision"])
+    canceled_payload = json.loads(canceled["payload"])
+    canceled_decision = json.loads(canceled["decision"])
+    assert "canceled_reason" not in active_payload
+    assert "canceled_reason" not in active_decision
+    assert canceled_payload["canceled_reason"] == "publication failed"
+    assert canceled_decision["canceled_reason"] == "publication failed"
 
 
 async def _create_legacy_backup_table(connection):

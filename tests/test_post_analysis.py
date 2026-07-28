@@ -34,6 +34,20 @@ def test_markdown_post_analysis_and_fetch_failure_status():
     assert failed["content_status"] == "fetch_failed"
 
 
+def test_german_faq_heading_is_detected_in_html_and_markdown():
+    html = analyze_post({
+        "url": "https://example.com/ratgeber",
+        "content_html": "<h1>Ratgeber</h1><h2>Häufige Fragen</h2><p>Antwort.</p>",
+    })
+    markdown = analyze_post({
+        "url": "https://example.com/ratgeber",
+        "content_md": "# Ratgeber\n\n## Häufig gestellte Fragen\n\nAntwort.",
+    })
+
+    assert html["faq_signal"] is True
+    assert markdown["faq_signal"] is True
+
+
 def test_html_fragment_is_analyzed_without_page_wrapper():
     result = parse_content_html("<h1>Title</h1><p>Body</p>", "https://example.com/post")
 

@@ -393,6 +393,101 @@ async def test_expired_execution_lease_recovery_classifies_remote_state_and_reje
 
 
 @pytest.mark.asyncio
+async def test_failed_action_can_be_reconciled_from_exact_readback_without_second_write() -> None:
+    failed = action()
+    failed.update(
+        {
+            "status": "failed",
+            "result": "readback_mismatch",
+            "execution_token": "original-write-token",
+            "execution_claimed_at": (datetime.now(UTC) - timedelta(hours=1)).isoformat(),
+            "execution_lease_expires_at": (datetime.now(UTC) - timedelta(minutes=30)).isoformat(),
+            "execution_attempt": 1,
+            "proposed_patch": {"title": "After"},
+            "approved_patch": {"title": "After"},
+            "submitted_patch": {"title": "After"},
+            "remote_response": {"raw": {"code": 0, "data": True}},
+            "article_id": "article-1",
+            "publish_task_id": "publish-1",
+            "effect_id": "effect-1",
+        }
+    )
+    store = MemoryStore(failed)
+
+    class ReadbackOnlyAdapter(Adapter):
+        async def recover(self, action: dict) -> dict:
+            assert action["status"] == "recovering"
+            assert self.writes == 0
+            return {
+                "recovery_status": "confirmed_applied",
+                "result": "updated",
+                "submitted_patch": {"title": "After"},
+                "readback": {"title": "After"},
+                "remote_response": {"remote_id": "2588676"},
+                "article_id": "article-1",
+                "publish_task_id": "publish-1",
+                "effect_id": "effect-1",
+                "target_url": "https://example.com/p/1",
+            }
+
+    adapter = ReadbackOnlyAdapter()
+    first = await service.recover_action(
+        store,
+        action_id="action-1",
+        adapter=adapter,
+        idempotency_key="reconcile-confirmed-write",
+    )
+    second = await service.recover_action(
+        store,
+        action_id="action-1",
+        adapter=adapter,
+        idempotency_key="reconcile-confirmed-write",
+    )
+
+    assert first["status"] == "completed"
+    assert first["result"] == "updated"
+    assert second == first
+    assert adapter.writes == 0
+    assert len(store.observations) == 1
+    assert store.action["article_id"] == "article-1"
+    assert store.action["publish_task_id"] == "publish-1"
+    assert store.action["effect_id"] == "effect-1"
+
+
+@pytest.mark.asyncio
+async def test_failed_action_confirmed_absent_stays_blocked_and_never_becomes_rewritable() -> None:
+    failed = action()
+    failed.update(
+        {
+            "status": "failed",
+            "result": "readback_mismatch",
+            "execution_token": "original-write-token",
+            "submitted_patch": {"title": "After"},
+            "remote_response": {"raw": {"code": 0, "data": True}},
+        }
+    )
+    store = MemoryStore(failed)
+
+    class AbsentAdapter(Adapter):
+        async def recover(self, action: dict) -> dict:
+            return {"recovery_status": "confirmed_absent"}
+
+    adapter = AbsentAdapter()
+    result = await service.recover_action(
+        store,
+        action_id="action-1",
+        adapter=adapter,
+        idempotency_key="reconcile-confirmed-absent",
+    )
+
+    assert result["status"] == "blocked"
+    assert result["result"] == "blocked"
+    assert store.action["recovery_status"] == "confirmed_absent"
+    assert adapter.writes == 0
+    assert store.observations == []
+
+
+@pytest.mark.asyncio
 async def test_rollback_is_capability_blocked_and_never_calls_writer() -> None:
     store, adapter = MemoryStore(action()), Adapter()
     preview = await service.rollback_preview(store, action_id="action-1")
@@ -403,7 +498,7 @@ async def test_rollback_is_capability_blocked_and_never_calls_writer() -> None:
 
 
 @pytest.mark.asyncio
-async def test_adapter_failure_becomes_auditable_fixed_failed_result() -> None:
+async def test_adapter_failure_becomes_auditable_unknown_remote_state() -> None:
     store, adapter = MemoryStore(action()), FailingAdapter()
     preview = await service.preview_action(
         store, action_id="action-1", patch={"title": "After"}, adapter=adapter
@@ -416,10 +511,44 @@ async def test_adapter_failure_becomes_auditable_fixed_failed_result() -> None:
         generation_mode="manual",
     )
     result = await service.execute_action(store, action_id="action-1", adapter=adapter)
-    assert result["result"] == "failed"
-    assert store.action["status"] == "failed"
+    assert result["result"] == "blocked"
+    assert store.action["status"] == "blocked"
+    assert store.action["recovery_status"] == "unknown_remote_state"
     assert store.exceptions[0]["type"] == "connector_error"
-    assert store.exceptions[0]["retryable"] is True
+    assert store.exceptions[0]["retryable"] is False
+    assert store.exceptions[0]["remote_write_occurred"] is None
+
+
+@pytest.mark.asyncio
+async def test_remote_outcome_blocked_result_creates_p1_exception_without_observation() -> None:
+    class UnknownAdapter(Adapter):
+        async def execute(self, _action):
+            return {
+                "result": "blocked",
+                "remote_outcome": "unknown_remote_state",
+                "remote_response": {"retry_policy": "manual_readback_required"},
+            }
+
+    store, adapter = MemoryStore(action()), UnknownAdapter()
+    preview = await service.preview_action(
+        store, action_id="action-1", patch={"title": "After"}, adapter=adapter
+    )
+    await service.approve_action(
+        store,
+        action_id="action-1",
+        snapshot_hash=preview["snapshot_hash"],
+        patch_hash=preview["patch_hash"],
+        generation_mode="manual",
+    )
+
+    result = await service.execute_action(store, action_id="action-1", adapter=adapter)
+
+    assert result["result"] == "blocked"
+    assert store.action["status"] == "blocked"
+    assert store.action["recovery_status"] == "unknown_remote_state"
+    assert store.action["observation_id"] is None
+    assert store.exceptions[0]["severity"] == "P1"
+    assert store.exceptions[0]["retryable"] is False
 
 
 def test_exception_redaction_is_recursive_and_fingerprint_aggregates_root_cause() -> None:

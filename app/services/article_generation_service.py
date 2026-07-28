@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.clients.ai_provider import generate_ai_content, is_stage_configured
 from app.clients.publishers import strip_markdown_frontmatter
 from app.clients.serpapi import fetch_google_serp, is_usable_serp_result
+from app.core.content_signals import has_faq_signal
 from app.engine.content_plan import image_plan_for, reference_plan
 from app.services.article_service import save_article
 from app.services.brief_service import build_brief_with_optional_ai
@@ -815,6 +816,4 @@ def _question_terms(value: str) -> set[str]:
 
 
 def _has_faq_heading(content: str, configured_patterns: list[str]) -> bool:
-    defaults = ("faq", "frequently asked questions", "常见问题", "preguntas frecuentes", "fragen und antworten")
-    lowered = content.casefold()
-    return any(pattern.casefold() in lowered for pattern in (*defaults, *configured_patterns))
+    return has_faq_signal(content, configured_patterns)

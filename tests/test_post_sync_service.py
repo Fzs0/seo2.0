@@ -186,6 +186,11 @@ async def test_site_sync_invalidates_update_effect_baseline_after_canonical_url_
 
     monkeypatch.setattr(post_sync_service, "publisher_for_site_runtime", runtime_connector)
     monkeypatch.setattr(post_sync_service, "persist_post_analysis", no_analysis)
+    monkeypatch.setattr(
+        post_sync_service,
+        "reconcile_article_public_url",
+        no_analysis,
+    )
     session = Session()
 
     result = await post_sync_service.sync_site_posts(

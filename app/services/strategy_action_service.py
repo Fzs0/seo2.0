@@ -5,13 +5,16 @@ import hashlib
 import json
 import re
 from datetime import UTC, datetime, timedelta
+from html import unescape
 from typing import Any, Protocol
+from urllib.parse import urlsplit, urlunsplit
 from uuid import uuid4
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.services.strategy_exception_service import record_exception
+from app.core.remote_outcomes import policy_for_remote_outcome
 
 RESULTS = {"created", "updated", "already_applied", "blocked", "failed", "readback_mismatch"}
 
@@ -382,7 +385,12 @@ async def execute_action(
     try:
         result = await (adapter or BlockedActionAdapter()).execute(action)
     except Exception as error:
-        action.update({"status": "failed", "result": "failed", "executed_at": _now()})
+        action.update({
+            "status": "blocked",
+            "result": "blocked",
+            "recovery_status": "unknown_remote_state",
+            "executed_at": _now(),
+        })
         await store.save(action)
         await store.record_exception(
             {
@@ -398,12 +406,12 @@ async def execute_action(
                 "summary": "The controlled action adapter failed.",
                 "raw_error": str(error),
                 "remote_write_occurred": None,
-                "retryable": True,
+                "retryable": False,
                 "responsibility_type": "connector_owner",
                 "unlock_condition": "Repair the connector and create a fresh preview before retrying.",
             }
         )
-        return _response(action, "failed")
+        return _response(action, "blocked")
     response = await complete_execution(
         store,
         action_id=action_id,
@@ -441,6 +449,8 @@ async def complete_execution(
         semantic = "failed"
     submitted_patch = dict(result.get("submitted_patch") or action.get("proposed_patch") or {})
     if semantic in {"blocked", "failed"}:
+        remote_outcome = result.get("remote_outcome")
+        outcome_policy = policy_for_remote_outcome(remote_outcome)
         action.update(
             {
                 "submitted_patch": submitted_patch,
@@ -451,9 +461,37 @@ async def complete_execution(
                 "result": semantic,
                 "field_differences": [],
                 "observation_id": None,
+                "recovery_status": remote_outcome or action.get("recovery_status"),
+                "article_id": result.get("article_id") or action.get("article_id"),
+                "execution_task_id": result.get("execution_task_id")
+                or action.get("execution_task_id"),
+                "publish_task_id": result.get("publish_task_id")
+                or action.get("publish_task_id"),
+                "effect_id": result.get("effect_id") or action.get("effect_id"),
             }
         )
         await store.save(action)
+        if outcome_policy and outcome_policy.task_status == "blocked":
+            exception = await store.record_exception(
+                {
+                    "run_id": action.get("run_id"),
+                    "action_id": action_id,
+                    "business_id": action.get("business_id"),
+                    "site_id": action.get("site_id"),
+                    "target_url": action.get("target_url"),
+                    "type": "remote_write_uncertain",
+                    "error_code": outcome_policy.error_code,
+                    "stage": "executing",
+                    "severity": outcome_policy.severity,
+                    "summary": "Remote write outcome requires manual readback before retry.",
+                    "remote_write_occurred": outcome_policy.remote_write_occurred,
+                    "retryable": outcome_policy.auto_retry_allowed,
+                    "responsibility_type": "human_operator",
+                    "unlock_condition": "Complete a fresh remote readback and resolve the exception.",
+                }
+            )
+            action["exception_id"] = exception.get("exception_id")
+            await store.save(action)
         return {
             **_response(action, semantic),
             **(
@@ -477,6 +515,13 @@ async def complete_execution(
             "executed_at": _now(),
             "result": semantic,
             "field_differences": differences,
+            "target_url": result.get("target_url") or action.get("target_url"),
+            "article_id": result.get("article_id") or action.get("article_id"),
+            "execution_task_id": result.get("execution_task_id")
+            or action.get("execution_task_id"),
+            "publish_task_id": result.get("publish_task_id")
+            or action.get("publish_task_id"),
+            "effect_id": result.get("effect_id") or action.get("effect_id"),
         }
     )
     await store.save(action)
@@ -525,39 +570,89 @@ async def recover_action(
     adapter: ActionAdapter | None = None,
     idempotency_key: str | None = None,
 ) -> dict[str, Any]:
-    """Recover an expired execution lease only after a remote readback classification."""
+    """Recover an expired or false-negative execution using read-only remote evidence."""
     action = await store.get(action_id, lock=True)
     request_hash = _hash({})
     replay = _idempotency_replay(action, "recover", idempotency_key, request_hash)
     if replay is not None:
         return replay
-    if action.get("status") != "executing":
+    original_status = str(action.get("status") or "")
+    terminal_reconciliation = original_status in {"failed", "blocked"}
+    if original_status != "executing" and not terminal_reconciliation:
         return {**_response(action, "blocked"), "block_reason": "action_not_executing"}
-    expires_at = _parse_time(action.get("execution_lease_expires_at"))
-    if expires_at is None or expires_at > datetime.now(UTC):
-        return {**_response(action, "blocked"), "block_reason": "execution_lease_active"}
+    if original_status == "executing":
+        expires_at = _parse_time(action.get("execution_lease_expires_at"))
+        if expires_at is None or expires_at > datetime.now(UTC):
+            return {**_response(action, "blocked"), "block_reason": "execution_lease_active"}
+    elif not action.get("submitted_patch") or not action.get("remote_response"):
+        return {
+            **_response(action, "blocked"),
+            "block_reason": "terminal_action_has_no_remote_write_evidence",
+        }
     recovery_token = str(uuid4())
-    action.update({"status": "recovering", "recovery_token": recovery_token})
+    action.update(
+        {
+            "status": "recovering",
+            "recovery_token": recovery_token,
+            "recovery_from_status": original_status,
+        }
+    )
     await store.save(action)
     recovery = await (adapter or BlockedActionAdapter()).recover(action)
     action = await store.get(action_id, lock=True)
     if action.get("recovery_token") != recovery_token:
         raise ValueError("stale recovery claim cannot submit results")
     status = recovery.get("recovery_status")
-    if status == "confirmed_not_applied":
-        action.update(
-            {
-                "status": "approved",
-                "execution_token": None,
-                "execution_claimed_at": None,
-                "execution_lease_expires_at": None,
-                "last_heartbeat_at": _now(),
-                "recovery_status": status,
-            }
-        )
+    if status in {"confirmed_not_applied", "confirmed_absent"}:
+        if terminal_reconciliation:
+            action.update(
+                {
+                    "status": "blocked",
+                    "result": "blocked",
+                    "last_heartbeat_at": _now(),
+                    "recovery_status": status,
+                }
+            )
+        else:
+            action.update(
+                {
+                    "status": "approved",
+                    "execution_token": None,
+                    "execution_claimed_at": None,
+                    "execution_lease_expires_at": None,
+                    "last_heartbeat_at": _now(),
+                    "recovery_status": status,
+                }
+            )
     elif status == "confirmed_applied":
         action.update({"last_heartbeat_at": _now(), "recovery_status": status})
+        if terminal_reconciliation:
+            action["execution_token"] = recovery_token
         action["status"] = "executing"
+        if terminal_reconciliation and not action.get("exception_id"):
+            exception = await store.record_exception(
+                {
+                    "run_id": action.get("run_id"),
+                    "action_id": action_id,
+                    "business_id": action.get("business_id"),
+                    "site_id": action.get("site_id"),
+                    "target_url": recovery.get("target_url") or action.get("target_url"),
+                    "type": "remote_write_reconciled",
+                    "error_code": "REMOTE_WRITE_RECONCILED",
+                    "stage": "reconciling",
+                    "severity": "P1",
+                    "status": "resolved",
+                    "summary": (
+                        "A previously failed local action was reconciled from an exact "
+                        "remote readback without repeating the write."
+                    ),
+                    "remote_write_occurred": True,
+                    "retryable": False,
+                    "responsibility_type": "connector_owner",
+                    "unlock_condition": "No further action; regression coverage prevents recurrence.",
+                }
+            )
+            action["exception_id"] = exception.get("exception_id")
         await store.save(action)
         response = await complete_execution(
             store,
@@ -569,6 +664,11 @@ async def recover_action(
                 "remote_response": recovery.get("remote_response"),
                 "readback": recovery.get("readback"),
                 "read_only_fields": recovery.get("read_only_fields") or [],
+                "target_url": recovery.get("target_url"),
+                "article_id": recovery.get("article_id"),
+                "execution_task_id": recovery.get("execution_task_id"),
+                "publish_task_id": recovery.get("publish_task_id"),
+                "effect_id": recovery.get("effect_id"),
             },
             allow_expired_lease=True,
         )
@@ -580,7 +680,11 @@ async def recover_action(
             {
                 "status": "blocked",
                 "result": "blocked",
-                "recovery_status": status if status in {"partially_applied", "unknown"} else "unknown",
+                "recovery_status": (
+                    status
+                    if status in {"partially_applied", "unknown_remote_state"}
+                    else "unknown_remote_state"
+                ),
             }
         )
         exception = await store.record_exception(
@@ -595,7 +699,7 @@ async def recover_action(
                 "stage": "executing",
                 "severity": "P1",
                 "summary": "Expired execution could not be safely classified as unapplied.",
-                "remote_write_occurred": status != "confirmed_not_applied",
+                "remote_write_occurred": True if status == "partially_applied" else None,
                 "retryable": False,
                 "responsibility_type": "human_operator",
                 "unlock_condition": "Verify the remote fields and explicitly resolve the action.",
@@ -652,8 +756,12 @@ def compare_readback_fields(
             continue
         submitted = submitted_patch.get(field)
         actual = readback.get(field)
-        approved_matches_submission = _normalize_value(expected) == _normalize_value(submitted)
-        remote_matches = _normalize_value(expected) == _normalize_value(actual)
+        approved_matches_submission = _normalize_value(expected, field=field) == _normalize_value(
+            submitted, field=field
+        )
+        remote_matches = _normalize_value(expected, field=field) == _normalize_value(
+            actual, field=field
+        )
         rows.append(
             {
                 "field": field,
@@ -795,9 +903,29 @@ def _response(action: dict[str, Any], result: str) -> dict[str, Any]:
     return {**action, "result": result}
 
 
-def _normalize_value(value: Any) -> Any:
+def _normalize_value(value: Any, *, field: str | None = None) -> Any:
     if value is None or value == "":
         return None
+    if field == "body":
+        plain = re.sub(r"<[^>]+>", " ", str(value))
+        # Images and ALT are validated as separate approved fields. Excluding
+        # them from body text keeps Markdown and connector-rendered HTML
+        # semantically comparable.
+        plain = re.sub(r"!\[[^\]]*\]\([^)]+\)", " ", plain)
+        plain = re.sub(r"\[([^\]]+)\]\([^)]+\)", r" \1 ", plain)
+        plain = re.sub(r"^#{1,6}\s*", "", plain, flags=re.M)
+        plain = re.sub(r"^\s*\d+[.)]\s+", "", plain, flags=re.M)
+        plain = re.sub(r"[*_`~>|-]+", " ", plain)
+        return re.sub(r"\s+", " ", unescape(plain)).strip()
+    if field == "images":
+        items = value if isinstance(value, list) else []
+        return sorted(_normalize_url(str(item)) for item in items)
+    if field == "image_alts":
+        items = value if isinstance(value, dict) else {}
+        return {
+            _normalize_url(str(src)): re.sub(r"\s+", " ", str(alt)).strip()
+            for src, alt in sorted(items.items())
+        }
     if isinstance(value, str):
         normalized = re.sub(r">\s+<", "><", value.strip())
         normalized = re.sub(r"\s+", " ", normalized)
@@ -805,10 +933,30 @@ def _normalize_value(value: Any) -> Any:
         normalized = re.sub(r"\s+<", "<", normalized)
         return normalized
     if isinstance(value, dict):
-        return {key: _normalize_value(child) for key, child in sorted(value.items())}
+        return {
+            key: _normalize_value(child)
+            for key, child in sorted(value.items())
+        }
     if isinstance(value, list):
         return [_normalize_value(child) for child in value]
     return value
+
+
+def _normalize_url(value: str) -> str:
+    raw = str(value or "").strip()
+    try:
+        split = urlsplit(raw)
+        return urlunsplit(
+            (
+                split.scheme.casefold(),
+                split.netloc.casefold(),
+                split.path,
+                split.query,
+                "",
+            )
+        )
+    except ValueError:
+        return raw
 
 
 def _observation_for(action: dict[str, Any]) -> dict[str, Any]:
@@ -825,6 +973,10 @@ def _observation_for(action: dict[str, Any]) -> dict[str, Any]:
         "generation_mode": action.get("generation_mode"),
         "generation_provider": action.get("generation_provider"),
         "generation_model": action.get("generation_model"),
+        "article_id": action.get("article_id"),
+        "execution_task_id": action.get("execution_task_id"),
+        "publish_task_id": action.get("publish_task_id"),
+        "effect_id": action.get("effect_id"),
         "before_evidence_snapshot": action.get("before_snapshot") or {},
         "executed_at": action.get("executed_at"),
         "checkpoints_days": [7, 14, 28, 56],

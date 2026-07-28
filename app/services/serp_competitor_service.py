@@ -7,6 +7,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from app.clients.http_client import ExternalCallError, request_text
+from app.core.content_signals import has_faq_signal
 
 
 async def fetch_competitor_pages(organic_results: list[dict[str, Any]], *, limit: int = 5) -> list[dict[str, Any]]:
@@ -170,7 +171,7 @@ def parse_content_html(source: str, url: str) -> dict[str, Any]:
         "image_count": candidate["images"] if candidate else 0,
         "internal_link_count": internal_links,
         "external_link_count": max(0, len(links) - internal_links),
-        "faq_signal": bool(re.search(r"\bfaq\b|frequently asked|common questions|常见问题", text, re.I)),
+        "faq_signal": has_faq_signal(text),
         "content_excerpt": text[:1800],
     }
 

@@ -63,7 +63,7 @@ def _site(**overrides: Any) -> dict[str, Any]:
 
 def test_build_oemapps_capability_is_safe_and_machine_readable() -> None:
     item = build_site_capability(
-        _site(),
+        _site(api_base_url="https://openapi.oemapps.com"),
         connectors=[
             {
                 "id": "connector",
@@ -85,8 +85,33 @@ def test_build_oemapps_capability_is_safe_and_machine_readable() -> None:
     assert item["supported_actions"]["delete_content"] == "forbidden"
     assert item["side_effects"]["product_seo"]["variant_recreation_possible"] is True
     assert item["side_effects"]["category_seo"]["membership_reset_possible"] is True
+    assert item["connectors"]["images"]["status"] == "available"
+    assert item["connectors"]["images"]["upload"] is True
+    assert {"images", "image_alts"} <= set(item["supported_fields"]["articles"])
     assert "api_config" not in item
     assert "token" not in str(item)
+
+
+def test_custom_blog_does_not_claim_unimplemented_image_upload() -> None:
+    item = build_site_capability(
+        _site(
+            site_type="blog",
+            is_main=False,
+            api_base_url="https://blog-api.example.com/api/open/v1",
+            api_config={
+                "connector_type": "custom_openapi",
+                "openApiKey": "configured",
+                "imageUploadPath": "/media/upload",
+            },
+        ),
+        connectors=[],
+        generated_at=datetime(2026, 7, 27, tzinfo=timezone.utc),
+    )
+
+    assert item["connectors"]["images"]["status"] == "unavailable"
+    assert item["connectors"]["images"]["upload"] is False
+    assert "images" not in item["supported_fields"]["articles"]
+    assert "image_alts" not in item["supported_fields"]["articles"]
 
 
 def test_missing_secret_is_misconfigured_and_never_writable() -> None:

@@ -471,10 +471,11 @@ async def ensure_effect(
                 },
             )
         if existing["status"] == "canceled":
+            existing_payload.pop("canceled_reason", None)
             await session.execute(
                 text(
                     "UPDATE seo_agent.tasks SET status = 'queued', finished_at = NULL, error_message = NULL, "
-                    "payload = payload || CAST(:payload AS jsonb), "
+                    "payload = (COALESCE(payload, '{}'::jsonb) - 'canceled_reason') || CAST(:payload AS jsonb), "
                     "decision = (COALESCE(decision, '{}'::jsonb) - 'canceled_reason') || CAST(:decision AS jsonb), "
                     "updated_at = now() WHERE id = CAST(:id AS uuid) AND status = 'canceled'"
                 ),
@@ -643,7 +644,9 @@ async def mark_effect_published(
             """
             UPDATE seo_agent.tasks
                SET article_id = CAST(:article_id AS uuid), target_url = :target_url, run_after = :run_after,
-                   payload = payload || CAST(:patch AS jsonb), updated_at = now()
+                   payload = (COALESCE(payload, '{}'::jsonb) - 'canceled_reason') || CAST(:patch AS jsonb),
+                   decision = COALESCE(decision, '{}'::jsonb) - 'canceled_reason',
+                   updated_at = now()
              WHERE task_type = 'review' AND status = 'queued' AND payload->>'kind' = 'strategy_effect'
                AND payload->>'execution_task_id' = :execution_task_id
             """

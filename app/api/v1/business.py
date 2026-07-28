@@ -30,6 +30,7 @@ from app.services.product_service import (
     list_products,
 )
 from app.services.post_sync_service import list_posts, sync_all_site_posts, sync_site_posts
+from app.services.article_url_reconciliation_service import reconcile_site_article_urls
 from app.services.keyword_query_service import build_analysis_queue, get_keyword, list_keywords
 from app.services.site_service import (
     delete_site,
@@ -653,6 +654,35 @@ async def sync_site_posts_route(
     session: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
     return await sync_site_posts(session, site_id=site_id, limit=(body.limit if body else 100))
+
+
+@router.post("/sites/{site_id}/articles/reconcile-public-urls")
+async def reconcile_site_article_urls_route(
+    site_id: str,
+    session: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    result = await reconcile_site_article_urls(session, site_id=site_id)
+    await session.commit()
+    return {"ok": result["failed"] == 0, "site_id": site_id, **result}
+
+
+@router.get("/sites/{site_id}/articles/lookup")
+async def lookup_remote_article_route(
+    site_id: str,
+    slug: str = Query(min_length=1, max_length=300),
+    session: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    site = await get_site(session, site_id)
+    if not site:
+        raise HTTPException(status_code=404, detail="site not found")
+    publisher = await publisher_for_site_runtime(
+        session,
+        dict(site),
+        dry_run=True,
+        require_active=False,
+    )
+    article = await publisher.find_article_by_slug(slug)
+    return {"ok": True, "site_id": site_id, "found": article is not None, "article": article}
 
 
 @router.post("/posts/sync-all")

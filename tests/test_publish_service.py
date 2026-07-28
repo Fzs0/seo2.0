@@ -38,6 +38,8 @@ class Session:
         if "UPDATE seo_agent.articles" in sql:
             self.article_updates.append(params)
             return Result()
+        if "UPDATE seo_agent.tasks" in sql:
+            return Result()
         if "FROM seo_agent.articles WHERE" in sql:
             return Result(self.article)
         if "FROM seo_agent.sites WHERE" in sql:
@@ -79,11 +81,34 @@ class Publisher:
         return self.found
 
 
+class UnknownRemotePublisher(Publisher):
+    async def publish(self, req: Any) -> PublishResult:
+        self.published += 1
+        return PublishResult(
+            ok=False,
+            dry_run=False,
+            error="create timed out and readback timed out",
+            remote_outcome="unknown_remote_state",
+            raw={"retry_policy": "manual_readback_required"},
+        )
+
+
+class IdentityConflictPublisher(Publisher):
+    async def find_article_by_slug(self, slug: str) -> dict[str, Any] | None:
+        raise RuntimeError("SHOPIFY_ARTICLE_IDENTITY_CONFLICT: blog_gid_or_handle")
+
+
 def _use_publisher(monkeypatch: pytest.MonkeyPatch, publisher: Publisher) -> None:
     async def resolve(*_args: Any, **_kwargs: Any) -> Publisher:
         return publisher
+    async def reconcile(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        return {"article_changes": 0, "task_changes": 0}
+    async def exception(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        return {"exception_id": "exception-id"}
 
     monkeypatch.setattr(publish_service, "publisher_for_site_runtime", resolve)
+    monkeypatch.setattr(publish_service, "reconcile_article_public_url", reconcile)
+    monkeypatch.setattr(publish_service, "record_exception", exception)
 
 
 def _article(**changes: Any) -> dict[str, Any]:
@@ -208,6 +233,97 @@ async def test_matching_slug_is_reused_without_creating(monkeypatch: pytest.Monk
     assert result["post_id"] == "42"
     assert publisher.published == 0
     assert len(session.article_updates) == 1
+
+
+@pytest.mark.asyncio
+async def test_unknown_remote_publish_is_persisted_as_blocked_p1(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = Session()
+    publisher = UnknownRemotePublisher()
+    _use_publisher(monkeypatch, publisher)
+
+    result = await publish_service.publish_article(
+        session, article_id="article-id", site_id=None, dry_run=False
+    )
+
+    assert result["ok"] is False
+    assert result["remote_outcome"] == "unknown_remote_state"
+    assert result["exception_id"] == "exception-id"
+    assert session.inserts[0]["status"] == "blocked"
+    assert json.loads(session.inserts[0]["payload"])["remote_outcome"] == "unknown_remote_state"
+    assert session.article_updates == []
+
+
+@pytest.mark.asyncio
+async def test_shopify_identity_conflict_blocks_before_create(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = Session()
+    publisher = IdentityConflictPublisher()
+    _use_publisher(monkeypatch, publisher)
+
+    result = await publish_service.publish_article(
+        session, article_id="article-id", site_id=None, dry_run=False
+    )
+
+    assert result["remote_outcome"] == "identity_conflict"
+    assert session.inserts[0]["status"] == "blocked"
+    assert publisher.published == 0
+
+
+@pytest.mark.asyncio
+async def test_oemapps_remote_detail_url_cannot_override_canonical_publish_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = Session(site=_site(
+        site_type="main",
+        domain="example.com",
+        base_url="https://example.com",
+        api_base_url="https://openapi.oemapps.com",
+    ))
+    publisher = Publisher()
+    publisher.remote = {
+        "id": 42,
+        "title": "Hello",
+        "slug": "hello",
+        "url": "https://example.com/blogs/detail/42",
+        "status": "published",
+    }
+    _use_publisher(monkeypatch, publisher)
+
+    result = await publish_service.publish_article(
+        session,
+        article_id="article-id",
+        site_id=None,
+        dry_run=False,
+    )
+
+    assert result["ok"] is True
+    assert result["url"] == "https://example.com/blogs/hello"
+    assert session.article_updates[0]["url"] == "https://example.com/blogs/hello"
+
+
+@pytest.mark.asyncio
+async def test_publish_audit_preserves_the_connector_raw_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = Session()
+    publisher = Publisher()
+    publisher.remote = _remote(status="published", raw_status="1")
+    _use_publisher(monkeypatch, publisher)
+
+    result = await publish_service.publish_article(
+        session,
+        article_id="article-id",
+        site_id=None,
+        dry_run=False,
+    )
+
+    assert result["ok"] is True
+    decision = json.loads(session.inserts[0]["decision"])
+    assert decision["remote_verification"]["remote"]["status"] == "published"
+    assert decision["remote_verification"]["remote"]["raw_status"] == "1"
 
 
 @pytest.mark.asyncio

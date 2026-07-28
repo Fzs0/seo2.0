@@ -472,6 +472,48 @@ async def retry_strategy_run(
         raise ValueError("strategy run not found")
     if original["status"] not in {"partial", "blocked", "failed", "canceled"}:
         raise ValueError("only partial, blocked, failed, or canceled runs can be retried")
+    root_run_id = original.get("root_run_id") or original["run_id"]
+    unresolved = (
+        await session.execute(
+            text(
+                """
+                WITH lineage AS (
+                    SELECT id::text AS run_id
+                      FROM seo_agent.tasks
+                     WHERE payload->>'kind' = :run_kind
+                       AND (
+                         id::text = :root_run_id
+                         OR payload->>'root_run_id' = :root_run_id
+                       )
+                )
+                SELECT COALESCE(
+                    payload->>'remote_outcome',
+                    payload->>'recovery_status',
+                    decision->>'remote_outcome'
+                )
+                  FROM seo_agent.tasks
+                 WHERE COALESCE(payload->>'run_id', payload->>'strategy_run_id')
+                       IN (SELECT run_id FROM lineage)
+                   AND COALESCE(
+                         payload->>'remote_outcome',
+                         payload->>'recovery_status',
+                         decision->>'remote_outcome'
+                       ) IN (
+                         'partially_applied',
+                         'unknown_remote_state',
+                         'identity_conflict'
+                       )
+                   AND status IN ('queued', 'running', 'blocked', 'failed')
+                 LIMIT 1
+                """
+            ),
+            {"root_run_id": root_run_id, "run_kind": RUN_KIND},
+        )
+    ).scalar_one_or_none()
+    if unresolved:
+        raise ValueError(
+            "REMOTE_STATE_REQUIRES_MANUAL_READBACK: resolve the uncertain remote outcome before retrying"
+        )
     return await create_strategy_run(
         session,
         business_id=original["business_id"],
@@ -483,7 +525,7 @@ async def retry_strategy_run(
         action_budget=original["action_budget"],
         site_quotas=original["site_quotas"],
         approval_policy=original["approval_policy"],
-        root_run_id=original.get("root_run_id") or original["run_id"],
+        root_run_id=root_run_id,
         attempt=int(original.get("attempt") or 1) + 1,
     )
 
@@ -621,8 +663,13 @@ async def run_strategy_run(
         stage = run["status"]
         await _stage_started(session, run_id, stage)
         planned = await _plan_all_sites(session, run=run, planner=planner)
+        planned = _bind_planned_actions(planned)
         planned = _apply_capability_gate(
             planned, run.get("capability_snapshot") or {}
+        )
+        planned = _restrict_plan_to_discovered_sites(
+            planned,
+            run.get("discovered_sites") or [],
         )
         if stage == "planning" and planned.get("replanned_after_hold_refresh"):
             run = await _complete_stage(
@@ -658,8 +705,13 @@ async def run_strategy_run(
             await _stage_started(session, run_id, "replanning")
             stage = "replanning"
             planned = await _plan_all_sites(session, run=run, planner=planner)
+            planned = _bind_planned_actions(planned)
             planned = _apply_capability_gate(
                 planned, run.get("capability_snapshot") or {}
+            )
+            planned = _restrict_plan_to_discovered_sites(
+                planned,
+                run.get("discovered_sites") or [],
             )
         summary = _summarize_plan(planned)
         if summary["discovered_site_count"] != summary["decided_site_count"]:
@@ -720,6 +772,13 @@ async def run_strategy_run(
     except Exception as error:
         if hasattr(session, "rollback"):
             await session.rollback()
+        if idempotency_key:
+            await _release_control_request(
+                session,
+                run_id=run_id,
+                operation="start",
+                key=idempotency_key,
+            )
         current = await get_strategy_run(session, run_id=run_id)
         if current and current["status"] not in TERMINAL_RUN_STATUSES:
             await append_strategy_run_event(
@@ -937,18 +996,24 @@ async def _create_unified_action(
         site_id=str(decision["site_id"]),
         action_type=action_type,
         target_url=decision.get("target_url") or decision.get("canonical_url"),
+        target_asset_id=decision.get("target_asset_id"),
+        source_strategy_task_id=decision.get("source_strategy_task_id"),
+        evidence_snapshot_id=run.get("evidence_snapshot_id"),
+        strategy_fingerprint=decision.get("strategy_fingerprint"),
+        evidence_fingerprint=decision.get("evidence_fingerprint"),
+        topic=decision.get("query"),
         idempotency_key=idempotency_key,
         risk_level=decision.get("risk_level") or "medium",
         approval_requirement="approval_required",
         capability_snapshot=capability_snapshot,
-        strategy_decision=decision,
+        strategy_decision=decision.get("strategy_decision") or decision,
     )
 
 
 async def _claim_control_request(
     session: AsyncSession, *, run_id: str, operation: str, key: str
 ) -> bool:
-    lock_key = f"strategy-run-control:{run_id}:{operation}:{key}"
+    lock_key = f"strategy-run-control:{run_id}:{key}"
     await session.execute(
         text("SELECT pg_advisory_xact_lock(hashtext(:key))"), {"key": lock_key}
     )
@@ -960,24 +1025,86 @@ async def _claim_control_request(
                    SET decision=jsonb_set(
                        decision, '{control_idempotency}',
                        COALESCE(decision->'control_idempotency','{}'::jsonb)
-                         || jsonb_build_object(:control_key, :operation),
+                         || jsonb_build_object(
+                              CAST(:control_key AS text),
+                              CAST(:operation AS text)
+                            ),
                        true),
                        updated_at=now()
                  WHERE id=CAST(:run_id AS uuid)
                    AND payload->>'kind'=:kind
                    AND NOT COALESCE(decision->'control_idempotency','{}'::jsonb)
-                           ? :control_key
+                           ? CAST(:control_key AS text)
                 RETURNING id
                 """
             ),
             {
                 "run_id": run_id, "kind": RUN_KIND,
-                "control_key": f"{operation}:{key}", "operation": operation,
+                "control_key": key, "operation": operation,
             },
         )
     ).first()
+    if row:
+        await session.commit()
+        return True
+
+    existing = (
+        await session.execute(
+            text(
+                """
+                SELECT decision->'control_idempotency'->>CAST(:control_key AS text)
+                  FROM seo_agent.tasks
+                 WHERE id=CAST(:run_id AS uuid)
+                   AND payload->>'kind'=:kind
+                """
+            ),
+            {"run_id": run_id, "kind": RUN_KIND, "control_key": key},
+        )
+    ).scalar_one_or_none()
     await session.commit()
-    return bool(row)
+    if existing == operation:
+        return False
+    if existing:
+        raise ValueError(
+            f"idempotency key is already bound to strategy run operation {existing}"
+        )
+    raise ValueError("strategy run not found")
+
+
+async def _release_control_request(
+    session: AsyncSession, *, run_id: str, operation: str, key: str
+) -> None:
+    """Remove a control receipt when the claimed operation fails before completion."""
+    lock_key = f"strategy-run-control:{run_id}:{key}"
+    await session.execute(
+        text("SELECT pg_advisory_xact_lock(hashtext(:key))"), {"key": lock_key}
+    )
+    await session.execute(
+        text(
+            """
+            UPDATE seo_agent.tasks
+               SET decision=jsonb_set(
+                   decision,
+                   '{control_idempotency}',
+                   COALESCE(decision->'control_idempotency','{}'::jsonb)
+                     - CAST(:control_key AS text),
+                   true
+               ),
+                   updated_at=now()
+             WHERE id=CAST(:run_id AS uuid)
+               AND payload->>'kind'=:kind
+               AND decision->'control_idempotency'->>CAST(:control_key AS text)
+                     = CAST(:operation AS text)
+            """
+        ),
+        {
+            "run_id": run_id,
+            "kind": RUN_KIND,
+            "control_key": key,
+            "operation": operation,
+        },
+    )
+    await session.commit()
 
 
 async def _load_run_actions(
@@ -1119,6 +1246,110 @@ def _summarize_plan(planned: dict[str, Any]) -> dict[str, Any]:
         "plan_id": plan.get("id"),
         "counts": counts,
         "site_results": decisions,
+    }
+
+
+def _bind_planned_actions(planned: dict[str, Any]) -> dict[str, Any]:
+    coverage = _attach_action_bindings(
+        dict(planned.get("coverage_matrix") or {}),
+        dict(planned.get("plan") or {}),
+    )
+    return {
+        **planned,
+        "decisions": list(coverage.get("decisions") or []),
+        "coverage_matrix": coverage,
+    }
+
+
+def _attach_action_bindings(
+    coverage: dict[str, Any],
+    plan: dict[str, Any],
+) -> dict[str, Any]:
+    """Bind each selected site decision to the exact persisted seo_strategy row.
+
+    ``generate_strategies`` persists one ``seo_strategy`` task per selected
+    candidate, but the coverage matrix historically retained only the candidate
+    ID.  Unified Actions need the persisted task identity so approval, article
+    generation, publishing, and recovery all operate on the same immutable
+    decision rather than trying to rediscover a "latest" row later.
+    """
+    by_candidate = {
+        str(item.get("candidate_id")): item
+        for item in plan.get("items") or []
+        if item.get("candidate_id") and item.get("id")
+    }
+    decisions: list[dict[str, Any]] = []
+    for raw in coverage.get("decisions") or []:
+        decision = dict(raw)
+        candidate_id = str(decision.get("selected_candidate_id") or "")
+        source = by_candidate.get(candidate_id)
+        if source:
+            action_type = str(
+                source.get("action_type")
+                or decision.get("action")
+                or source.get("strategy_type")
+                or ""
+            )
+            decision.update(
+                {
+                    "action": action_type,
+                    "source_strategy_task_id": str(source["id"]),
+                    "target_asset_id": (
+                        source.get("target_asset_id")
+                        or source.get("post_id")
+                        or source.get("article_id")
+                    ),
+                    "target_url": source.get("target_url")
+                    or source.get("canonical_url")
+                    or ((source.get("evidence") or {}).get("site_content") or {}).get(
+                        "published_url"
+                    ),
+                    "strategy_fingerprint": source.get("strategy_fingerprint"),
+                    "evidence_fingerprint": source.get("evidence_fingerprint"),
+                    "query": source.get("query"),
+                    "strategy_type": source.get("strategy_type"),
+                    "strategy_decision": {
+                        key: value
+                        for key, value in source.items()
+                        if key
+                        not in {
+                            "id",
+                            "candidate_id",
+                            "plan_id",
+                            "status",
+                            "created_at",
+                            "updated_at",
+                        }
+                    },
+                }
+            )
+        decisions.append(decision)
+    return {**coverage, "decisions": decisions}
+
+
+def _restrict_plan_to_discovered_sites(
+    planned: dict[str, Any],
+    discovered_sites: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Keep planner coverage identical to the run's enabled-site discovery snapshot."""
+    discovered_ids = {str(site["id"]) for site in discovered_sites}
+    coverage = dict(planned.get("coverage_matrix") or {})
+    decisions = [
+        decision
+        for decision in (coverage.get("decisions") or planned.get("decisions") or [])
+        if str(decision.get("site_id")) in discovered_ids
+    ]
+    return {
+        **planned,
+        "site_scope": discovered_sites,
+        "decisions": decisions,
+        "coverage_matrix": {
+            **coverage,
+            "discovered_site_count": len(discovered_sites),
+            "decided_site_count": len(decisions),
+            "decisions": decisions,
+            "complete": len(decisions) == len(discovered_sites),
+        },
     }
 
 

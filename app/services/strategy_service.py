@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.time_values import require_aware_datetime
 from app.engine.classifier import keyword_scope
 from app.services.strategy_execution import (
     _execution_heartbeat,
@@ -199,7 +200,10 @@ async def generate_strategies(
         {
             "site_id": site_id,
             "business_id": business_id,
-            "source_audit_scanned_at": source_audit["scanned_at"],
+            "source_audit_scanned_at": require_aware_datetime(
+                source_audit["scanned_at"],
+                field="source_audit_scanned_at",
+            ),
         },
     )
     candidate_rows = [dict(row) for row in rows.mappings().all()]
@@ -494,7 +498,7 @@ async def generate_strategies(
                        SET decision = decision || CAST(:marker AS jsonb),
                            updated_at = now()
                      WHERE id = CAST(:analysis_id AS uuid)
-                        OR payload->>'analysis_batch_id' = :analysis_id
+                        OR payload->>'analysis_batch_id' = CAST(:analysis_id AS text)
                     """
                 ),
                 {
@@ -1186,7 +1190,10 @@ async def save_strategy_plan(
         business_id=business_id,
         analysis_batch_id=analysis_batch_id,
         source_audit_batch_id=str(analysis_batch["source_audit_batch_id"]),
-        source_audit_scanned_at=str(analysis_batch["source_audit_scanned_at"]),
+        source_audit_scanned_at=require_aware_datetime(
+            analysis_batch["source_audit_scanned_at"],
+            field="source_audit_scanned_at",
+        ),
         action_budget=budget,
         site_quotas=quotas,
         candidates=selected,

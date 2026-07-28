@@ -21,6 +21,8 @@ from app.services.strategy_effect_service import (
     ensure_effect,
     mark_effect_published,
 )
+from app.core.remote_outcomes import policy_for_remote_outcome
+from app.services.strategy_exception_service import record_exception
 from app.services.strategy_decision_service import build_keywordless_new_article_context
 from app.core.config import get_settings
 
@@ -451,6 +453,7 @@ async def _execute_strategy(
             await heartbeat
     if result.get("status") == "done":
         article_id = (result.get("article") or {}).get("id")
+        published_url: str | None = None
         scheduled_payload = dict(execution.get("payload") or {})
         if (scheduled_payload.get("auto_publish") or execution["task_type"] == "update_article") and article_id:
             await session.execute(
@@ -478,14 +481,62 @@ async def _execute_strategy(
                 await session.commit()
                 return {"ok": False, "status": "failed", "execution_task_id": str(execution_id), "result": result, "error": str(error)}
             if not published.get("ok"):
+                remote_outcome = published.get("remote_outcome")
+                outcome_policy = policy_for_remote_outcome(remote_outcome)
                 await cancel_unpublished_effect(
                     session,
                     execution_task_id=str(execution_id),
                     reason=published.get("error") or "自动发布失败",
                 )
-                await _finish_execution_task(session, execution_id, status="failed", error_message=published.get("error") or "自动发布失败")
+                final_status = outcome_policy.task_status if outcome_policy else "failed"
+                await _finish_execution_task(
+                    session,
+                    execution_id,
+                    status=final_status,
+                    error_message=published.get("error") or "自动发布失败",
+                )
+                if outcome_policy and outcome_policy.task_status == "blocked":
+                    exception_id = published.get("exception_id")
+                    if not exception_id:
+                        exception = await record_exception(
+                            session,
+                            {
+                                "run_id": approved_decision.get("strategy_run_id"),
+                                "business_id": approved_decision.get("business_id"),
+                                "site_id": str(execution["site_id"]),
+                                "publish_task_id": published.get("task_id"),
+                                "execution_task_id": str(execution_id),
+                                "target_url": published.get("url"),
+                                "type": "remote_write_uncertain",
+                                "error_code": outcome_policy.error_code,
+                                "stage": "publishing",
+                                "severity": outcome_policy.severity,
+                                "summary": "Remote publish outcome blocks automatic execution retry.",
+                                "remote_write_occurred": outcome_policy.remote_write_occurred,
+                                "retryable": outcome_policy.auto_retry_allowed,
+                                "responsibility_type": "human_operator",
+                                "unlock_condition": "Complete a fresh remote readback and resolve the exception.",
+                            },
+                        )
+                        exception_id = exception["exception_id"]
+                    await session.execute(
+                        text(
+                            "UPDATE seo_agent.tasks SET payload = payload || "
+                            "jsonb_build_object('remote_outcome', CAST(:remote_outcome AS text), "
+                            "'publish_task_id', CAST(:publish_task_id AS text), "
+                            "'exception_id', CAST(:exception_id AS text)), updated_at=now() "
+                            "WHERE id=CAST(:id AS uuid)"
+                        ),
+                        {
+                            "id": execution_id,
+                            "remote_outcome": remote_outcome,
+                            "publish_task_id": published.get("task_id"),
+                            "exception_id": exception_id,
+                        },
+                    )
                 await session.commit()
-                return {"ok": False, "status": "failed", "execution_task_id": str(execution_id), "result": result, "publish": published}
+                return {"ok": False, "status": final_status, "execution_task_id": str(execution_id), "result": result, "publish": published}
+            published_url = str(published.get("url") or "").strip() or None
             try:
                 await mark_effect_published(
                     session,
@@ -504,10 +555,11 @@ async def _execute_strategy(
         await session.execute(
             text(
                 "UPDATE seo_agent.tasks SET status = 'done', article_id = CAST(:article_id AS uuid), "
+                "target_url = COALESCE(:target_url, target_url), "
                 "logs = COALESCE(logs, '[]'::jsonb) || jsonb_build_array(jsonb_build_object('stage', 'done', 'message', '文章生成并保存完成', 'at', now())), "
                 "finished_at = now(), updated_at = now() WHERE id = CAST(:id AS uuid)"
             ),
-            {"id": execution_id, "article_id": article_id},
+            {"id": execution_id, "article_id": article_id, "target_url": published_url},
         )
     else:
         failed = next((step for step in result.get("steps", []) if step.get("status") == "failed"), {})

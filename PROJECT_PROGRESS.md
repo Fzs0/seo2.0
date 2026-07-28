@@ -1,6 +1,6 @@
 # SEO Workbench 项目进度
 
-更新时间：2026-07-26（Asia/Shanghai）
+更新时间：2026-07-28（Asia/Shanghai）
 
 > 新窗口先阅读本文，再检查 `git status --short`。工作区有大量已有修改，禁止 `git reset --hard`、批量回滚或覆盖无关文件。
 >
@@ -23,9 +23,12 @@
 | 主站电商 SEO 内容分层 | 已实现只读 V1 | 可查看产品页/分类页/支持文章职责；主站文章候选和生文尚未接入 |
 | 自定义商品数据连接器 | 后端已实现并完成本地验证 | 通用连接器保持只读；支持配置、样例预览、真实请求测试、版本、激活、分页同步和 SEO 缺口审计；尚未制作前端配置页 |
 | 自建站 OEMApps 商品接口 | 后端已实现，待站点配置验收 | 所有自建站共用内置读取/修改协议，每站只配置 Token；SEO 修改要求预览、快照确认、单商品 PUT、审计和回读；Shopify 暂缓 |
+| SEO 自主运营后端 V2 | 人工审批执行版已实现 | PostgreSQL 17、完整 Strategy Run、全站覆盖、能力快照、统一 Action、执行租约、平台回读、异常脱敏和效果观察已接入；生产真实写 adapter 仍受认证与业务授权门禁阻塞 |
+| 内容审计长任务 | 已改为异步可轮询 | POST 快速返回批次，同业务进行中任务自动复用；客户端超时不再等同于审计失败 |
+| Strategy Run 启动 | SQL 根因已修复，待受控重放 | PG17 参数类型、同键重放、冲突检测和失败标记清理已通过真实数据库测试；原三个 queued Run 尚未重放 |
 | 当前运行环境 | 本轮源码已加载并通过指纹校验 | 本地 8000 后端健康，`source_drift=false`；后续源码变化必须重启 |
 
-当前最近的可执行动作是：等待 SerpApi 额度恢复或配置新密钥后，在“今日策略”重新扫描并生成候选，先人工批准 1 条低风险策略，核对策略、执行、发布和 `strategy_effect` 记录。真实验收完成前，不能把本轮代码描述为已上线闭环。
+当前最近的安全动作是：先对 HealthyOxy、Avinoti、Exdivo 现有三个 queued Strategy Run 做一次受控重放，只检查事件、站点覆盖矩阵、能力快照和 Action 预览，不批准或执行远端写入。三站回读通过后，再选择 1 条低风险动作进行人工审批验收。真实回读完成前，不能把 V2 描述为全自动生产上线。
 
 ### 2026-07-26 主项目稳定化检查点
 
@@ -38,6 +41,35 @@
 - 后端健康接口新增进程、Git revision、启动时/当前源码指纹和 `source_drift`；`backend-control.ps1` 会拒绝把漂移进程当作当前版本。
 - 默认 `pytest` 发现范围固定为主项目和共享社媒 Python 契约，排除 `knowledge/`、`.codex_tmp/`、`outputs/` 等本地副本，避免重复收集。
 - 完整验证：Python `397 passed`；主前端 `11 passed` 且生产构建通过；社媒前端 `4 passed` 且生产构建通过；两个执行器分别 `2 passed`、`22 passed`，两个浏览器扩展各 `1 passed`；Python compileall、Git diff 检查通过。运行中主后端健康，OpenAPI 为 138 个路径、151 个操作，站点、文章库存和本地文章接口冒烟均返回 200。
+
+### 2026-07-27 GA4 hostname 隔离与 Exdivo 历史清理
+
+- 根因确认：Exdivo Property `534571138` 同时接收 `exdivo.com`、复制站和 `*.jcysaas.cn` 后台流量；旧本地总览为 11,502 sessions / 24,622 pageviews，并非主站单域数据。
+- `GoogleSource` 新增统一 GA4 hostname 白名单；Exdivo 显式允许 `exdivo.com`、`www.exdivo.com`，Avinoti 显式允许 `avinoti.shop`、`www.avinoti.shop`。其他来源未显式配置时回退为各自 GSC 主域名及 `www`，不会再读取整个 Property。
+- `GA4Client` 的总览、渠道和落地页请求全部强制带 `hostName inListFilter`；超过 100,000 行时拒绝截断保存。
+- GA4 同步改为先完整取得三类报告，再在一个事务中按站点和日期范围替换两张本地表；落地页失败或异常为空时不删除旧数据。
+- 清理前已创建 `seo_agent.ga4_session_daily_backup_20260727_exdivo` 与 `seo_agent.ga4_landing_page_daily_backup_20260727_exdivo`。2026-05-01 至 2026-07-26 重建后主站总览为 39 行、5,870 sessions、5,465 users、13,661 pageviews；有效落地页 1,483 行。第二次重跑结果一致。
+- Avinoti 同期只检测到 `avinoti.shop` 流量，没有发现 `avinoti.jcysaas.cn` 或其他 hostname 污染；白名单已用于后续防护，未重写其历史。
+- 后端已重启，`source_drift=false`；公开 sources API 回读两站白名单正确，数据库健康和 sites API 均通过。
+- 完整主项目 Python 回归：`397 passed`；compileall 与 `git diff --check` 通过。
+
+### 2026-07-28 SEO 自主运营后端 V2 与异常修复
+
+- 独立提交 `0b45aed` 建立“安全人工审批执行版”后端：应用启动强制 PostgreSQL 17；Strategy Run 持久化阶段、事件、证据快照和全站覆盖矩阵；Site Capabilities 声明读写、审批、允许字段、副作用和连接器健康；统一 Action 保存 preview、审批哈希、执行租约、心跳、提交补丁、平台回读差异和效果观察。
+- Strategy Run 状态禁止从 planning 直接完成。`all_sites` 和 `selected_sites` 均逐站决策，发现站点集合与决策集合不一致时不得完成；可执行决策必须创建统一 Action 并携带该站点完整能力快照。
+- Action 审批绑定 `snapshot_hash + patch_hash + capability_snapshot_hash`。缺少能力声明、快照过期、字段越权、连接器异常或关键字段回读不一致时均阻塞；回读不一致创建 P1 异常且不创建正向观察。
+- 执行租约支持 Token、领取时间、到期时间、尝试次数和心跳。超时后必须先远端只读分类为未应用、已应用、部分应用或未知；旧 Token 和过期 Token 不能提交结果。
+- 平台在回读一致后按 Action 幂等创建第 7、14、28、56 天观察计划。URL、slug、canonical、redirect、删除、价格、库存、Variant、分类成员关系和未声明字段继续禁止。
+- 内容审计超过客户端 240 秒的问题已修复：`POST /api/v1/workflow/content-audit/scan` 立即返回持久化批次和 `poll_url`，`GET /api/v1/workflow/content-audit/scans/{batch_id}` 查询状态；同业务并发请求通过 advisory lock 复用一个 queued/running 批次。Exdivo 批次 `3917a44c-26e3-4ac0-be18-04904ac61753` 已确认完成，ANOM-001 标记为 resolved。
+- Strategy Run 启动 500 的根因已在真实 PG17 精确复现并修复：`jsonb_build_object` 的 key/value 与 JSONB 查询参数均显式转换为 text；同一幂等键重放原操作，改绑其他操作返回冲突，业务阶段失败时清理已领取标记。ANOM-002 当前为 mitigated/pending controlled replay。
+- PostgreSQL 17.10 发布门禁实际结果为 `9 passed`，覆盖全量 migration、031/032 双跑、Hold 多连接并发、Hold Token 超时接管、最新审计批次审批门禁、Action 并发幂等、Strategy Run 启动幂等和内容审计并发复用。普通全量回归为 `536 passed, 9 skipped`；PG17 项由独立门禁强制执行，缺少连接时门禁硬失败。
+- 本地 8000 后端已重启并加载当前源码，健康接口为 `source_drift=false`。本次未运行真实策略、未批准 Action、未调用生产 PUT，也未执行生产数据库迁移。
+- 当前限制：生产真实写 adapter 在全局认证和 business scope 授权完成前保持禁用；真实回滚和无审批自动执行仍阻塞；内容审计后台任务目前是进程内任务，进程崩溃后批次可见但尚无独立 worker 自动接管；2026-07-28 两项异常修复尚未形成 Git 提交。
+- 2026-07-28 发布异常第一轮源码修复完成：OEMApps 将 `1 / "1" / publish / published` 在连接器边界归一化为 `published` 并保留 `raw_status`；Shopify 已支持按 article handle 查重，创建 mutation 单次尝试，异常后只读回读恢复而不盲目重试写入；公开文章 URL 统一使用站点业务域，Exdivo、Avinoti、HealthyOxy 的 article、execution、publish task、effect task 四处一致性合同测试已通过。Shopify 图片上传列入第二轮，真实三站回读仍待用户验收。
+- 本轮发布异常验证：相关定向回归 `124 passed`，主项目普通全量回归 `546 passed, 9 skipped`；PostgreSQL `17.10` 独立发布门禁 `9 passed`。本地 8000 后端已通过 `start-backend.bat` 启动，健康接口 `source_drift=false`；未执行真实远端写入或 Strategy Run 重放。
+- 后端真实运行态复验补丁已完成：Strategy Run payload 时间统一严格解析；Run 规划覆盖严格收敛到启用站点发现快照；Shopify 查重使用 Blog+handle、cursor 分页和统一 `news` 默认值；创建异常返回四态远端事实；新增四处 URL 事务协调和站点级幂等修复接口。
+- 正式接口重放结果：Exdivo Run `a3aaa0e6-ba1f-495c-93c3-a3569ada1212` 为 `awaiting_approval`（6/6），Avinoti Run `a060e8c5-40f8-4bdb-8895-895f34fdc8ec` 为 `awaiting_approval`（1/1），HealthyOxy Run `f5088787-d162-4a80-a4d4-0d0ae7bdbad5` 为 `blocked`（1/1）。三站相关 article/execution/publish/effect 共检查 45 条任务，不一致 0、内部域名 0；幂等复跑 changed=0。
+- 本轮最终验证为普通全量 `556 passed, 13 skipped`、PG17 门禁 `13 passed`。HealthyOxy 真实只读 Shopify handle 查询返回既有 Article/Blog GID 和业务公开 URL；未批准 Action、未执行远端写入。数据库迁移：无。
 
 2026-07-21 自定义商品数据连接器后端 V1 已完成：新增只读 HTTPS 请求模板、域名白名单、分页、响应校验、字段映射、secret 加密、版本验证/激活、运行记录和产品幂等同步；产品同步后同时保存 TDK、canonical、图片 ALT 等 SEO 审计结果。ExDivo 提供的真实 104 条响应样例已全部成功映射，发现 49 条缺少 meta title、49 条缺少 meta description、461 张图片缺少 ALT。数据库迁移已应用到本地 `pg-workbench`，尚未重启 8000 端口进程；正式保存 token 前还需在 `.env` 配置 `CONNECTOR_SECRET_KEY`。当前仅负责安全读取、标准化和识别缺口，AI 修正与向上游写回仍未实现。
 
@@ -303,6 +335,16 @@ POST /api/v1/publish
 
 ## 6. 最近验证结果
 
+```text
+2026-07-28 当前主项目普通全量回归：536 passed, 9 skipped（PG17 集成项在无测试 DSN 时跳过）
+2026-07-28 PostgreSQL 17.10 独立发布门禁：9 passed，缺少 PG17 测试连接时硬失败
+2026-07-28 内容审计与 Strategy Run 针对性组合回归：36 passed
+2026-07-28 Python compileall：通过
+2026-07-28 git diff --check：通过，仅 Windows CRLF 提示
+2026-07-28 本地后端：健康，source_drift=false
+2026-07-28 远端写入：0；未运行真实策略、未批准 Action、未执行生产迁移
+```
+
 > 以下大部分为 2026-07-18 数据重置前的历史验证证据。当前策略候选、计划和执行数据已清空且 `articles=0`，不能把历史策略任务数当作现状。
 
 ```text
@@ -341,14 +383,14 @@ WordPress 线上修复：经用户明确确认，已使用已保存正文更新 
 
 ## 7. 新窗口正确开发顺序
 
-1. 用户手动通过根目录 `start-backend.bat` 重启；打开“主站内容”，验收 `exdivo` 的产品页、分类页、文章数量和 URL 分层。
-2. 实现主站 GSC/SERP 查询到产品页/分类页的关键词归属；每个搜索意图确定唯一主承接页，文章只承接信息和购买前问题。
-3. 在“主站内容”增加“创建内容候选”：目标产品/分类页、主题、意图、转化 URL、内链和事实来源必须完整。
-4. 复用现有 Brief → 大纲 → 文章 → QA 链路生成主站草稿；主站先只保存草稿，外站发布继续人工确认。
-5. 主站文章真实验收 1 篇后，再处理页面读取失败、title、description、H1、Product/Offer 数据和筛选 URL 等技术问题。
-6. 博客站策略仍按既有顺序单独验收：扫描 → 候选 → 今日计划 → 人工审核 → 执行 → 效果观察。
+1. 先把 2026-07-28 的内容审计和 Strategy Run 修复整理成独立提交，禁止混入当前 GA4、发布服务、YouTube 执行器、研究脚本、文章和图片改动。
+2. 对现有 HealthyOxy、Avinoti、Exdivo 三个 queued Run 做受控启动：只验证状态推进、事件、能力快照、证据、全部站点覆盖和 Action 预览；不得批准或执行远端写入。
+3. 三站覆盖矩阵通过后，选择 1 条允许字段明确、风险低、可独立回读的 Action 做人工审批执行验收；任何能力变化、快照变化或回读差异都必须停止。
+4. 完成全局身份认证和 business scope 授权；在此之前生产真实写 adapter 保持禁用。
+5. 为内容审计增加独立 worker 或启动恢复机制，处理进程崩溃后遗留的 queued/running 批次。
+6. 继续主站商业页面主线：实现 GSC/SERP 查询到产品页/分类页的意图归属，再生成绑定转化 URL 的支持文章候选。
 
-不要先做：旧内容编排恢复、打开主站普通 `strategy_enabled`、主站自动发布、批量改写 80 个页面 SEO 字段、无复盘数据时的 AI 全权接管。
+不要先做：无审批自动执行、真实批量写入、真实回滚、打开主站普通 `strategy_enabled`、批量改写页面 SEO 字段、无复盘数据时的 AI 全权接管。
 
 ## 8. 新窗口检查命令
 
@@ -356,11 +398,14 @@ WordPress 线上修复：经用户明确确认，已使用已保存正文更新 
 cd C:\Users\PC\Desktop\seo2.0
 git status --short
 Get-Content -Raw PROJECT_PROGRESS.md
+Get-Content -Raw docs\SEO_AUTONOMOUS_OPERATIONS_BACKEND_V2.md
+Get-Content -Raw logs\daily-content-strategy-2026-07-27\anomaly-report.md
 Get-Content -Raw TXT\strategy-close-loop-2026-07-17\strategy-closed-loop-2026-07-17.md
 Get-Content -Raw docs\MAIN_SITE_ECOMMERCE_SEO_V1.md
 docker compose ps
 Invoke-RestMethod http://127.0.0.1:8000/api/health
 docker exec pg-workbench psql -U seo -d seo_workbench -X -c "SELECT (SELECT count(*) FROM seo_agent.tasks) tasks, (SELECT count(*) FROM seo_agent.articles) articles;"
+.\scripts\test-pg17-release-gate.ps1
 Get-Item 'E:\Keywords\vape_pages_2026-06-25-US.xlsx'
 ```
 
@@ -418,3 +463,31 @@ Get-Item 'E:\Keywords\vape_pages_2026-06-25-US.xlsx'
 3. 在新一批策略执行前建立基线及 7 / 14 / 28 / 56 / 90 天效果追踪。
 4. 发布或更新成功后按远端 ID 回读，验证标题、正文摘要、URL 和状态。
 5. 把竞争文章结构从 SERP JSON 正式入库并进入策略排序。
+
+### 2026-07-28 后端根因修复批次
+
+- 修复 HealthyOxy `strategy_hold_refresh` 字段契约和 PostgreSQL aborted
+  transaction 污染；GSC/GA4 改为逐来源独立事务。
+- 建立 RemoteOutcome 唯一状态映射，贯通 Publish Task、Execution、Strategy
+  Action、Strategy Run 和 P1 Exception；未解除不确定状态时禁止 Run retry。
+- Shopify 查重升级为 blog GID + blog handle + article handle 三元身份校验。
+- 新增真实 PG17 入口级门禁：三站四处 URL、一轮失败后 retry payload 恢复、
+  Shopify timeout 五层落账、证据刷新事务隔离。
+- 验证：`568 passed, 16 skipped`；PG17 `14 passed`。
+- 真实 Run：Exdivo `ea2d267c-b6f7-4271-abbb-90bd2b9ec141` 与 Avinoti
+  `2806325c-1e30-4757-900a-be98fafff9c3` 到达 `awaiting_approval`。
+- HealthyOxy 的事务问题已修复，真实 GSC/GA4 刷新成功；当前被 Shopify
+  connection 缺少产品只读权限及权威来源证据安全阻断，未绕过门禁。
+
+### 2026-07-28 图片能力与效果任务状态一致性修复
+
+- 图片能力改为以实际连接器实现为准：OEMApps 主站保留图片上传；
+  普通 OpenAPI 博客不再因残留 `imageUploadPath` 而错误声明上传能力。
+- Site Capability、Strategy Action generation context 与 Publisher capability
+  已对齐；不支持上传的站点不再暴露 `images/image_alts` 或上传入口。
+- 效果任务从 canceled 恢复及确认发布时，同时清除 payload、decision 中的
+  过期 `canceled_reason`，历史审计事件继续保留。
+- 新增幂等迁移 `034_clear_stale_strategy_effect_cancel_reason.sql`；本地
+  `seo_workbench` 修复 4 条活动记录，活动状态残留计数为 0。
+- 验证：相关模块 `121 passed`；全量 `589 passed, 17 skipped`；PG17 门禁
+  `15 passed`；后端重启后 `source_drift=false`；无远端文章写入。
