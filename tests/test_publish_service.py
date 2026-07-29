@@ -55,7 +55,9 @@ class Session:
 class Publisher:
     def __init__(self) -> None:
         self.published = 0
+        self.publish_requests: list[Any] = []
         self.updated: list[str] = []
+        self.update_requests: list[Any] = []
         self.seo_synced: list[tuple[str, Any]] = []
         self.gets: list[str] = []
         self.found: dict[str, Any] | None = None
@@ -63,10 +65,12 @@ class Publisher:
 
     async def publish(self, req: Any) -> PublishResult:
         self.published += 1
+        self.publish_requests.append(req)
         return PublishResult(ok=True, dry_run=req.status == "draft", post_id=None if req.status == "draft" else "42")
 
     async def update(self, post_id: str, req: Any) -> PublishResult:
         self.updated.append(post_id)
+        self.update_requests.append(req)
         return PublishResult(ok=True, dry_run=req.status == "draft", post_id=None if req.status == "draft" else post_id)
 
     async def sync_seo_metadata(self, post_id: str, req: Any) -> PublishResult:
@@ -127,6 +131,7 @@ def _article(**changes: Any) -> dict[str, Any]:
         "language_code": "en",
         "market": "US",
         "qa_checklist": [{"key": "ok", "ok": True}],
+        "image_plan": [],
         "published_post_id": None,
         "published_url": None,
         "published_at": None,
@@ -186,6 +191,51 @@ async def test_dry_run_is_database_read_only(monkeypatch: pytest.MonkeyPatch) ->
     assert session.inserts == []
     assert session.article_updates == []
     assert session.commits == 0
+
+
+@pytest.mark.asyncio
+async def test_publish_request_uses_uploaded_cover_from_article_image_plan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cover_url = "https://site.example.com/wp-content/uploads/cover.png"
+    session = Session(
+        article=_article(
+            content_md=(
+                "# Hello\n\n"
+                "Useful body.\n\n"
+                "![Compatibility diagram](https://site.example.com/wp-content/uploads/body.png)"
+            ),
+            image_plan=[
+                {
+                    "role": "cover",
+                    "image_id": "501",
+                    "src": cover_url,
+                    "alt": "Replacement pod beside its charging dock",
+                },
+                {
+                    "role": "content",
+                    "src": "https://site.example.com/wp-content/uploads/body.png",
+                    "alt": "Compatibility diagram",
+                },
+            ],
+        )
+    )
+    publisher = Publisher()
+    _use_publisher(monkeypatch, publisher)
+
+    result = await publish_service.publish_article(
+        session,
+        article_id="article-id",
+        site_id=None,
+        dry_run=True,
+    )
+
+    assert result["ok"] is True
+    request = publisher.publish_requests[0]
+    assert request.image_cover_id == "501"
+    assert request.image_cover_url == cover_url
+    assert request.image_cover_alt == "Replacement pod beside its charging dock"
+    assert "![Compatibility diagram]" in request.content_md
 
 
 @pytest.mark.asyncio

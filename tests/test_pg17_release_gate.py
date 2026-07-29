@@ -28,6 +28,7 @@ from app.services.post_sync_service import sync_site_posts
 from app.services.strategy_run_service import (
     cancel_strategy_run,
     create_strategy_run,
+    list_strategy_runs,
     retry_strategy_run,
     run_strategy_run,
 )
@@ -70,6 +71,48 @@ async def test_pg17_full_migrations_and_repair_migrations_are_idempotent():
         assert await connection.fetchval("SELECT to_regclass('seo_agent.tasks')") is not None
     finally:
         await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_pg17_strategy_run_list_accepts_null_optional_filters():
+    sqlalchemy_dsn = _dsn().replace("postgresql://", "postgresql+asyncpg://", 1)
+    engine = create_async_engine(sqlalchemy_dsn)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    run_id = uuid4()
+    async with engine.begin() as connection:
+        await connection.exec_driver_sql(
+            """
+            INSERT INTO seo_agent.tasks
+              (id, task_type, status, priority, title, payload, decision)
+            VALUES
+              ($1::uuid, 'review', 'queued', 'P2', 'list filter regression',
+               jsonb_build_object(
+                 'kind', 'strategy_run',
+                 'business_id', 'pg17-list',
+                 'run_id', $1::text,
+                 'root_run_id', $1::text
+               ),
+               '{"status":"queued","current_stage":"queued"}'::jsonb)
+            """,
+            (run_id,),
+        )
+    try:
+        async with factory() as session:
+            unfiltered = await list_strategy_runs(session, limit=1)
+            scoped = await list_strategy_runs(
+                session,
+                business_id="pg17-list",
+                limit=1,
+            )
+        assert unfiltered
+        assert scoped[0]["run_id"] == str(run_id)
+    finally:
+        async with engine.begin() as connection:
+            await connection.exec_driver_sql(
+                "DELETE FROM seo_agent.tasks WHERE id=$1::uuid",
+                (run_id,),
+            )
+        await engine.dispose()
 
 
 @pytest.mark.asyncio

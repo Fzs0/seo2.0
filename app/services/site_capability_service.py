@@ -94,9 +94,15 @@ def build_site_capability(
             checked_at=generated_at,
             missing_code="article_connector_configuration_missing",
         )
-    if is_oemapps_site(safe_site):
+    if is_oemapps_site(safe_site) or _is_wordpress_site(safe_site):
         capability_health["images"] = _local_health(
-            available=True, checked_at=generated_at, upload=True
+            available=(
+                True
+                if is_oemapps_site(safe_site)
+                else _article_configuration_ready(safe_site)
+            ),
+            checked_at=generated_at,
+            upload=True,
         )
 
     actions = dict(contract["supported_actions"])
@@ -350,6 +356,15 @@ def _article_configuration_ready(site: dict[str, Any]) -> bool:
             or config.get("tokenB")
         )
     )
+
+
+def _is_wordpress_site(site: dict[str, Any]) -> bool:
+    config = _mapping(site.get("api_config"))
+    connector_type = str(config.get("connector_type") or "").casefold()
+    return str(site.get("site_type") or "").casefold() == "wp" or connector_type in {
+        "wp",
+        "wordpress",
+    }
 
 
 def _site_role(site: dict[str, Any]) -> str:

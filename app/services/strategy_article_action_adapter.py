@@ -32,7 +32,15 @@ from app.services.strategy_service import review_strategy
 
 ARTICLE_ACTIONS = frozenset({"new_article", "update_article"})
 ARTICLE_FIELDS = frozenset(
-    {"title", "body", "meta_title", "meta_description", "images", "image_alts"}
+    {
+        "title",
+        "body",
+        "meta_title",
+        "meta_description",
+        "images",
+        "image_alts",
+        "cover_image",
+    }
 )
 
 
@@ -355,6 +363,12 @@ async def get_article_generation_context(
         )
     ).mappings().all()
     image_patch_supported = _image_patch_supported(action)
+    cover_patch_supported = _cover_patch_supported(action)
+    optional_patch_fields = (
+        ["images", "image_alts"] if image_patch_supported else []
+    )
+    if cover_patch_supported:
+        optional_patch_fields.append("cover_image")
     return {
         "action_id": action_id,
         "run_id": action.get("run_id"),
@@ -372,9 +386,7 @@ async def get_article_generation_context(
             "meta_title",
             "meta_description",
         ],
-        "optional_patch_fields": (
-            ["images", "image_alts"] if image_patch_supported else []
-        ),
+        "optional_patch_fields": optional_patch_fields,
         "forbidden_patch_fields": [
             "slug",
             "url",
@@ -384,7 +396,7 @@ async def get_article_generation_context(
         ],
         "image_upload_endpoint": (
             f"/api/v1/sites/{action['site_id']}/images/upload"
-            if image_patch_supported
+            if image_patch_supported or cover_patch_supported
             else None
         ),
         "next_step": f"POST /api/v1/strategy-actions/{action_id}/preview",
@@ -418,7 +430,9 @@ async def _load_action_context(
                        post.content_md AS post_content_md,
                        post.content_html AS post_content_html,
                        post.meta_title AS post_meta_title,
-                       post.meta_description AS post_meta_description
+                       post.meta_description AS post_meta_description,
+                       post.cover_url AS post_cover_url,
+                       post.raw AS post_raw
                   FROM seo_agent.tasks strategy
                   JOIN seo_agent.sites site ON site.id=strategy.site_id
                   LEFT JOIN seo_agent.posts post
@@ -473,6 +487,27 @@ def canonical_article_patch(patch: dict[str, Any]) -> dict[str, Any]:
     body = str(patch.get("body") or "").strip()
     meta_title = str(patch.get("meta_title") or "").strip()
     meta_description = str(patch.get("meta_description") or "").strip()
+    raw_cover = patch.get("cover_image")
+    cover_image: dict[str, str] | None = None
+    if raw_cover is not None:
+        if not isinstance(raw_cover, dict):
+            raise ValueError("cover_image must be an uploaded media object")
+        cover_src = str(raw_cover.get("src") or raw_cover.get("url") or "").strip()
+        cover_id = str(
+            raw_cover.get("image_id") or raw_cover.get("id") or ""
+        ).strip()
+        cover_alt = str(raw_cover.get("alt") or "").strip()
+        if not cover_src.startswith(("http://", "https://")):
+            raise ValueError("cover_image src must be an absolute HTTP URL")
+        if not cover_id.isdigit():
+            raise ValueError("cover_image image_id must be a numeric media ID")
+        if not cover_alt:
+            raise ValueError("cover_image alt is required")
+        cover_image = {
+            "image_id": cover_id,
+            "src": cover_src,
+            "alt": cover_alt,
+        }
 
     images: list[str] = []
     alts: dict[str, str] = {}
@@ -508,6 +543,7 @@ def canonical_article_patch(patch: dict[str, Any]) -> dict[str, Any]:
         "meta_description": meta_description,
         "images": images,
         "image_alts": alts,
+        "cover_image": cover_image,
     }
 
 
@@ -526,17 +562,32 @@ def _image_patch_supported(action: dict[str, Any]) -> bool:
     )
 
 
+def _cover_patch_supported(action: dict[str, Any]) -> bool:
+    capability = action.get("capability_snapshot")
+    if not isinstance(capability, dict):
+        return False
+    fields = set(
+        ((capability.get("supported_fields") or {}).get("articles") or ())
+    )
+    images = (capability.get("connectors") or {}).get("images") or {}
+    return (
+        "cover_image" in fields
+        and images.get("status") == "available"
+        and images.get("upload") is True
+    )
+
+
 def _capability_filtered_article_patch(
     action: dict[str, Any],
     patch: dict[str, Any],
 ) -> dict[str, Any]:
-    if _image_patch_supported(action):
-        return patch
-    return {
-        field: value
-        for field, value in patch.items()
-        if field not in {"images", "image_alts"}
-    }
+    filtered = dict(patch)
+    if not _image_patch_supported(action):
+        filtered.pop("images", None)
+        filtered.pop("image_alts", None)
+    if not _cover_patch_supported(action):
+        filtered.pop("cover_image", None)
+    return filtered
 
 
 def _validate_article_patch(
@@ -560,6 +611,15 @@ def _validate_article_patch(
             raise ValueError(f"article image is not inserted in the body: {src}")
         if not patch["image_alts"].get(src):
             raise ValueError(f"article image is missing ALT text: {src}")
+    cover_image = patch.get("cover_image")
+    if cover_image and (
+        not str(cover_image.get("src") or "").startswith(("http://", "https://"))
+        or not str(cover_image.get("image_id") or "").isdigit()
+        or not str(cover_image.get("alt") or "").strip()
+    ):
+        raise ValueError(
+            "cover_image requires uploaded src, numeric image_id, and alt"
+        )
     checks = _qa(
         patch["body"],
         keyword,
@@ -581,6 +641,7 @@ def _before_snapshot(context: dict[str, Any]) -> dict[str, Any]:
             "meta_description": None,
             "images": [],
             "image_alts": {},
+            "cover_image": None,
         }
     body = str(context.get("post_content_md") or context.get("post_content_html") or "")
     return {
@@ -590,6 +651,21 @@ def _before_snapshot(context: dict[str, Any]) -> dict[str, Any]:
         "meta_description": context.get("post_meta_description"),
         "images": list(_extract_images(body)),
         "image_alts": _extract_images(body),
+        "cover_image": _context_cover_image(context),
+    }
+
+
+def _context_cover_image(context: dict[str, Any]) -> dict[str, str] | None:
+    src = str(context.get("post_cover_url") or "").strip()
+    raw = context.get("post_raw")
+    raw = raw if isinstance(raw, dict) else {}
+    image_id = str(raw.get("featured_media") or "").strip()
+    if not src and not image_id:
+        return None
+    return {
+        "src": src,
+        "image_id": image_id,
+        "alt": str(raw.get("featured_media_alt") or "").strip(),
     }
 
 
@@ -678,6 +754,22 @@ async def _save_action_article(
         patch["title"],
         strategy.get("internal_link_plan") or [],
     )
+    image_plan: list[dict[str, Any]] = []
+    if patch.get("cover_image"):
+        image_plan.append(
+            {
+                **dict(patch["cover_image"]),
+                "role": "cover",
+            }
+        )
+    image_plan.extend(
+        {
+            "src": src,
+            "alt": patch["image_alts"].get(src),
+            "role": "content",
+        }
+        for src in patch["images"]
+    )
     saved = await save_article(
         session,
         {
@@ -702,10 +794,7 @@ async def _save_action_article(
             "meta_description": patch["meta_description"],
             "primary_keyword": keyword,
             "internal_link_plan": strategy.get("internal_link_plan") or [],
-            "image_plan": [
-                {"src": src, "alt": patch["image_alts"].get(src)}
-                for src in patch["images"]
-            ],
+            "image_plan": image_plan,
             "references_plan": (
                 (strategy.get("execution_evidence") or {}).get("evidence_sources") or []
             ),
@@ -997,6 +1086,7 @@ def normalize_remote_article(remote: dict[str, Any]) -> dict[str, Any]:
         or meta.get("_yoast_wpseo_metadesc")
     )
     images = _extract_images(body)
+    cover_image = _extract_cover_image(remote)
     return {
         "title": title,
         "body": body,
@@ -1004,6 +1094,44 @@ def normalize_remote_article(remote: dict[str, Any]) -> dict[str, Any]:
         "meta_description": meta_description,
         "images": list(images),
         "image_alts": images,
+        "cover_image": cover_image,
+    }
+
+
+def _extract_cover_image(remote: dict[str, Any]) -> dict[str, str] | None:
+    media_id = str(
+        remote.get("featured_media")
+        or remote.get("image_cover_id")
+        or remote.get("cover_image_id")
+        or remote.get("image_id")
+        or ""
+    ).strip()
+    src = str(
+        remote.get("image_cover_url")
+        or remote.get("cover_url")
+        or remote.get("src")
+        or ""
+    ).strip()
+    alt = str(
+        remote.get("image_cover_alt")
+        or remote.get("cover_alt")
+        or remote.get("image_alt")
+        or ""
+    ).strip()
+    embedded = remote.get("_embedded")
+    embedded = embedded if isinstance(embedded, dict) else {}
+    featured = embedded.get("wp:featuredmedia")
+    media = featured[0] if isinstance(featured, list) and featured else {}
+    media = media if isinstance(media, dict) else {}
+    media_id = str(media.get("id") or media_id).strip()
+    src = str(media.get("source_url") or media.get("url") or src).strip()
+    alt = str(media.get("alt_text") or media.get("alt") or alt).strip()
+    if not media_id and not src:
+        return None
+    return {
+        "image_id": media_id,
+        "src": _normalize_url(src),
+        "alt": re.sub(r"\s+", " ", unescape(alt)).strip(),
     }
 
 
@@ -1024,7 +1152,20 @@ def _extract_images(body: str) -> dict[str, str]:
 
 def _semantic_value(field: str, value: Any) -> Any:
     if field == "body":
-        plain = re.sub(r"<[^>]+>", " ", str(value or ""))
+        plain = str(value or "")
+        # Publishers such as WordPress store the article title separately and
+        # omit the submitted Markdown H1 from the persisted body.
+        plain = re.sub(r"<h1\b[^>]*>.*?</h1>", " ", plain, flags=re.I | re.S)
+        plain = re.sub(r"^#\s+.*(?:\r?\n|$)", " ", plain, count=1, flags=re.M)
+        # Preserve semantic boundaries before stripping rendered HTML so table
+        # cells and list items do not collapse into different tokens.
+        plain = re.sub(
+            r"</(?:p|li|h[2-6]|td|th|tr|blockquote|figure|div|ul|ol|table)>",
+            " ",
+            plain,
+            flags=re.I,
+        )
+        plain = re.sub(r"<[^>]+>", " ", plain)
         # Images and ALT are compared as independent approved fields. Keeping
         # Markdown ALT text here creates a false body mismatch after OEMApps
         # renders the same image as an HTML tag.
@@ -1042,6 +1183,19 @@ def _semantic_value(field: str, value: Any) -> Any:
         return {
             _normalize_url(str(src)): re.sub(r"\s+", " ", str(alt)).strip()
             for src, alt in sorted(values.items())
+        }
+    if field == "cover_image":
+        cover = value if isinstance(value, dict) else {}
+        if not cover:
+            return None
+        return {
+            "image_id": str(cover.get("image_id") or "").strip(),
+            "src": _normalize_url(str(cover.get("src") or "")),
+            "alt": re.sub(
+                r"\s+",
+                " ",
+                unescape(str(cover.get("alt") or "")),
+            ).strip(),
         }
     return re.sub(r"\s+", " ", unescape(str(value or ""))).strip()
 

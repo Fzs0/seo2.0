@@ -6,6 +6,7 @@ import ipaddress
 import json
 import socket
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urljoin, urlparse
 
@@ -23,6 +24,13 @@ class ConnectorHttpError(RuntimeError):
 
 class ConnectorResponseTooLarge(ConnectorHttpError):
     """The decoded response exceeded its configured byte budget."""
+
+
+@dataclass(frozen=True)
+class BinaryHttpResponse:
+    content: bytes
+    content_type: str
+    final_url: str
 
 
 async def resolve_host(host: str, port: int) -> list[str]:
@@ -134,9 +142,96 @@ class SafeJsonHttpClient:
                 raise ConnectorSecurityError("connector DNS target must resolve only to public addresses")
 
 
+class SafeBinaryHttpClient(SafeJsonHttpClient):
+    """Download bounded image bytes with the same DNS and redirect policy."""
+
+    async def get(
+        self,
+        *,
+        url: str,
+        allowed_hosts: set[str],
+        headers: dict[str, str] | None = None,
+        max_response_bytes: int = 10 * 1024 * 1024,
+        timeout_seconds: float = 30,
+        max_redirects: int = 3,
+    ) -> BinaryHttpResponse:
+        current_url = url
+        allowed = {host.lower().strip(".") for host in allowed_hosts}
+        for redirect_count in range(max_redirects + 1):
+            await self._validate_target(current_url, allowed)
+            try:
+                async with self._client.stream(
+                    "GET",
+                    current_url,
+                    headers=headers,
+                    timeout=httpx.Timeout(timeout_seconds),
+                    follow_redirects=False,
+                ) as response:
+                    if response.status_code in {301, 302, 303, 307, 308}:
+                        if redirect_count >= max_redirects:
+                            raise ConnectorHttpError(
+                                "connector redirect limit exceeded"
+                            )
+                        location = response.headers.get("Location")
+                        if not location:
+                            raise ConnectorHttpError(
+                                "connector redirect did not include Location"
+                            )
+                        current_url = urljoin(current_url, location)
+                        continue
+                    try:
+                        response.raise_for_status()
+                    except httpx.HTTPStatusError as error:
+                        raise ConnectorHttpError(
+                            f"connector returned HTTP {response.status_code}"
+                        ) from error
+                    declared = response.headers.get("Content-Length")
+                    if declared:
+                        try:
+                            if int(declared) > max_response_bytes:
+                                raise ConnectorResponseTooLarge(
+                                    "connector response exceeds configured byte limit"
+                                )
+                        except ValueError:
+                            pass
+                    content_type = (
+                        response.headers.get("Content-Type", "")
+                        .split(";", 1)[0]
+                        .strip()
+                        .lower()
+                    )
+                    if not content_type.startswith("image/"):
+                        raise ConnectorHttpError(
+                            "connector response must use an image content type"
+                        )
+                    chunks: list[bytes] = []
+                    total = 0
+                    async for chunk in response.aiter_bytes():
+                        total += len(chunk)
+                        if total > max_response_bytes:
+                            raise ConnectorResponseTooLarge(
+                                "connector response exceeds configured byte limit"
+                            )
+                        chunks.append(chunk)
+                    return BinaryHttpResponse(
+                        content=b"".join(chunks),
+                        content_type=content_type,
+                        final_url=current_url,
+                    )
+            except (ConnectorHttpError, ConnectorSecurityError):
+                raise
+            except (httpx.HTTPError, asyncio.TimeoutError) as error:
+                raise ConnectorHttpError(
+                    f"connector request failed: {type(error).__name__}"
+                ) from error
+        raise ConnectorHttpError("connector redirect limit exceeded")
+
+
 __all__ = [
+    "BinaryHttpResponse",
     "ConnectorHttpError",
     "ConnectorResponseTooLarge",
+    "SafeBinaryHttpClient",
     "SafeJsonHttpClient",
     "resolve_host",
 ]

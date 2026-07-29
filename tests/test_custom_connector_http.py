@@ -4,8 +4,10 @@ import httpx
 import pytest
 
 from app.connectors.safe_http import (
+    BinaryHttpResponse,
     ConnectorHttpError,
     ConnectorResponseTooLarge,
+    SafeBinaryHttpClient,
     SafeJsonHttpClient,
 )
 from app.connectors.custom_data import ConnectorSecurityError
@@ -122,4 +124,69 @@ async def test_safe_client_rejects_non_json_and_invalid_json() -> None:
         await client.request_json(**kwargs)
     with pytest.raises(ConnectorHttpError, match="invalid JSON"):
         await client.request_json(**kwargs)
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_safe_binary_client_downloads_a_bounded_public_image() -> None:
+    png = b"\x89PNG\r\n\x1a\n" + b"image-payload"
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"Content-Type": "image/png"},
+            content=png,
+        )
+
+    client = SafeBinaryHttpClient(
+        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        resolver=public_resolver,
+    )
+    result = await client.get(
+        url="https://cdn.example.com/hero.png",
+        allowed_hosts={"cdn.example.com"},
+        max_response_bytes=1024,
+    )
+    await client.aclose()
+
+    assert result == BinaryHttpResponse(
+        content=png,
+        content_type="image/png",
+        final_url="https://cdn.example.com/hero.png",
+    )
+
+
+@pytest.mark.asyncio
+async def test_safe_binary_client_revalidates_redirect_and_rejects_non_images() -> None:
+    responses = iter(
+        [
+            httpx.Response(
+                302,
+                headers={"Location": "https://private.example.com/image.png"},
+            ),
+            httpx.Response(
+                200,
+                headers={"Content-Type": "text/html"},
+                content=b"<html></html>",
+            ),
+        ]
+    )
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        return next(responses)
+
+    client = SafeBinaryHttpClient(
+        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        resolver=public_resolver,
+    )
+    with pytest.raises(ConnectorSecurityError, match="allowlisted"):
+        await client.get(
+            url="https://cdn.example.com/hero.png",
+            allowed_hosts={"cdn.example.com"},
+        )
+    with pytest.raises(ConnectorHttpError, match="image content type"):
+        await client.get(
+            url="https://cdn.example.com/hero.png",
+            allowed_hosts={"cdn.example.com"},
+        )
     await client.aclose()

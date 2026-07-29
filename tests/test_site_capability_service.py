@@ -87,7 +87,7 @@ def test_build_oemapps_capability_is_safe_and_machine_readable() -> None:
     assert item["side_effects"]["category_seo"]["membership_reset_possible"] is True
     assert item["connectors"]["images"]["status"] == "available"
     assert item["connectors"]["images"]["upload"] is True
-    assert {"images", "image_alts"} <= set(item["supported_fields"]["articles"])
+    assert {"images", "image_alts", "cover_image"} <= set(item["supported_fields"]["articles"])
     assert "api_config" not in item
     assert "token" not in str(item)
 
@@ -112,6 +112,32 @@ def test_custom_blog_does_not_claim_unimplemented_image_upload() -> None:
     assert item["connectors"]["images"]["upload"] is False
     assert "images" not in item["supported_fields"]["articles"]
     assert "image_alts" not in item["supported_fields"]["articles"]
+
+
+def test_wordpress_capability_declares_media_upload_and_cover_fields() -> None:
+    item = build_site_capability(
+        _site(
+            site_type="wp",
+            is_main=False,
+            api_base_url=None,
+            api_config={
+                "username": "admin",
+                "applicationPassword": "configured",
+            },
+        ),
+        connectors=[],
+        generated_at=datetime(2026, 7, 29, tzinfo=timezone.utc),
+    )
+
+    assert item["connectors"]["images"]["status"] == "available"
+    assert item["connectors"]["images"]["upload"] is True
+    assert {
+        "images",
+        "image_alts",
+        "cover_image",
+    } <= set(item["supported_fields"]["articles"])
+    assert item["supported_actions"]["new_article"] == "approval_required"
+    assert item["supported_actions"]["update_article"] == "approval_required"
 
 
 def test_missing_secret_is_misconfigured_and_never_writable() -> None:

@@ -907,7 +907,21 @@ def _normalize_value(value: Any, *, field: str | None = None) -> Any:
     if value is None or value == "":
         return None
     if field == "body":
-        plain = re.sub(r"<[^>]+>", " ", str(value))
+        plain = str(value)
+        # WordPress stores the post title separately and removes the Markdown
+        # H1 from the body. The title is compared as its own approved field, so
+        # exclude a body H1 on either representation before semantic comparison.
+        plain = re.sub(r"<h1\b[^>]*>.*?</h1>", " ", plain, flags=re.I | re.S)
+        plain = re.sub(r"^#\s+.*(?:\r?\n|$)", " ", plain, count=1, flags=re.M)
+        # Preserve boundaries between block, list, and table cells before tags
+        # are removed; otherwise adjacent HTML cells collapse into one token.
+        plain = re.sub(
+            r"</(?:p|li|h[2-6]|td|th|tr|blockquote|figure|div|ul|ol|table)>",
+            " ",
+            plain,
+            flags=re.I,
+        )
+        plain = re.sub(r"<[^>]+>", " ", plain)
         # Images and ALT are validated as separate approved fields. Excluding
         # them from body text keeps Markdown and connector-rendered HTML
         # semantically comparable.
@@ -925,6 +939,19 @@ def _normalize_value(value: Any, *, field: str | None = None) -> Any:
         return {
             _normalize_url(str(src)): re.sub(r"\s+", " ", str(alt)).strip()
             for src, alt in sorted(items.items())
+        }
+    if field == "cover_image":
+        cover = value if isinstance(value, dict) else {}
+        if not cover:
+            return None
+        return {
+            "image_id": str(cover.get("image_id") or "").strip(),
+            "src": _normalize_url(str(cover.get("src") or "")),
+            "alt": re.sub(
+                r"\s+",
+                " ",
+                unescape(str(cover.get("alt") or "")),
+            ).strip(),
         }
     if isinstance(value, str):
         normalized = re.sub(r">\s+<", "><", value.strip())

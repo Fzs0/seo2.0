@@ -48,6 +48,27 @@ def test_article_patch_is_canonical_and_rejects_url_fields() -> None:
         service.canonical_article_patch({**_patch(), "slug": "must-not-change"})
 
 
+def test_article_patch_keeps_uploaded_cover_media_identity() -> None:
+    cover_url = "https://site.example.com/wp-content/uploads/cover.png"
+
+    patch = service.canonical_article_patch(
+        {
+            **_patch(),
+            "cover_image": {
+                "image_id": "501",
+                "src": cover_url,
+                "alt": "Replacement pod beside its charging dock",
+            },
+        }
+    )
+
+    assert patch["cover_image"] == {
+        "image_id": "501",
+        "src": cover_url,
+        "alt": "Replacement pod beside its charging dock",
+    }
+
+
 def test_article_readback_compares_markdown_with_remote_html_semantically() -> None:
     body = "# Guide\n\n## Details\n\nA clear buyer answer."
     differences = compare_readback_fields(
@@ -91,6 +112,43 @@ def test_article_readback_ignores_separately_verified_image_and_list_markup() ->
     assert differences[0]["match"] is True
 
 
+def test_article_readback_accepts_wordpress_body_without_title_h1_and_with_table_blocks() -> None:
+    markdown = (
+        "# Foger Vape Refill Guide\n\n"
+        "A sealed replacement pod is replaced rather than opened.\n\n"
+        "## Compatibility\n\n"
+        "| Component | Action |\n"
+        "| --- | --- |\n"
+        "| Pod | Replace |\n"
+        "| Dock | Keep |\n\n"
+        "1. Check the package.\n"
+        "2. Confirm the dock."
+    )
+    wordpress = (
+        "<!-- wp:paragraph --><p>A sealed replacement pod is replaced rather than opened.</p>"
+        "<!-- /wp:paragraph -->"
+        '<!-- wp:heading {"level":2} --><h2>Compatibility</h2><!-- /wp:heading -->'
+        "<!-- wp:table --><figure><table><thead><tr>"
+        "<th>Component</th><th>Action</th></tr></thead><tbody>"
+        "<tr><td>Pod</td><td>Replace</td></tr>"
+        "<tr><td>Dock</td><td>Keep</td></tr>"
+        "</tbody></table></figure><!-- /wp:table -->"
+        "<!-- wp:list --><ol><li>Check the package.</li>"
+        "<li>Confirm the dock.</li></ol><!-- /wp:list -->"
+    )
+
+    differences = compare_readback_fields(
+        {"body": markdown},
+        {"body": markdown},
+        {"body": wordpress},
+    )
+
+    assert differences[0]["match"] is True
+    assert service._semantic_value("body", markdown) == service._semantic_value(
+        "body", wordpress
+    )
+
+
 def test_oemapps_meta_description_alias_is_normalized() -> None:
     readback = service.normalize_remote_article(
         {
@@ -102,6 +160,38 @@ def test_oemapps_meta_description_alias_is_normalized() -> None:
     )
 
     assert readback["meta_description"] == "A complete description returned by OEMApps."
+
+
+def test_wordpress_featured_media_is_normalized_and_compared() -> None:
+    cover = {
+        "image_id": "501",
+        "src": "https://site.example.com/wp-content/uploads/cover.png",
+        "alt": "Replacement pod beside its charging dock",
+    }
+    readback = service.normalize_remote_article(
+        {
+            "title": {"rendered": "Guide"},
+            "content": {"rendered": "<p>Body</p>"},
+            "featured_media": 501,
+            "_embedded": {
+                "wp:featuredmedia": [
+                    {
+                        "id": 501,
+                        "source_url": cover["src"],
+                        "alt_text": cover["alt"],
+                    }
+                ]
+            },
+        }
+    )
+
+    assert readback["cover_image"] == cover
+    differences = compare_readback_fields(
+        {"cover_image": cover},
+        {"cover_image": cover},
+        readback,
+    )
+    assert differences[0]["match"] is True
 
 
 @pytest.mark.asyncio

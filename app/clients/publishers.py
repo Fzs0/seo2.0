@@ -13,18 +13,21 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import hashlib
 from html import escape
+from pathlib import Path
 import re
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timezone
 from typing import Any
 from urllib.parse import quote, urlsplit, urlunsplit
 
 import structlog
 
 from app.clients.http_client import ExternalCallError, request_json
+from app.connectors.safe_http import ConnectorHttpError, SafeBinaryHttpClient
 from app.core.article_urls import is_oemapps_site, resolve_article_public_url
 from app.core.config import get_settings
 
@@ -45,6 +48,9 @@ class PublishRequest:
     author: str | None = None
     category_id: str | None = None
     image_cover_url: str | None = None
+    image_cover_id: str | None = None
+    image_cover_alt: str | None = None
+    published_at: str | None = None
 
 
 @dataclass
@@ -67,6 +73,10 @@ class ImageUploadRequest:
     url: str | None = None
     file: str | None = None
     base64: str | None = None
+    filename: str | None = None
+    alt_text: str | None = None
+    title: str | None = None
+    caption: str | None = None
 
     def payload(self) -> dict[str, str]:
         upload_type = str(self.type or "").strip().casefold()
@@ -658,7 +668,7 @@ class OpenAPIPublisher(PublisherBase):
         body: dict[str, Any] = {
             "title": req.title,
             "handle": req.slug,
-            "content": oemapps_html_from_markdown(content_md),
+            "content": oemapps_html_from_markdown(content_md, req.title),
             "status": 1 if req.status in {"publish", "published"} else 0,
             "descript": description,
             "meta_title": req.meta_title or req.title,
@@ -667,12 +677,31 @@ class OpenAPIPublisher(PublisherBase):
             "author_name": req.author or (self.site.get("api_config") or {}).get("defaultAuthor") or "admin",
             "related_product_ids": [],
             "is_top": 0,
+            # OEMApps exposes this field as a date string.  Sending a full ISO
+            # timestamp is rejected by its article endpoint and omitting it
+            # leaves some storefront templates with their epoch-date fallback.
+            "published_at": _oemapps_published_date(req.published_at),
         }
         if req.image_cover_url:
             body["src"] = req.image_cover_url
+        if str(req.image_cover_id or "").isdigit():
+            body["image_id"] = int(str(req.image_cover_id))
         if str(req.category_id or "").isdigit():
             body["news_id"] = int(str(req.category_id))
         return body
+
+
+def _oemapps_published_date(value: str | None) -> str:
+    """Return the documented OEMApps ``YYYY-MM-DD`` publication date."""
+    raw = str(value or "").strip()
+    if raw:
+        try:
+            return datetime.fromisoformat(raw.replace("Z", "+00:00")).date().isoformat()
+        except ValueError as error:
+            raise ValueError(
+                "OEMApps published_at must be an ISO 8601 date or datetime"
+            ) from error
+    return datetime.now(UTC).date().isoformat()
 
 
 class WordPressPublisher(PublisherBase):
@@ -686,7 +715,14 @@ class WordPressPublisher(PublisherBase):
     """
 
     connector_type = "wordpress"
-    capabilities = ("read_articles", "get_article", "find_article_by_slug", "publish_article", "update_article")
+    capabilities = (
+        "read_articles",
+        "get_article",
+        "find_article_by_slug",
+        "publish_article",
+        "update_article",
+        "upload_image",
+    )
 
     def _site_url(self) -> str:
         site_url = (self.site.get("domain") or self.site.get("base_url") or "").rstrip("/")
@@ -728,7 +764,7 @@ class WordPressPublisher(PublisherBase):
             "GET",
             _join_endpoint(site_url, f"{path}/{quote(str(post_id), safe='')}"),
             client_label="connector_wordpress_article",
-            params={"context": "edit"},
+            params={"context": "edit", "_embed": 1},
             headers=headers,
             timeout=60,
         )
@@ -749,15 +785,124 @@ class WordPressPublisher(PublisherBase):
         )
         return data[0] if isinstance(data, list) and data else None
 
+    async def upload_image(self, req: ImageUploadRequest) -> ImageUploadResult:
+        try:
+            body = req.payload()
+        except ValueError as error:
+            return ImageUploadResult(
+                ok=False,
+                dry_run=self.dry_run,
+                error=str(error),
+            )
+
+        cfg = self.site.get("api_config") or {}
+        endpoint = _join_endpoint(
+            self._site_url(),
+            str(cfg.get("mediaPath") or "/wp-json/wp/v2/media"),
+        )
+        if self.dry_run:
+            filename = _wordpress_dry_run_filename(req, body)
+            return ImageUploadResult(
+                ok=True,
+                dry_run=True,
+                raw={
+                    "endpoint": endpoint,
+                    "type": body["type"],
+                    "filename": filename,
+                },
+            )
+
+        headers = self._auth_headers()
+        if not self._site_url() or not headers:
+            return ImageUploadResult(
+                ok=False,
+                dry_run=False,
+                error="wordpress media connector missing site URL or credentials",
+            )
+        try:
+            filename, content, content_type = await _wordpress_image_payload(
+                req,
+                body,
+            )
+        except (ValueError, ConnectorHttpError) as error:
+            return ImageUploadResult(
+                ok=False,
+                dry_run=False,
+                error=str(error),
+            )
+        media_fields = {
+            "alt_text": str(req.alt_text or "").strip(),
+            "title": str(req.title or Path(filename).stem).strip(),
+        }
+        if str(req.caption or "").strip():
+            media_fields["caption"] = str(req.caption).strip()
+        try:
+            data = await request_json(
+                "POST",
+                endpoint,
+                client_label="connector_wordpress_media_upload",
+                headers=headers,
+                data=media_fields,
+                files={"file": (filename, content, content_type)},
+                timeout=120,
+                max_attempts=1,
+            )
+        except ExternalCallError as error:
+            return ImageUploadResult(
+                ok=False,
+                dry_run=False,
+                error=str(error),
+            )
+
+        media_id = data.get("id") if isinstance(data, dict) else None
+        source_url = data.get("source_url") if isinstance(data, dict) else None
+        if not source_url and isinstance(data, dict):
+            guid = data.get("guid")
+            source_url = guid.get("rendered") if isinstance(guid, dict) else None
+        if media_id is None or not str(source_url or "").startswith(("http://", "https://")):
+            return ImageUploadResult(
+                ok=False,
+                dry_run=False,
+                error="WordPress media upload did not return id and source_url",
+                raw=data if isinstance(data, dict) else {},
+            )
+        return ImageUploadResult(
+            ok=True,
+            dry_run=False,
+            image_id=str(media_id),
+            src=str(source_url),
+            raw=data,
+        )
+
     async def publish(self, req: PublishRequest) -> PublishResult:
+        cover_error = self._cover_error(req)
+        if cover_error:
+            return PublishResult(ok=False, dry_run=self.dry_run, error=cover_error)
         if self.dry_run:
             return self._dry_response(req)
         return await self._real_publish(req)
 
     async def update(self, post_id: str, req: PublishRequest) -> PublishResult:
+        cover_error = self._cover_error(req)
+        if cover_error:
+            return PublishResult(ok=False, dry_run=self.dry_run, error=cover_error)
         if self.dry_run:
             return self._dry_response(req)
         return await self._real_update(post_id, req)
+
+    @staticmethod
+    def _cover_error(req: PublishRequest) -> str | None:
+        has_cover = any(
+            str(value or "").strip()
+            for value in (
+                req.image_cover_url,
+                req.image_cover_id,
+                req.image_cover_alt,
+            )
+        )
+        if has_cover and not str(req.image_cover_id or "").isdigit():
+            return "WordPress cover requires a numeric uploaded media ID"
+        return None
 
     def _wordpress_body(self, req: PublishRequest, *, include_slug: bool = True) -> dict[str, Any]:
         content_md, frontmatter = strip_markdown_frontmatter(req.content_md)
@@ -777,6 +922,8 @@ class WordPressPublisher(PublisherBase):
             body["slug"] = req.slug
         if req.category_id:
             body["categories"] = [int(req.category_id)] if str(req.category_id).isdigit() else [req.category_id]
+        if str(req.image_cover_id or "").isdigit():
+            body["featured_media"] = int(str(req.image_cover_id))
         return body
 
     async def _real_publish(self, req: PublishRequest) -> PublishResult:
@@ -1522,6 +1669,25 @@ def markdown_to_gutenberg(source: str) -> str:
                 index += 1
             blocks.append(_wp_block("code", f'<pre class="wp-block-code"><code>{escape(chr(10).join(code))}</code></pre>'))
             continue
+        image = re.match(
+            r"^\s*!\[([^\]]*)\]\((https?://[^)\s]+|/[^)\s]+)(?:\s+[^)]*)?\)\s*$",
+            line,
+        )
+        if image:
+            alt = escape(image.group(1), quote=True)
+            src = escape(image.group(2), quote=True)
+            blocks.append(
+                _wp_block(
+                    "image",
+                    (
+                        '<figure class="wp-block-image">'
+                        f'<img src="{src}" alt="{alt}" />'
+                        "</figure>"
+                    ),
+                )
+            )
+            index += 1
+            continue
         heading = re.match(r"^\s*(#{1,6})\s+(.+?)\s*#*\s*$", line)
         if heading:
             level = len(heading.group(1))
@@ -1572,9 +1738,9 @@ def markdown_to_gutenberg(source: str) -> str:
     return "\n\n".join(blocks)
 
 
-def oemapps_html_from_markdown(source: str) -> str:
-    """Render generated Markdown as HTML accepted by the OEMApps ``content`` field."""
-    rendered = markdown_to_gutenberg(source)
+def oemapps_html_from_markdown(source: str, article_title: str) -> str:
+    """Render an OEMApps body without competing with its separately stored title."""
+    rendered = _article_body_without_h1(source, article_title)
     return re.sub(r"<!--\s*/?wp:[\s\S]*?-->", "", rendered).strip()
 
 
@@ -1586,7 +1752,34 @@ def shopify_body_from_markdown(source: str, article_title: str) -> str:
     second document H1.  A non-title H1 is demoted as well, so subsections cannot
     introduce a competing page-level heading.
     """
+    return _article_body_without_h1(source, article_title)
+
+
+def _article_body_without_h1(source: str, article_title: str) -> str:
+    """Remove the redundant title H1 and demote every other body H1 to H2."""
     title_key = _heading_key(article_title)
+    if re.search(r"</?[a-z][^>]*>", source or "", flags=re.I):
+        removed_html_title = False
+
+        def normalize_html_h1(match: re.Match[str]) -> str:
+            nonlocal removed_html_title
+            attrs, heading_html = match.group(1), match.group(2)
+            if (
+                not removed_html_title
+                and title_key
+                and _heading_key(heading_html) == title_key
+            ):
+                removed_html_title = True
+                return ""
+            return f"<h2{attrs}>{heading_html}</h2>"
+
+        return re.sub(
+            r"<h1\b([^>]*)>([\s\S]*?)</h1\s*>",
+            normalize_html_h1,
+            source,
+            flags=re.I,
+        )
+
     removed_title = False
     normalized_lines: list[str] = []
     for line in (source or "").replace("\r\n", "\n").replace("\r", "\n").split("\n"):
@@ -1601,8 +1794,8 @@ def shopify_body_from_markdown(source: str, article_title: str) -> str:
         normalized_lines.append(f"{heading.group(1)}## {heading_text}")
 
     body = markdown_to_gutenberg("\n".join(normalized_lines))
-    # Preserve compatibility with a previously generated Gutenberg body that is
-    # sent back through the connector, while still enforcing Shopify's no-H1 body rule.
+    # A previously rendered HTML/Gutenberg body may be sent back through an
+    # update path, so enforce the invariant again at the final HTML boundary.
     body = re.sub(r"<h1\b([^>]*)>", r"<h2\1>", body, flags=re.I)
     return re.sub(r"</h1\s*>", "</h2>", body, flags=re.I)
 
@@ -1632,6 +1825,116 @@ def _wp_block(name: str, content: str, attrs: str = "") -> str:
     return f"<!-- wp:{name}{suffix} -->{content}<!-- /wp:{name} -->"
 
 
+async def _wordpress_image_payload(
+    req: ImageUploadRequest,
+    body: dict[str, str],
+) -> tuple[str, bytes, str]:
+    upload_type = body["type"]
+    suggested_filename = req.filename
+    if upload_type == "base64":
+        encoded = body["base64"]
+        if encoded.startswith("data:"):
+            header, separator, encoded = encoded.partition(",")
+            if not separator or ";base64" not in header.casefold():
+                raise ValueError("image base64 data URI is invalid")
+        try:
+            content = base64.b64decode(encoded, validate=True)
+        except (ValueError, binascii.Error) as error:
+            raise ValueError("image base64 payload is invalid") from error
+    elif upload_type == "file":
+        workspace = Path.cwd().resolve()
+        try:
+            source = Path(body["file"]).expanduser().resolve(strict=True)
+        except (OSError, RuntimeError) as error:
+            raise ValueError("image file does not exist") from error
+        if not source.is_file() or not source.is_relative_to(workspace):
+            raise ValueError("WordPress image file must be inside the workspace")
+        try:
+            content = source.read_bytes()
+        except OSError as error:
+            raise ValueError("image file could not be read") from error
+        suggested_filename = suggested_filename or source.name
+    elif upload_type == "url":
+        raw_url = body["url"]
+        parsed = urlsplit(raw_url)
+        if parsed.scheme != "https" or not parsed.hostname:
+            raise ValueError("WordPress URL image upload requires a public HTTPS URL")
+        client = SafeBinaryHttpClient()
+        try:
+            downloaded = await client.get(
+                url=raw_url,
+                allowed_hosts={parsed.hostname.casefold().rstrip(".")},
+                max_response_bytes=10 * 1024 * 1024,
+            )
+        finally:
+            await client.aclose()
+        content = downloaded.content
+        suggested_filename = (
+            suggested_filename
+            or Path(urlsplit(downloaded.final_url).path).name
+            or "wordpress-image"
+        )
+    else:
+        raise ValueError("unsupported WordPress image upload type")
+    if not content:
+        raise ValueError("image payload is empty")
+    if len(content) > 10 * 1024 * 1024:
+        raise ValueError("image payload exceeds 10 MB")
+    content_type, extension = _detect_image_type(content)
+    filename = _safe_image_filename(
+        suggested_filename or f"wordpress-image.{extension}",
+        extension=extension,
+    )
+    return filename, content, content_type
+
+
+def _wordpress_dry_run_filename(
+    req: ImageUploadRequest,
+    body: dict[str, str],
+) -> str:
+    if str(req.filename or "").strip():
+        return Path(str(req.filename)).name
+    if body["type"] == "file":
+        return Path(body["file"]).name or "wordpress-image"
+    if body["type"] == "url":
+        return Path(urlsplit(body["url"]).path).name or "wordpress-image"
+    return "wordpress-image"
+
+
+def _detect_image_type(content: bytes) -> tuple[str, str]:
+    if content.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png", "png"
+    if content.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg", "jpg"
+    if content.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif", "gif"
+    if len(content) >= 12 and content[:4] == b"RIFF" and content[8:12] == b"WEBP":
+        return "image/webp", "webp"
+    if (
+        len(content) >= 16
+        and content[4:8] == b"ftyp"
+        and content[8:12] in {b"avif", b"avis"}
+    ):
+        return "image/avif", "avif"
+    raise ValueError(
+        "unsupported image format; use PNG, JPEG, GIF, WebP, or AVIF"
+    )
+
+
+def _safe_image_filename(value: str, *, extension: str) -> str:
+    filename = re.sub(
+        r"[^A-Za-z0-9._-]+",
+        "-",
+        Path(str(value)).name,
+    ).strip(".-_")
+    if not filename:
+        filename = "wordpress-image"
+    suffix = f".{extension}"
+    if not filename.casefold().endswith(suffix):
+        filename = f"{Path(filename).stem}{suffix}"
+    return filename[:180]
+
+
 def _wp_inline(text: str) -> str:
     value = escape(text, quote=False)
     value = re.sub(r"!\[([^]]*)\]\((https?://[^)]+|/[^)]+)\)", r'<img src="\2" alt="\1" />', value)
@@ -1653,6 +1956,10 @@ def _is_markdown_block_start(lines: list[str], index: int) -> bool:
     line = lines[index]
     return bool(
         re.match(r"^\s*(?:#{1,6}\s|```|>|(?:---+|\*\*\*+|___+)\s*$)", line)
+        or re.match(
+            r"^\s*!\[[^\]]*\]\((?:https?://|/)[^)\s]+(?:\s+[^)]*)?\)\s*$",
+            line,
+        )
         or re.match(r"^\s*([-+*]|\d+[.)])\s+", line)
         or ("|" in line and index + 1 < len(lines) and _is_table_divider(lines[index + 1]))
     )

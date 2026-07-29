@@ -111,7 +111,7 @@
 | POST | `/api/v1/sites/sync-config` | 无 | 从项目配置同步站点到数据库。 |
 | DELETE | `/api/v1/sites/{site_id}` | 路径：`site_id` | `{deleted: true}`；不存在返回 404。 |
 | GET | `/api/v1/sites/{site_id}/connector` | 路径：`site_id` | 检测该站点发布连接器，返回站点信息和连接结果；会发起外部调用。 |
-| POST | `/api/v1/sites/{site_id}/images/upload` | `SiteImageUploadBody` | 通过站点发布连接器上传 URL、文件路径或 Base64 图片；默认 `dry_run=true`。 |
+| POST | `/api/v1/sites/{site_id}/images/upload` | `SiteImageUploadBody` | 通过站点发布连接器上传 URL、文件路径或 Base64 图片；OEMApps 与 WordPress 均返回可用于正文的 `src` 和封面所需的 `image_id`；默认 `dry_run=true`。 |
 | POST | `/api/v1/sites/{site_id}/posts/sync` | 路径：`site_id`；可选 `SyncPostsBody` | 从一个外部站点同步已有文章。 |
 
 ### 2.6 关键词
@@ -270,7 +270,7 @@ GA4 数据源可在本地配置中提供 `ga4Hostnames: string[]`。未显式配
 | `SerpApiBody` | `keyword: string`，`gl?: string`，`hl?: string` |
 | `ImageSearchBody` | `provider: string = "pexels"`，`query: string`，`per_page: integer = 10`，`page: integer = 1` |
 | `PublishBody` | `article_id: string`，`site_id?: string`，`dry_run: boolean = true`，`actor?: string`，`update_post_id?: string`；更新旧文时锁定远端文章 ID |
-| `SiteImageUploadBody` | `type: string`；三选一提供 `url?`、`file?`、`base64?`；`dry_run: boolean = true` |
+| `SiteImageUploadBody` | `type: string`；三选一提供 `url?`、`file?`、`base64?`；可选 `filename?`、`alt_text?`、`title?`、`caption?`；`dry_run: boolean = true`。把上传返回的 `image_id`、`src` 和 ALT 存入文章 `image_plan` 的 `role=cover` 项；OEMApps 发布适配器以 `src` + 数字 `image_id` 设置封面，并以 `YYYY-MM-DD` 传递 `published_at`；WordPress 以该 `image_id` 设置 `featured_media`。正文图片使用 `src` 和非空 ALT 插入 Markdown。 |
 | `AnalyticsSyncBody` | 三选一：`sourceId: string`、`siteId: string` 或 `all: true`；可附 `daysBack?: integer`、`skipGsc?: boolean`、`skipGa4?: boolean` |
 | `RuleSetBody` | `name: string`，`version: string`，`source: string = "api"`，`payload: object`，`notes?: string`，`set_active: boolean = false`，`actor?: string` |
 

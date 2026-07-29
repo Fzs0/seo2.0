@@ -35,7 +35,8 @@ async def publish_article(
 ) -> dict[str, Any]:
     article_sql = (
         "SELECT id, task_id, site_id, title, slug, target_url, status, content_md, meta_title, meta_description, "
-        "primary_keyword, language_code, market, qa_checklist, qa_summary, published_post_id, published_url, published_at "
+        "primary_keyword, language_code, market, qa_checklist, qa_summary, image_plan, "
+        "published_post_id, published_url, published_at "
         "FROM seo_agent.articles WHERE id = CAST(:id AS uuid)"
         + (" FOR UPDATE" if not dry_run else "")
     )
@@ -80,6 +81,7 @@ async def publish_article(
     if article_market and site_market and article_market != site_market:
         raise PublishError(f"article market {a['market']} cannot publish to site market {s['market']}")
 
+    cover = _cover_from_image_plan(a.get("image_plan"))
     req = PublishRequest(
         title=a["title"] or a["slug"] or "untitled",
         slug=a["slug"] or f"article-{a['id']}",
@@ -89,6 +91,14 @@ async def publish_article(
         status="draft" if dry_run else "publish",
         excerpt=a["meta_description"] or "",
         primary_keyword=a["primary_keyword"] or "",
+        image_cover_url=cover.get("src") if cover else None,
+        image_cover_id=cover.get("image_id") if cover else None,
+        image_cover_alt=cover.get("alt") if cover else None,
+        published_at=(
+            a["published_at"].isoformat()
+            if a.get("published_at") is not None
+            else None
+        ),
     )
     publisher = await publisher_for_site_runtime(
         session, dict(s), dry_run=dry_run, require_active=not dry_run
@@ -247,6 +257,21 @@ async def publish_article(
         remote_verification=verification,
         exception_id=exception_id,
     )
+
+
+def _cover_from_image_plan(value: Any) -> dict[str, str] | None:
+    plan = value if isinstance(value, list) else []
+    for item in plan:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("role") or "").casefold() != "cover":
+            continue
+        return {
+            "src": str(item.get("src") or "").strip(),
+            "image_id": str(item.get("image_id") or "").strip(),
+            "alt": str(item.get("alt") or "").strip(),
+        }
+    return None
 
 
 async def sync_article_seo_metadata(

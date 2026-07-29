@@ -73,6 +73,7 @@ async def request_json(
     client_label: str,
     json: dict[str, Any] | None = None,
     data: dict[str, Any] | None = None,
+    files: dict[str, tuple[str, bytes, str]] | None = None,
     params: dict[str, Any] | None = None,
     headers: dict[str, str] | None = None,
     timeout: float | None = None,
@@ -97,6 +98,7 @@ async def request_json(
                         url,
                         json=json,
                         data=data,
+                        files=files,
                         params=params,
                         headers=headers,
                     )

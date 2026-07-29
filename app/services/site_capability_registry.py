@@ -98,8 +98,26 @@ def contract_for_site(site: dict[str, Any], adapters: set[str]) -> dict[str, Any
             *merged["supported_fields"]["articles"],
             "images",
             "image_alts",
+            "cover_image",
+        ]
+    if merged["supported_fields"].get("articles") and _is_wordpress_site(site):
+        merged["supported_fields"]["articles"] = [
+            *merged["supported_fields"]["articles"],
+            "images",
+            "image_alts",
+            "cover_image",
         ]
     return merged
+
+
+def _is_wordpress_site(site: dict[str, Any]) -> bool:
+    connector_type = str(
+        (site.get("api_config") or {}).get("connector_type") or ""
+    ).casefold()
+    return str(site.get("site_type") or "").casefold() == "wp" or connector_type in {
+        "wp",
+        "wordpress",
+    }
 
 
 __all__ = ["FORBIDDEN_ACTIONS", "contract_for_site"]

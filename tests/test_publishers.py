@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import base64
+
 import pytest
 
-from app.clients.publishers import ImageUploadRequest, OpenAPIPublisher, PublishRequest, ShopifyPublisher, WordPressPublisher, markdown_to_gutenberg, strip_markdown_frontmatter
+from app.clients.publishers import ImageUploadRequest, OpenAPIPublisher, PublishRequest, ShopifyPublisher, WordPressPublisher, _oemapps_published_date, markdown_to_gutenberg, oemapps_html_from_markdown, strip_markdown_frontmatter
 from app.clients.http_client import ExternalCallError
+from app.connectors.safe_http import BinaryHttpResponse
 
 
 def test_markdown_to_gutenberg_uses_separate_blocks():
@@ -14,6 +17,44 @@ def test_markdown_to_gutenberg_uses_separate_blocks():
     assert '<!-- wp:list -->' in content
     assert '<strong>bold</strong>' in content
     assert content.count("<!-- wp:") == 3
+
+
+def test_oemapps_published_date_normalizes_or_rejects_invalid_values() -> None:
+    assert _oemapps_published_date("2026-07-29T05:42:51Z") == "2026-07-29"
+    assert _oemapps_published_date("2026-07-29") == "2026-07-29"
+    with pytest.raises(ValueError, match="published_at"):
+        _oemapps_published_date("2026-99-99")
+
+
+def test_oemapps_article_body_never_contains_h1() -> None:
+    content = oemapps_html_from_markdown(
+        "# Article Title\n\nIntro.\n\n# Competing Section\n\n## Details",
+        "Article Title",
+    )
+
+    assert "<h1" not in content.casefold()
+    assert "</h1" not in content.casefold()
+    assert "<p>Intro.</p>" in content
+    assert content.count("<h2>") == 2
+    assert "<h2>Competing Section</h2>" in content
+    assert "<h2>Details</h2>" in content
+
+
+def test_oemapps_existing_html_body_is_preserved_while_h1_is_normalized() -> None:
+    content = oemapps_html_from_markdown(
+        (
+            '<h1 class="article-title">Article Title</h1>'
+            '<p>Existing <strong>HTML</strong> body.</p>'
+            '<h1 id="section">Competing Section</h1>'
+        ),
+        "Article Title",
+    )
+
+    assert "<h1" not in content.casefold()
+    assert "</h1" not in content.casefold()
+    assert '<p>Existing <strong>HTML</strong> body.</p>' in content
+    assert '<h2 id="section">Competing Section</h2>' in content
+    assert "&lt;" not in content
 
 
 def test_strip_markdown_frontmatter_keeps_body_and_metadata():
@@ -217,6 +258,8 @@ async def test_oemapps_sites_share_single_article_publish_adapter(monkeypatch):
         author='Editorial Team',
         category_id='4275',
         image_cover_url='https://cdn.example.com/cover.jpg',
+        image_cover_id='16756439',
+        published_at='2026-07-29T05:42:51Z',
         status='publish',
     )
 
@@ -254,7 +297,7 @@ async def test_oemapps_sites_share_single_article_publish_adapter(monkeypatch):
     assert payload == {
         'title': 'SEO Guide',
         'handle': 'seo-guide',
-        'content': '<h1>SEO Guide</h1>\n\n<p>Useful <strong>content</strong>.</p>',
+        'content': '<p>Useful <strong>content</strong>.</p>',
         'status': 1,
         'descript': 'SEO guide description',
         'meta_title': 'SEO Guide Title',
@@ -263,7 +306,9 @@ async def test_oemapps_sites_share_single_article_publish_adapter(monkeypatch):
         'author_name': 'Editorial Team',
         'related_product_ids': [],
         'is_top': 0,
+        'published_at': '2026-07-29',
         'src': 'https://cdn.example.com/cover.jpg',
+        'image_id': 16756439,
         'news_id': 4275,
     }
 
@@ -287,7 +332,18 @@ async def test_oemapps_article_update_uses_site_token(monkeypatch):
         dry_run=False,
     )
 
-    result = await publisher.update('7', PublishRequest(title='Updated', slug='updated', content_md='# Updated', status='publish'))
+    result = await publisher.update(
+        '7',
+        PublishRequest(
+            title='Updated',
+            slug='updated',
+            content_md='# Updated',
+            image_cover_url='https://cdn.example.com/cover.jpg',
+            image_cover_id='16756439',
+            published_at='2026-07-29T05:42:51Z',
+            status='publish',
+        ),
+    )
 
     assert result.ok is True
     assert result.url == 'https://avinoti.shop/blogs/updated'
@@ -296,7 +352,10 @@ async def test_oemapps_article_update_uses_site_token(monkeypatch):
     assert called['headers'] == {'token': 'site-token'}
     assert called['json']['handle'] == 'updated'
     assert called['json']['status'] == 1
-    assert called['json']['content'] == '<h1>Updated</h1>'
+    assert called['json']['content'] == ''
+    assert called['json']['published_at'] == '2026-07-29'
+    assert called['json']['src'] == 'https://cdn.example.com/cover.jpg'
+    assert called['json']['image_id'] == 16756439
 
 
 @pytest.mark.asyncio
@@ -605,6 +664,277 @@ async def test_wordpress_publisher_posts_json(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_wordpress_publish_sets_featured_media_and_content_image_alt(
+    monkeypatch,
+):
+    called: dict[str, object] = {}
+
+    async def fake_request_json(method: str, url: str, **kwargs):
+        called.update(method=method, url=url, json=kwargs.get('json'))
+        return {'id': 99, 'link': 'https://site.example.com/media-guide'}
+
+    monkeypatch.setattr('app.clients.publishers.request_json', fake_request_json)
+    publisher = WordPressPublisher(
+        {
+            'site_type': 'wp',
+            'domain': 'https://site.example.com',
+            'api_config': {'username': 'admin', 'applicationPassword': 'app password'},
+        },
+        dry_run=False,
+    )
+    content_url = (
+        'https://site.example.com/wp-content/uploads/2026/07/compatibility.png'
+    )
+
+    result = await publisher.publish(
+        PublishRequest(
+            title='Media Guide',
+            slug='media-guide',
+            content_md=(
+                '# Media Guide\n\n'
+                'Direct answer for readers.\n\n'
+                f'![Compatibility diagram]({content_url})'
+            ),
+            image_cover_url=(
+                'https://site.example.com/wp-content/uploads/2026/07/cover.png'
+            ),
+            image_cover_id='501',
+            image_cover_alt='Replacement pod and charging dock',
+            status='publish',
+        )
+    )
+
+    assert result.ok is True
+    assert called['json']['featured_media'] == 501
+    assert '<!-- wp:image -->' in called['json']['content']
+    assert (
+        f'<img src="{content_url}" alt="Compatibility diagram" />'
+        in called['json']['content']
+    )
+    assert '<!-- wp:paragraph --><p><img' not in called['json']['content']
+
+
+@pytest.mark.asyncio
+async def test_wordpress_publish_rejects_cover_without_uploaded_media_identity(
+    monkeypatch,
+):
+    async def fail_if_called(*_args, **_kwargs):
+        raise AssertionError('invalid cover must be rejected before remote write')
+
+    monkeypatch.setattr('app.clients.publishers.request_json', fail_if_called)
+    publisher = WordPressPublisher(
+        {
+            'domain': 'https://site.example.com',
+            'api_config': {'username': 'admin', 'applicationPassword': 'app password'},
+        },
+        dry_run=False,
+    )
+
+    result = await publisher.publish(
+        PublishRequest(
+            title='Media Guide',
+            slug='media-guide',
+            content_md='# Media Guide\n\nUseful content.',
+            image_cover_url='https://site.example.com/wp-content/uploads/cover.png',
+            image_cover_alt='Product-referenced editorial cover',
+            status='publish',
+        )
+    )
+
+    assert result.ok is False
+    assert result.error == 'WordPress cover requires a numeric uploaded media ID'
+
+
+@pytest.mark.asyncio
+async def test_wordpress_publisher_uploads_media_with_alt_in_one_request(monkeypatch):
+    called: dict[str, object] = {}
+
+    async def fake_request_json(method: str, url: str, **kwargs):
+        called.update(
+            method=method,
+            url=url,
+            headers=kwargs.get('headers'),
+            files=kwargs.get('files'),
+            data=kwargs.get('data'),
+            client_label=kwargs.get('client_label'),
+        )
+        return {
+            'id': 501,
+            'source_url': 'https://site.example.com/wp-content/uploads/2026/07/hero.png',
+        }
+
+    monkeypatch.setattr('app.clients.publishers.request_json', fake_request_json)
+    publisher = WordPressPublisher(
+        {
+            'site_type': 'wp',
+            'domain': 'https://site.example.com',
+            'api_config': {'username': 'admin', 'applicationPassword': 'app password'},
+        },
+        dry_run=False,
+    )
+    png = b'\x89PNG\r\n\x1a\n' + b'valid-image-payload'
+
+    result = await publisher.upload_image(
+        ImageUploadRequest(
+            type='base64',
+            base64='data:image/png;base64,' + base64.b64encode(png).decode('ascii'),
+            filename='article-hero.png',
+            alt_text='Sealed replacement pod beside a charging dock',
+        )
+    )
+
+    assert 'upload_image' in publisher.capabilities
+    assert result.ok is True
+    assert result.image_id == '501'
+    assert result.src == 'https://site.example.com/wp-content/uploads/2026/07/hero.png'
+    assert called['method'] == 'POST'
+    assert called['url'] == 'https://site.example.com/wp-json/wp/v2/media'
+    assert called['client_label'] == 'connector_wordpress_media_upload'
+    assert called['data'] == {
+        'alt_text': 'Sealed replacement pod beside a charging dock',
+        'title': 'article-hero',
+    }
+    assert called['files'] == {
+        'file': ('article-hero.png', png, 'image/png'),
+    }
+    assert str(called['headers']['Authorization']).startswith('Basic ')
+
+
+@pytest.mark.asyncio
+async def test_wordpress_publisher_uploads_a_public_url_image(monkeypatch):
+    png = b'\x89PNG\r\n\x1a\n' + b'url-image'
+    called: dict[str, object] = {}
+
+    class SafeClient:
+        async def get(self, **kwargs):
+            called['download'] = kwargs
+            return BinaryHttpResponse(
+                content=png,
+                content_type='image/png',
+                final_url='https://cdn.example.com/editorial.png',
+            )
+
+        async def aclose(self):
+            called['closed'] = True
+
+    async def fake_request_json(method: str, url: str, **kwargs):
+        called.update(method=method, url=url, files=kwargs.get('files'))
+        return {
+            'id': 502,
+            'source_url': 'https://site.example.com/wp-content/uploads/editorial.png',
+        }
+
+    monkeypatch.setattr('app.clients.publishers.SafeBinaryHttpClient', SafeClient)
+    monkeypatch.setattr('app.clients.publishers.request_json', fake_request_json)
+    publisher = WordPressPublisher(
+        {
+            'domain': 'https://site.example.com',
+            'api_config': {'username': 'admin', 'applicationPassword': 'app password'},
+        },
+        dry_run=False,
+    )
+
+    result = await publisher.upload_image(
+        ImageUploadRequest(
+            type='url',
+            url='https://cdn.example.com/editorial.png',
+            alt_text='Editorial compatibility illustration',
+        )
+    )
+
+    assert result.ok is True
+    assert called['download'] == {
+        'url': 'https://cdn.example.com/editorial.png',
+        'allowed_hosts': {'cdn.example.com'},
+        'max_response_bytes': 10 * 1024 * 1024,
+    }
+    assert called['closed'] is True
+    assert called['files'] == {
+        'file': ('editorial.png', png, 'image/png'),
+    }
+
+
+@pytest.mark.asyncio
+async def test_wordpress_media_dry_run_performs_no_file_or_network_io(monkeypatch):
+    class FailSafeClient:
+        def __init__(self):
+            raise AssertionError('dry-run must not construct a download client')
+
+    async def fail_if_called(*_args, **_kwargs):
+        raise AssertionError('dry-run must not call WordPress')
+
+    monkeypatch.setattr('app.clients.publishers.SafeBinaryHttpClient', FailSafeClient)
+    monkeypatch.setattr('app.clients.publishers.request_json', fail_if_called)
+    publisher = WordPressPublisher(
+        {
+            'domain': 'https://site.example.com',
+            'api_config': {'username': 'admin', 'applicationPassword': 'app password'},
+        },
+        dry_run=True,
+    )
+
+    result = await publisher.upload_image(
+        ImageUploadRequest(
+            type='url',
+            url='https://cdn.example.com/editorial.png',
+            filename='editorial-cover.png',
+            alt_text='Editorial cover',
+        )
+    )
+
+    assert result.ok is True
+    assert result.dry_run is True
+    assert result.raw == {
+        'endpoint': 'https://site.example.com/wp-json/wp/v2/media',
+        'type': 'url',
+        'filename': 'editorial-cover.png',
+    }
+
+
+@pytest.mark.asyncio
+async def test_wordpress_publisher_uploads_only_workspace_file_images(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.chdir(tmp_path)
+    image = tmp_path / 'cover.png'
+    png = b'\x89PNG\r\n\x1a\n' + b'file-image'
+    image.write_bytes(png)
+    called: dict[str, object] = {}
+
+    async def fake_request_json(method: str, url: str, **kwargs):
+        called.update(method=method, url=url, files=kwargs.get('files'))
+        return {
+            'id': 503,
+            'source_url': 'https://site.example.com/wp-content/uploads/cover.png',
+        }
+
+    monkeypatch.setattr('app.clients.publishers.request_json', fake_request_json)
+    publisher = WordPressPublisher(
+        {
+            'domain': 'https://site.example.com',
+            'api_config': {'username': 'admin', 'applicationPassword': 'app password'},
+        },
+        dry_run=False,
+    )
+
+    result = await publisher.upload_image(
+        ImageUploadRequest(type='file', file=str(image))
+    )
+
+    assert result.ok is True
+    assert called['files'] == {'file': ('cover.png', png, 'image/png')}
+
+    outside = tmp_path.parent / 'outside.png'
+    outside.write_bytes(png)
+    rejected = await publisher.upload_image(
+        ImageUploadRequest(type='file', file=str(outside))
+    )
+    assert rejected.ok is False
+    assert 'workspace' in str(rejected.error)
+
+
+@pytest.mark.asyncio
 async def test_wordpress_publisher_updates_existing_post(monkeypatch):
     called: dict[str, object] = {}
 
@@ -648,7 +978,7 @@ async def test_wordpress_publisher_gets_id_and_finds_slug(monkeypatch):
 
     assert item and item['id'] == 1837
     assert found and found['id'] == 1837
-    assert calls[0][2]['params'] == {'context': 'edit'}
+    assert calls[0][2]['params'] == {'context': 'edit', '_embed': 1}
     assert calls[1][2]['params']['slug'] == 'existing'
 
 

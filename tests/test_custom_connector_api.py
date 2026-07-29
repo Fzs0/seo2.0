@@ -54,6 +54,13 @@ def test_openapi_exposes_connector_management_routes() -> None:
     assert "/api/v1/connectors/{connector_id}/home-seo" in paths
     assert "/api/v1/connectors/{connector_id}/home-seo/update/preview" in paths
     assert "/api/v1/connectors/{connector_id}/home-seo/update/execute" in paths
+    assert "/api/v1/connectors/{connector_id}/pages" in paths
+    assert (
+        "/api/v1/connectors/{connector_id}/pages/{page_id}/update/preview" in paths
+    )
+    assert (
+        "/api/v1/connectors/{connector_id}/pages/{page_id}/update/execute" in paths
+    )
 
 
 def test_oemapps_execute_requires_seo_patch_and_explicit_confirmation_field() -> None:
@@ -67,6 +74,19 @@ def test_oemapps_execute_requires_seo_patch_and_explicit_confirmation_field() ->
             "expected_snapshot_hash": "a" * 64,
             "confirm_variant_recreation": True,
         },
+    )
+
+    assert response.status_code == 422
+
+
+def test_oemapps_page_execute_requires_patch_snapshot_and_confirmation_fields() -> None:
+    app = FastAPI()
+    app.include_router(router, prefix="/api/v1")
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/v1/connectors/connector-id/pages/1234/update/execute",
+        json={"title": "Updated"},
     )
 
     assert response.status_code == 422

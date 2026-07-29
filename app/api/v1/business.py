@@ -461,6 +461,10 @@ class SiteImageUploadBody(BaseModel):
     url: str | None = None
     file: str | None = None
     base64: str | None = None
+    filename: str | None = Field(default=None, max_length=180)
+    alt_text: str | None = Field(default=None, max_length=500)
+    title: str | None = Field(default=None, max_length=500)
+    caption: str | None = Field(default=None, max_length=2000)
     dry_run: bool = True
 
 
@@ -634,6 +638,10 @@ async def upload_site_image_route(
         url=body.url,
         file=body.file,
         base64=body.base64,
+        filename=body.filename,
+        alt_text=body.alt_text,
+        title=body.title,
+        caption=body.caption,
     ))
     if not result.ok:
         raise HTTPException(status_code=400, detail=result.error or "image upload failed")

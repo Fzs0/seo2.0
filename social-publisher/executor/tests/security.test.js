@@ -172,6 +172,25 @@ test('validates every video platform through the generic adapter registry', () =
   }
 });
 
+test('YouTube adapter supports the Korean Studio controls used by Hubstudio 2876', () => {
+  const { FINAL_LABELS, NEXT_LABELS } = require('../src/adapters/youtube');
+  assert.ok(NEXT_LABELS.includes('다음'));
+  assert.ok(FINAL_LABELS.includes('저장'));
+});
+
+test('YouTube adapter waits until a localized upload is no longer in progress', async () => {
+  const { waitForUploadReady } = require('../src/adapters/youtube');
+  let checks = 0;
+  const page = {
+    evaluate: async () => {
+      checks += 1;
+      return checks < 2;
+    },
+  };
+  assert.equal(await waitForUploadReady(page, 2000), true);
+  assert.equal(checks, 2);
+});
+
 test('accepts macOS absolute media paths', () => {
   const value = validateCommand({
     command: 'prepare', job_id: 'job-macos', container_code: 'env-macos',
@@ -319,6 +338,20 @@ test('orphan-page inspection cannot block the container indefinitely', async () 
   const never = new Promise(() => {});
   const started = Date.now();
   assert.equal(await softTimeout(never, 20, 'skipped'), 'skipped');
+  assert.ok(Date.now() - started < 250);
+});
+
+test('orphan-page discovery cannot block preparation indefinitely', async () => {
+  const executor = new SocialExecutor({
+    connectBrowser: async () => {},
+    pageDiscoveryTimeoutMs: 20,
+  });
+  const started = Date.now();
+
+  await executor.cleanupOrphanedManagedPages({
+    pages: async () => new Promise(() => {}),
+  });
+
   assert.ok(Date.now() - started < 250);
 });
 

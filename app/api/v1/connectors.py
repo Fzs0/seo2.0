@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.connectors.custom_data import ConnectorConfig, ConnectorError
 from app.connectors.oemapps_collections import OemAppsCollectionError
 from app.connectors.oemapps_home_seo import OemAppsHomeSeoError
+from app.connectors.oemapps_pages import OemAppsPageError
 from app.connectors.oemapps_products import OemAppsProductError
 from app.connectors.safe_http import ConnectorHttpError
 from app.connectors.secrets import ConnectorSecretError
@@ -44,6 +45,11 @@ from app.services.oemapps_home_seo_service import (
     list_home_seo_update_runs,
     preview_home_seo_update,
     sync_oemapps_home_seo,
+)
+from app.services.oemapps_page_service import (
+    execute_page_update,
+    list_oemapps_pages,
+    preview_page_update,
 )
 
 
@@ -140,6 +146,53 @@ class OemAppsCollectionSeoExecuteBody(OemAppsCollectionSeoPatch):
 
 
 class OemAppsHomeSeoExecuteBody(OemAppsCollectionSeoPatch):
+    expected_snapshot_hash: str = Field(min_length=64, max_length=64)
+    confirm: bool = False
+
+    def as_patch(self) -> dict[str, Any]:
+        return self.model_dump(
+            exclude_unset=True,
+            exclude={"expected_snapshot_hash", "confirm"},
+        )
+
+
+class OemAppsPagePatch(BaseModel):
+    handle: str | None = Field(default=None, max_length=500)
+    title: str | None = Field(default=None, max_length=1000)
+    meta_title: str | None = Field(default=None, max_length=500)
+    meta_description: str | None = Field(default=None, max_length=2000)
+    meta_keywords: list[str] | None = Field(default=None, max_length=100)
+    is_default: int | None = Field(default=None, ge=0)
+    from_id: int | None = Field(default=None, ge=0)
+    from_name: str | None = Field(default=None, max_length=1000)
+    content: str | None = Field(default=None, max_length=2_000_000)
+
+    @model_validator(mode="after")
+    def validate_patch(self) -> "OemAppsPagePatch":
+        fields = {
+            "handle",
+            "title",
+            "meta_title",
+            "meta_description",
+            "meta_keywords",
+            "is_default",
+            "from_id",
+            "from_name",
+            "content",
+        }
+        if not (self.model_fields_set & fields):
+            raise ValueError("at least one custom page field must be provided")
+        if self.meta_keywords is not None and any(
+            len(value) > 200 for value in self.meta_keywords
+        ):
+            raise ValueError("each meta keyword must be at most 200 characters")
+        return self
+
+    def as_patch(self) -> dict[str, Any]:
+        return self.model_dump(exclude_unset=True)
+
+
+class OemAppsPageExecuteBody(OemAppsPagePatch):
     expected_snapshot_hash: str = Field(min_length=64, max_length=64)
     confirm: bool = False
 
@@ -376,6 +429,52 @@ async def home_seo_update_runs_route(
     session: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
     return await list_home_seo_update_runs(session, connector_id, limit=limit)
+
+
+@router.get("/{connector_id}/pages")
+async def list_oemapps_pages_route(
+    connector_id: str,
+    session: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    try:
+        return await list_oemapps_pages(session, connector_id)
+    except (ValueError, ConnectorSecretError, OemAppsPageError) as error:
+        raise _bad_request(error) from error
+
+
+@router.post("/{connector_id}/pages/{page_id}/update/preview")
+async def preview_oemapps_page_update_route(
+    connector_id: str,
+    page_id: str,
+    body: OemAppsPagePatch,
+    session: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    try:
+        return await preview_page_update(
+            session, connector_id, page_id, body.as_patch()
+        )
+    except (ValueError, ConnectorSecretError, OemAppsPageError) as error:
+        raise _bad_request(error) from error
+
+
+@router.post("/{connector_id}/pages/{page_id}/update/execute")
+async def execute_oemapps_page_update_route(
+    connector_id: str,
+    page_id: str,
+    body: OemAppsPageExecuteBody,
+    session: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    try:
+        return await execute_page_update(
+            session,
+            connector_id,
+            page_id,
+            body.as_patch(),
+            expected_snapshot_hash=body.expected_snapshot_hash,
+            confirm=body.confirm,
+        )
+    except (ValueError, ConnectorSecretError, OemAppsPageError) as error:
+        raise _bad_request(error) from error
 
 
 @router.post("/{connector_id}/products/{product_id}/seo-update/preview")

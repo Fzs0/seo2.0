@@ -260,10 +260,16 @@ async def list_strategy_runs(
                 """
                 SELECT id::text AS id, payload, decision, created_at, updated_at,
                        started_at, finished_at, error_message
-                  FROM seo_agent.tasks
+                 FROM seo_agent.tasks
                  WHERE task_type = 'review' AND payload->>'kind' = :kind
-                   AND (:business_id IS NULL OR payload->>'business_id' = :business_id)
-                   AND (:status IS NULL OR decision->>'status' = :status)
+                   AND (
+                     CAST(:business_id AS text) IS NULL
+                     OR payload->>'business_id' = CAST(:business_id AS text)
+                   )
+                   AND (
+                     CAST(:status AS text) IS NULL
+                     OR decision->>'status' = CAST(:status AS text)
+                   )
                    AND (CAST(:from_at AS timestamptz) IS NULL OR created_at >= CAST(:from_at AS timestamptz))
                    AND (CAST(:to_at AS timestamptz) IS NULL OR created_at <= CAST(:to_at AS timestamptz))
                  ORDER BY created_at DESC

@@ -14,6 +14,7 @@ class SocialExecutor {
     this.artifactDir = path.resolve(options.artifactDir || './artifacts');
     this.timeoutMs = options.timeoutMs || 45000;
     this.reviewTtlMs = options.reviewTtlMs || 1800000;
+    this.pageDiscoveryTimeoutMs = options.pageDiscoveryTimeoutMs || 2000;
     this.locks = new Set();
     this.prepared = new Map();
     this.log = options.log || (() => {});
@@ -152,7 +153,11 @@ class SocialExecutor {
 
   async cleanupOrphanedManagedPages(browser) {
     const activeTargets = new Set([...this.prepared.values()].map(state => state.targetId));
-    await Promise.all((await browser.pages()).map(async page => {
+    // Hubstudio can keep a suspended or half-closed DevTools target around.
+    // In that state Puppeteer's browser.pages() may never settle, so bound the
+    // discovery call itself instead of only bounding per-page inspection.
+    const pages = await softTimeout(browser.pages(), this.pageDiscoveryTimeoutMs, []);
+    await Promise.all(pages.map(async page => {
       if (activeTargets.has(page.target()._targetId)) return;
       // A suspended background tab must never block preparation for every
       // other platform. Marker inspection is read-only and deliberately
