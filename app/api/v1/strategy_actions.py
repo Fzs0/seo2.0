@@ -12,18 +12,23 @@ from app.services.strategy_action_service import (
     ActionAdapter,
     SQLActionStore,
     approve_action,
-    execute_action,
+    execute_action_and_reconcile,
     get_action,
     preview_action,
-    recover_action,
+    recover_action_and_reconcile,
     heartbeat_action,
     rollback_action,
     rollback_preview,
 )
 from app.services.strategy_article_action_adapter import (
-    StrategyArticleActionAdapter,
     get_article_generation_context,
+    preflight_article_action,
+    upload_strategy_article_image,
 )
+from app.services.strategy_action_adapter_router import (
+    StrategyActionAdapterRouter,
+)
+from app.clients.publishers import ImageUploadRequest
 from app.api.v1.response_contract import ContractRoute, failure, success
 
 router = APIRouter(
@@ -36,13 +41,17 @@ router = APIRouter(
 def get_action_adapter(
     session: AsyncSession = Depends(get_db),
 ) -> ActionAdapter:
-    """Use the guarded article adapter; unsupported action types remain blocked."""
-    return StrategyArticleActionAdapter(session)
+    """Use exact platform/action routing; unknown pairs remain zero-write blocked."""
+    return StrategyActionAdapterRouter(session)
 
 
 class PreviewBody(BaseModel):
     patch: dict[str, Any] = Field(min_length=1)
     capability_snapshot_hash: str = Field(min_length=16)
+    generation_mode: str | None = None
+    generation_provider: str | None = None
+    generation_model: str | None = None
+    generation_run_id: str | None = None
 
 
 class ApproveBody(BaseModel):
@@ -53,6 +62,7 @@ class ApproveBody(BaseModel):
     generation_model: str | None = None
     generation_run_id: str | None = None
     capability_snapshot_hash: str = Field(min_length=16)
+    side_effect_confirmations: dict[str, bool] = Field(default_factory=dict)
 
 
 class RollbackBody(BaseModel):
@@ -62,6 +72,18 @@ class RollbackBody(BaseModel):
 class HeartbeatBody(BaseModel):
     execution_token: str = Field(min_length=16)
     lease_seconds: int = Field(default=300, ge=1, le=3600)
+
+
+class StrategyImageUploadBody(BaseModel):
+    type: str
+    url: str | None = None
+    file: str | None = None
+    base64: str | None = None
+    filename: str | None = Field(default=None, max_length=180)
+    alt_text: str | None = Field(default=None, max_length=500)
+    title: str | None = Field(default=None, max_length=500)
+    caption: str | None = Field(default=None, max_length=2000)
+    dry_run: bool = True
 
 
 @router.get("/{action_id}")
@@ -75,12 +97,19 @@ async def get_strategy_action(
 async def get_strategy_action_generation_context(
     action_id: str,
     request: Request,
+    preflight_token: str = Header(
+        min_length=16, alias="X-Strategy-Preflight-Token"
+    ),
     session: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
     try:
         return success(
             request,
-            await get_article_generation_context(session, action_id=action_id),
+            await get_article_generation_context(
+                session,
+                action_id=action_id,
+                preflight_token=preflight_token,
+            ),
         )
     except ValueError as error:
         return failure(
@@ -92,6 +121,72 @@ async def get_strategy_action_generation_context(
         )
 
 
+@router.post("/{action_id}/preflight")
+async def preflight_strategy_article_action(
+    action_id: str,
+    request: Request,
+    idempotency_key: str = Header(min_length=8, alias="Idempotency-Key"),
+    session: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    try:
+        return success(
+            request,
+            await preflight_article_action(
+                session,
+                action_id=action_id,
+                idempotency_key=idempotency_key,
+            ),
+        )
+    except ValueError as error:
+        return failure(
+            request,
+            status_code=409,
+            code="STRATEGY_ACTION_PREFLIGHT_BLOCKED",
+            message=str(error),
+            retryable=False,
+        )
+
+
+@router.post("/{action_id}/images/upload")
+async def upload_strategy_article_image_route(
+    action_id: str,
+    body: StrategyImageUploadBody,
+    request: Request,
+    preflight_token: str = Header(
+        min_length=16, alias="X-Strategy-Preflight-Token"
+    ),
+    idempotency_key: str = Header(min_length=8, alias="Idempotency-Key"),
+    session: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    try:
+        return success(
+            request,
+            await upload_strategy_article_image(
+                session,
+                action_id=action_id,
+                preflight_token=preflight_token,
+                idempotency_key=idempotency_key,
+                request=ImageUploadRequest(
+                    type=body.type,
+                    url=body.url,
+                    file=body.file,
+                    base64=body.base64,
+                    filename=body.filename,
+                    alt_text=body.alt_text,
+                    title=body.title,
+                    caption=body.caption,
+                ),
+                dry_run=body.dry_run,
+            ),
+        )
+    except ValueError as error:
+        return failure(
+            request,
+            status_code=409,
+            code="STRATEGY_ACTION_MEDIA_UPLOAD_BLOCKED",
+            message=str(error),
+            retryable=False,
+        )
 @router.post("/{action_id}/preview")
 async def preview_strategy_action(
     action_id: str,
@@ -109,6 +204,10 @@ async def preview_strategy_action(
         patch=body.patch,
         adapter=adapter,
         capability_snapshot_hash=body.capability_snapshot_hash,
+        generation_mode=body.generation_mode,
+        generation_provider=body.generation_provider,
+        generation_model=body.generation_model,
+        generation_run_id=body.generation_run_id,
         idempotency_key=idempotency_key,
     )
 
@@ -132,6 +231,7 @@ async def approve_strategy_action(
         generation_provider=body.generation_provider,
         generation_model=body.generation_model,
         generation_run_id=body.generation_run_id,
+        side_effect_confirmations=body.side_effect_confirmations,
         capability_snapshot_hash=body.capability_snapshot_hash,
         idempotency_key=idempotency_key,
     )
@@ -148,7 +248,7 @@ async def execute_strategy_action(
 ) -> dict[str, Any]:
     return await _call(
         request,
-        execute_action,
+        execute_action_and_reconcile,
         SQLActionStore(session),
         action_id=action_id,
         adapter=adapter,
@@ -167,7 +267,7 @@ async def recover_strategy_action(
 ) -> dict[str, Any]:
     return await _call(
         request,
-        recover_action,
+        recover_action_and_reconcile,
         SQLActionStore(session),
         action_id=action_id,
         adapter=adapter,

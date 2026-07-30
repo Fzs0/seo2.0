@@ -15,8 +15,18 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.services.strategy_exception_service import record_exception
 from app.core.remote_outcomes import policy_for_remote_outcome
+from app.services.strategy_plan_contract import (
+    validate_strategy_action_lineage,
+    validate_strategy_action_wave,
+)
 
 RESULTS = {"created", "updated", "already_applied", "blocked", "failed", "readback_mismatch"}
+ON_PAGE_ACTION_TYPES = {
+    "homepage_seo",
+    "product_seo",
+    "category_seo",
+    "product_image_alt",
+}
 
 
 class ActionAdapter(Protocol):
@@ -51,6 +61,7 @@ class SQLActionStore:
         self.session = session
 
     async def create(self, action: dict[str, Any]) -> dict[str, Any]:
+        await self.validate_lineage(action, lock=True)
         scoped_key = (
             f"{action['business_id']}:{action['site_id']}:{action['idempotency_key']}"
         )
@@ -97,6 +108,24 @@ class SQLActionStore:
         )
         await self.session.commit()
         return action
+
+    async def validate_lineage(
+        self, action: dict[str, Any], *, lock: bool = False
+    ) -> dict[str, Any]:
+        return await validate_strategy_action_lineage(
+            self.session, action, lock=lock
+        )
+
+    async def validate_wave(self, action: dict[str, Any]) -> None:
+        await validate_strategy_action_wave(self.session, action)
+
+    async def reconcile_parent_run(self, run_id: str) -> None:
+        """Close the parent run after an action reaches a terminal outcome."""
+        # Keep the dependency one-way at import time: the run service creates
+        # actions, while production action completion coordinates the parent run.
+        from app.services.strategy_run_service import reconcile_strategy_run
+
+        await reconcile_strategy_run(self.session, run_id=run_id)
 
     async def get(self, action_id: str, *, lock: bool = False) -> dict[str, Any]:
         row = (
@@ -190,10 +219,42 @@ async def get_action(store: ActionStore, *, action_id: str) -> dict[str, Any]:
 
 
 async def create_action(store: ActionStore, **values: Any) -> dict[str, Any]:
-    required = ("run_id", "business_id", "site_id", "action_type", "idempotency_key")
+    required = (
+        "run_id",
+        "plan_id",
+        "source_strategy_task_id",
+        "business_id",
+        "site_id",
+        "action_type",
+        "idempotency_key",
+    )
     missing = [key for key in required if not values.get(key)]
     if missing:
         raise ValueError(f"strategy action missing required fields: {missing}")
+    capability = values.get("capability_snapshot")
+    permission = (
+        (capability.get("supported_actions") or {}).get(values["action_type"])
+        if isinstance(capability, dict)
+        else None
+    )
+    if permission not in {"approval_required", "allowed", "execute"}:
+        raise ValueError(
+            "strategy action cannot be created without an executable capability snapshot"
+        )
+    if values["action_type"] in ON_PAGE_ACTION_TYPES:
+        adapter_identity = values.get("adapter_identity")
+        if (
+            not isinstance(adapter_identity, dict)
+            or adapter_identity.get("read") is not True
+            or adapter_identity.get("write") is not True
+            or adapter_identity.get("readback") is not True
+            or str(adapter_identity.get("connector_type") or "").casefold()
+            != str(values.get("connector_type") or "").casefold()
+        ):
+            raise ValueError(
+                "on-page strategy action requires an exact readable, writable, "
+                "independently readable adapter identity"
+            )
     action = {
         "action_id": str(values.get("action_id") or uuid4()),
         "status": "planned",
@@ -219,14 +280,40 @@ async def preview_action(
     patch: dict[str, Any],
     adapter: ActionAdapter | None = None,
     capability_snapshot_hash: str | None = None,
+    generation_mode: str | None = None,
+    generation_provider: str | None = None,
+    generation_model: str | None = None,
+    generation_run_id: str | None = None,
     idempotency_key: str | None = None,
 ) -> dict[str, Any]:
     action = await store.get(action_id, lock=True)
-    request_hash = _hash({"patch": patch, "capability_snapshot_hash": capability_snapshot_hash})
+    await _validate_store_lineage(store, action)
+    preview_provenance = (
+        _provenance(
+            generation_mode,
+            generation_provider,
+            generation_model,
+            generation_run_id,
+        )
+        if generation_mode is not None
+        else {}
+    )
+    request_hash = _hash(
+        {
+            "patch": patch,
+            "capability_snapshot_hash": capability_snapshot_hash,
+            **preview_provenance,
+        }
+    )
     replay = _idempotency_replay(action, "preview", idempotency_key, request_hash)
     if replay is not None:
         return replay
-    capability_error = _capability_error(action, patch, capability_snapshot_hash)
+    capability_error = _capability_error(
+        action,
+        patch,
+        capability_snapshot_hash,
+        require_side_effect_confirmations=False,
+    )
     if capability_error:
         response = {**_response(action, "blocked"), "block_reason": capability_error}
         await _save_receipt(store, action, "preview", idempotency_key, request_hash, response)
@@ -240,6 +327,7 @@ async def preview_action(
     await store.save(action)
     result = await (adapter or BlockedActionAdapter()).preview(action, patch)
     action = await store.get(action_id, lock=True)
+    await _validate_store_lineage(store, action)
     if action.get("preview_token") != preview_token:
         raise ValueError("stale preview claim cannot submit results")
     if result.get("result") == "blocked":
@@ -259,6 +347,7 @@ async def preview_action(
             "rollback_snapshot": before,
             "previewed_at": _now(),
             "capability_snapshot_hash": capability_snapshot_hash,
+            **preview_provenance,
         }
     )
     await store.save(action)
@@ -278,9 +367,11 @@ async def approve_action(
     generation_provider: str | None = None,
     generation_model: str | None = None,
     generation_run_id: str | None = None,
+    side_effect_confirmations: dict[str, bool] | None = None,
     idempotency_key: str | None = None,
 ) -> dict[str, Any]:
     action = await store.get(action_id, lock=True)
+    await _validate_store_lineage(store, action)
     request_hash = _hash(
         {
             "snapshot_hash": snapshot_hash,
@@ -290,6 +381,7 @@ async def approve_action(
             "generation_provider": generation_provider,
             "generation_model": generation_model,
             "generation_run_id": generation_run_id,
+            "side_effect_confirmations": side_effect_confirmations or {},
         }
     )
     replay = _idempotency_replay(action, "approve", idempotency_key, request_hash)
@@ -301,9 +393,28 @@ async def approve_action(
         raise ValueError("approval does not match the current snapshot and patch")
     if capability_snapshot_hash != action.get("capability_snapshot_hash"):
         raise ValueError("approval does not match the current capability snapshot")
+    confirmations = dict(side_effect_confirmations or {})
+    confirmation_error = _side_effect_confirmation_error(action, confirmations)
+    if confirmation_error:
+        raise ValueError(confirmation_error)
     provenance = _provenance(
         generation_mode, generation_provider, generation_model, generation_run_id
     )
+    preview_provenance = {
+        key: action.get(key)
+        for key in (
+            "generation_mode",
+            "generation_provider",
+            "generation_model",
+            "generation_run_id",
+        )
+    }
+    if preview_provenance["generation_mode"] is not None and (
+        preview_provenance != provenance
+    ):
+        raise ValueError(
+            "approval generation provenance does not match the current preview"
+        )
     action.update(
         {
             "status": "approved",
@@ -312,6 +423,9 @@ async def approve_action(
             "approved_at": _now(),
             "approved_patch": dict(action.get("proposed_patch") or {}),
             "approved_capability_snapshot_hash": capability_snapshot_hash,
+            "approved_adapter_identity": action.get("adapter_identity"),
+            "approved_target_identity": _target_identity(action),
+            "side_effect_confirmations": confirmations,
             **provenance,
         }
     )
@@ -330,6 +444,7 @@ async def execute_action(
     idempotency_key: str | None = None,
 ) -> dict[str, Any]:
     action = await store.get(action_id, lock=True)
+    await _validate_store_lineage(store, action)
     request_hash = _hash({"capability_snapshot_hash": capability_snapshot_hash})
     replay = _idempotency_replay(action, "execute", idempotency_key, request_hash)
     if replay is not None:
@@ -338,6 +453,12 @@ async def execute_action(
         return _response(action, "already_applied")
     if action.get("status") != "approved":
         return {**_response(action, "blocked"), "block_reason": "action_not_approved"}
+    if action.get("run_mode") != "approval_execution":
+        return {
+            **_response(action, "blocked"),
+            "block_reason": "dry_run_actions_cannot_execute",
+        }
+    await _validate_store_wave(store, action)
     if capability_snapshot_hash != action.get("approved_capability_snapshot_hash"):
         action.update(
             {
@@ -350,6 +471,20 @@ async def execute_action(
         )
         await store.save(action)
         return {**_response(action, "blocked"), "block_reason": "capability_snapshot_changed"}
+    if action.get("adapter_identity") != action.get("approved_adapter_identity"):
+        action.update({"status": "previewed", "result": "blocked"})
+        await store.save(action)
+        return {
+            **_response(action, "blocked"),
+            "block_reason": "adapter_identity_changed",
+        }
+    if _target_identity(action) != action.get("approved_target_identity"):
+        action.update({"status": "previewed", "result": "blocked"})
+        await store.save(action)
+        return {
+            **_response(action, "blocked"),
+            "block_reason": "target_identity_changed",
+        }
     capability_error = _capability_error(
         action, action.get("proposed_patch") or {}, capability_snapshot_hash
     )
@@ -389,6 +524,17 @@ async def execute_action(
             "status": "blocked",
             "result": "blocked",
             "recovery_status": "unknown_remote_state",
+            "submitted_patch": dict(
+                action.get("approved_patch")
+                or action.get("proposed_patch")
+                or {}
+            ),
+            "remote_response": {
+                "ok": False,
+                "remote_outcome": "unknown_remote_state",
+                "error_code": "ACTION_CONNECTOR_ERROR",
+                "retry_policy": "manual_readback_required",
+            },
             "executed_at": _now(),
         })
         await store.save(action)
@@ -420,6 +566,33 @@ async def execute_action(
     )
     latest = await store.get(action_id, lock=True)
     await _save_receipt(store, latest, "execute", idempotency_key, request_hash, response)
+    return response
+
+
+async def execute_action_and_reconcile(
+    store: ActionStore,
+    *,
+    action_id: str,
+    adapter: ActionAdapter | None = None,
+    capability_snapshot_hash: str | None = None,
+    lease_seconds: int = 300,
+    idempotency_key: str | None = None,
+) -> dict[str, Any]:
+    """Execute one formal action and advance its parent run when terminal.
+
+    The action response is returned unchanged so execute idempotency receipts
+    retain their exact public contract.  Run state remains independently
+    queryable through the Strategy Run API.
+    """
+    response = await execute_action(
+        store,
+        action_id=action_id,
+        adapter=adapter,
+        capability_snapshot_hash=capability_snapshot_hash,
+        lease_seconds=lease_seconds,
+        idempotency_key=idempotency_key,
+    )
+    await _reconcile_parent_run_if_terminal(store, response)
     return response
 
 
@@ -616,10 +789,22 @@ async def recover_action(
         else:
             action.update(
                 {
-                    "status": "approved",
+                    "status": "planned",
                     "execution_token": None,
                     "execution_claimed_at": None,
                     "execution_lease_expires_at": None,
+                    "preview_token": None,
+                    "snapshot_hash": None,
+                    "patch_hash": None,
+                    "capability_snapshot_hash": None,
+                    "approved_at": None,
+                    "approved_snapshot_hash": None,
+                    "approved_patch_hash": None,
+                    "approved_patch": None,
+                    "approved_capability_snapshot_hash": None,
+                    "approved_adapter_identity": None,
+                    "approved_target_identity": None,
+                    "side_effect_confirmations": {},
                     "last_heartbeat_at": _now(),
                     "recovery_status": status,
                 }
@@ -708,6 +893,24 @@ async def recover_action(
         action["exception_id"] = exception.get("exception_id")
     response = _response(action, action.get("result") or "blocked")
     await _save_receipt(store, action, "recover", idempotency_key, request_hash, response)
+    return response
+
+
+async def recover_action_and_reconcile(
+    store: ActionStore,
+    *,
+    action_id: str,
+    adapter: ActionAdapter | None = None,
+    idempotency_key: str | None = None,
+) -> dict[str, Any]:
+    """Recover one action and close its parent run if recovery is terminal."""
+    response = await recover_action(
+        store,
+        action_id=action_id,
+        adapter=adapter,
+        idempotency_key=idempotency_key,
+    )
+    await _reconcile_parent_run_if_terminal(store, response)
     return response
 
 
@@ -816,6 +1019,8 @@ def _capability_error(
     action: dict[str, Any],
     patch: dict[str, Any],
     snapshot_hash: str | None,
+    *,
+    require_side_effect_confirmations: bool = True,
 ) -> str | None:
     capability = action.get("capability_snapshot")
     if not isinstance(capability, dict):
@@ -828,6 +1033,13 @@ def _capability_error(
     policy = (capability.get("supported_actions") or {}).get(action_type)
     if policy in {None, "forbidden"}:
         return "capability_not_declared"
+    declared_adapter = (capability.get("action_adapters") or {}).get(action_type)
+    if declared_adapter is not None and (
+        action.get("adapter_identity") != declared_adapter
+        or str(action.get("connector_type") or "").casefold()
+        != str(declared_adapter.get("connector_type") or "").casefold()
+    ):
+        return "action_adapter_identity_mismatch"
     fields = capability.get("supported_fields") or {}
     allowed = set(fields.get(action_type) or fields.get("articles") or ())
     if any(field not in allowed for field in patch):
@@ -848,12 +1060,50 @@ def _capability_error(
         return "capability_snapshot_stale"
     if capability.get("configuration_issues"):
         return "capability_configuration_issue"
-    side_effects = (capability.get("side_effects") or {}).get(action_type) or {}
-    confirmations = action.get("side_effect_confirmations") or {}
-    required = [key for key, enabled in side_effects.items() if key.startswith("requires_") and enabled]
-    if any(not confirmations.get(key) for key in required):
+    if require_side_effect_confirmations and _side_effect_confirmation_error(
+        action, dict(action.get("side_effect_confirmations") or {})
+    ):
         return "side_effect_confirmation_required"
     return None
+
+
+def _side_effect_confirmation_error(
+    action: dict[str, Any], confirmations: dict[str, bool]
+) -> str | None:
+    capability = action.get("capability_snapshot") or {}
+    action_type = str(action.get("action_type") or "")
+    side_effects = (capability.get("side_effects") or {}).get(action_type) or {}
+    required = [
+        key
+        for key, enabled in side_effects.items()
+        if key.startswith("requires_") and enabled
+    ]
+    missing = [key for key in required if confirmations.get(key) is not True]
+    if missing:
+        return "side-effect confirmation required: " + ", ".join(sorted(missing))
+    unknown = set(confirmations) - set(required)
+    if unknown:
+        return "side-effect confirmation is not declared: " + ", ".join(
+            sorted(unknown)
+        )
+    return None
+
+
+def _target_identity(action: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: action.get(key)
+        for key in (
+            "business_id",
+            "site_id",
+            "page_type",
+            "target_asset_id",
+            "remote_object_id",
+            "target_url",
+            "connector_id",
+            "connector_type",
+            "action_type",
+        )
+    }
 
 
 async def rollback_preview(
@@ -987,6 +1237,12 @@ def _normalize_url(value: str) -> str:
 
 
 def _observation_for(action: dict[str, Any]) -> dict[str, Any]:
+    strategy_decision = action.get("strategy_decision") or {}
+    evidence = (
+        strategy_decision.get("execution_evidence")
+        or strategy_decision.get("evidence")
+        or {}
+    )
     return {
         "observation_id": str(uuid4()),
         "business_id": action.get("business_id"),
@@ -995,6 +1251,12 @@ def _observation_for(action: dict[str, Any]) -> dict[str, Any]:
         "action_id": action.get("action_id"),
         "target_url": action.get("target_url"),
         "action_type": action.get("action_type"),
+        "page_type": action.get("page_type"),
+        "target_asset_id": action.get("target_asset_id"),
+        "remote_object_id": action.get("remote_object_id"),
+        "connector_id": action.get("connector_id"),
+        "connector_type": action.get("connector_type"),
+        "adapter_identity": action.get("adapter_identity"),
         "strategy": action.get("strategy"),
         "topic": action.get("topic"),
         "generation_mode": action.get("generation_mode"),
@@ -1005,13 +1267,33 @@ def _observation_for(action: dict[str, Any]) -> dict[str, Any]:
         "publish_task_id": action.get("publish_task_id"),
         "effect_id": action.get("effect_id"),
         "before_evidence_snapshot": action.get("before_snapshot") or {},
+        "after_evidence_snapshot": action.get("readback") or {},
+        "before_snapshot_hash": _hash(action.get("before_snapshot") or {}),
+        "after_snapshot_hash": _hash(action.get("readback") or {}),
+        "gsc_page_baseline": evidence.get("gsc_page_baseline")
+        or evidence.get("gsc")
+        or {},
+        "ga4_landing_page_baseline": evidence.get("ga4_landing_page_baseline")
+        or evidence.get("ga4")
+        or {},
+        "t0_required_checks": [
+            "http_status",
+            "title",
+            "description",
+            "canonical",
+            "robots",
+            "page_accessibility",
+        ],
         "executed_at": action.get("executed_at"),
-        "checkpoints_days": [7, 14, 28, 56],
+        "next_check_at": action.get("executed_at") or _now(),
+        "checkpoints_days": [0, 7, 14, 28, 56, 90],
         "checkpoint_statuses": {
+            "0": "pending",
             "7": "pending",
             "14": "pending",
             "28": "pending",
             "56": "pending",
+            "90": "pending",
         },
     }
 
@@ -1066,6 +1348,33 @@ def _task_status(status: str) -> str:
     }.get(status, "queued")
 
 
+async def _validate_store_lineage(
+    store: ActionStore, action: dict[str, Any]
+) -> None:
+    validator = getattr(store, "validate_lineage", None)
+    if validator is not None:
+        await validator(action)
+
+
+async def _validate_store_wave(
+    store: ActionStore, action: dict[str, Any]
+) -> None:
+    validator = getattr(store, "validate_wave", None)
+    if validator is not None:
+        await validator(action)
+
+
+async def _reconcile_parent_run_if_terminal(
+    store: ActionStore, action: dict[str, Any]
+) -> None:
+    if action.get("status") not in {"completed", "blocked", "failed", "canceled"}:
+        return
+    run_id = action.get("run_id")
+    reconciler = getattr(store, "reconcile_parent_run", None)
+    if run_id and reconciler is not None:
+        await reconciler(str(run_id))
+
+
 def _now() -> str:
     return datetime.now(UTC).isoformat()
 
@@ -1080,10 +1389,12 @@ __all__ = [
     "complete_execution",
     "create_action",
     "execute_action",
+    "execute_action_and_reconcile",
     "get_action",
     "heartbeat_action",
     "preview_action",
     "recover_action",
+    "recover_action_and_reconcile",
     "rollback_action",
     "rollback_preview",
 ]

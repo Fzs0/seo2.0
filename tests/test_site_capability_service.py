@@ -82,14 +82,97 @@ def test_build_oemapps_capability_is_safe_and_machine_readable() -> None:
     assert item["canonical_hosts"] == ["example.com"]
     assert item["connectors"]["products"]["status"] == "available"
     assert item["supported_actions"]["product_seo"] == "approval_required"
+    assert item["action_adapters"]["product_seo"] == {
+        "adapter_id": "oemapps_on_page",
+        "adapter_version": "1",
+        "connector_type": "oemapps",
+        "read": True,
+        "write": True,
+        "readback": True,
+    }
     assert item["supported_actions"]["delete_content"] == "forbidden"
     assert item["side_effects"]["product_seo"]["variant_recreation_possible"] is True
     assert item["side_effects"]["category_seo"]["membership_reset_possible"] is True
+    assert "price" in item["protected_fields"]["product_seo"]
+    assert "category_membership" in item["protected_fields"]["category_seo"]
     assert item["connectors"]["images"]["status"] == "available"
     assert item["connectors"]["images"]["upload"] is True
     assert {"images", "image_alts", "cover_image"} <= set(item["supported_fields"]["articles"])
     assert "api_config" not in item
     assert "token" not in str(item)
+
+
+def test_shopify_product_seo_capability_requires_active_product_scopes() -> None:
+    item = build_site_capability(
+        _site(
+            site_type="shopify",
+            api_config={"connector_type": "shopify"},
+        ),
+        connectors=[
+            {
+                "id": "11111111-1111-1111-1111-111111111111",
+                "site_id": "11111111-1111-1111-1111-111111111111",
+                "status": "active",
+                "adapter": "shopify",
+                "scopes": ["read_products", "write_products"],
+                "last_success_at": datetime(2026, 7, 30, tzinfo=timezone.utc),
+                "last_error": None,
+            }
+        ],
+        generated_at=datetime(2026, 7, 30, tzinfo=timezone.utc),
+    )
+
+    assert item["connectors"]["products"]["status"] == "available"
+    assert item["supported_actions"]["product_seo"] == "approval_required"
+    assert item["supported_actions"].get("category_seo") is None
+    assert item["action_adapters"]["product_seo"]["adapter_id"] == (
+        "shopify_product_seo"
+    )
+    assert item["action_adapters"]["product_seo"]["readback"] is True
+    assert "inventory" in item["protected_fields"]["product_seo"]
+
+
+def test_shopify_write_products_implies_read_products_for_product_seo() -> None:
+    item = build_site_capability(
+        _site(
+            site_type="shopify",
+            api_config={"connector_type": "shopify"},
+        ),
+        connectors=[
+            {
+                "id": "11111111-1111-1111-1111-111111111111",
+                "site_id": "11111111-1111-1111-1111-111111111111",
+                "status": "active",
+                "adapter": "shopify",
+                "scopes": ["write_products"],
+                "last_success_at": datetime(2026, 7, 30, tzinfo=timezone.utc),
+                "last_error": None,
+            }
+        ],
+        generated_at=datetime(2026, 7, 30, tzinfo=timezone.utc),
+    )
+
+    product_health = item["connectors"]["products"]
+    assert product_health["status"] == "available"
+    assert product_health["read"] is True
+    assert product_health["write"] is True
+    assert product_health["error_code"] is None
+    assert product_health["error_summary"] is None
+    assert product_health["unlock_condition"] is None
+    assert product_health["granted_scopes"] == ["write_products"]
+    assert product_health["effective_scopes"] == [
+        "read_products",
+        "write_products",
+    ]
+    assert item["supported_actions"]["product_seo"] == "approval_required"
+    assert item["action_adapters"]["product_seo"] == {
+        "adapter_id": "shopify_product_seo",
+        "adapter_version": "1",
+        "connector_type": "shopify",
+        "read": True,
+        "write": True,
+        "readback": True,
+    }
 
 
 def test_custom_blog_does_not_claim_unimplemented_image_upload() -> None:

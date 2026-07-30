@@ -23,7 +23,6 @@ from pydantic import BaseModel, Field
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.config import get_settings
 from app.core.database import get_db
 from app.engine.locale import locale_for_project
 from app.engine.loader import get_store
@@ -40,27 +39,11 @@ from app.services.keyword_service import (
     prepare_stored_semrush_strategy_validation,
 )
 from app.services.keyword_ai_service import cancel_keyword_analysis, get_keyword_analysis, get_latest_keyword_analysis, start_keyword_analysis
-from app.services.automation_service import (
-    get_execution_status,
-    run_automation_once,
-    start_execution,
-    stop_execution,
-)
+from app.services.automation_service import get_execution_status
 from app.services.strategy_effect_service import list_effects
-from app.services.strategy_on_page_execution import (
-    execute_strategy_on_page,
-    preview_strategy_on_page,
-)
 from app.services.strategy_service import (
-    cancel_strategy,
-    clear_strategy_queue,
-    execute_strategy,
-    generate_strategies,
-    get_strategy_plan,
     list_strategies,
     list_strategy_candidates,
-    review_strategy,
-    save_strategy_plan,
 )
 from app.services.content_audit_service import get_content_audit_batch, list_ai_reviews, start_content_audit
 from app.services.article_generation_service import generate_article_pipeline, generate_legacy_article_preview
@@ -394,42 +377,6 @@ async def ai_analyze_cancel(run_id: str, session: AsyncSession = Depends(get_db)
         raise HTTPException(status_code=404, detail=str(error)) from error
 
 
-class StrategyGenerateBody(BaseModel):
-    businessId: str = Field(min_length=1)
-    siteId: str | None = None
-    limit: int = Field(default=4, ge=1, le=10)
-    actionBudget: int | None = Field(default=None, ge=0, le=200)
-    siteQuotas: dict[str, int] = Field(default_factory=dict)
-    minImpressions: int = 20
-
-
-class StrategyPlanBody(BaseModel):
-    businessId: str = Field(min_length=1)
-    actionBudget: int = Field(default=4, ge=0, le=200)
-    siteQuotas: dict[str, int] = Field(default_factory=dict)
-    selectedCandidateIds: list[str] | None = None
-
-
-class StrategyReviewBody(BaseModel):
-    approved: bool
-    executeNow: bool = False
-
-
-class StrategyOnPagePreviewBody(BaseModel):
-    patch: dict[str, Any]
-    generationMode: str = Field(pattern="^(manual|model)$")
-    generationProvider: str | None = None
-    generationModel: str | None = None
-    generationRunId: str | None = None
-
-
-class StrategyOnPageExecuteBody(StrategyOnPagePreviewBody):
-    expectedSnapshotHash: str = Field(min_length=64, max_length=64)
-    confirm: bool
-    confirmVariantRecreation: bool = False
-    confirmMembershipTopReset: bool = False
-
-
 class ContentAuditBody(BaseModel):
     businessId: str = Field(min_length=1)
     refresh: bool = True
@@ -475,22 +422,6 @@ async def list_content_audit_reviews(
     return {"items": await list_ai_reviews(session, status=status, limit=limit, business_id=business_id)}
 
 
-@router.post("/workflow/strategies/generate")
-async def generate_strategy_tasks(body: StrategyGenerateBody, session: AsyncSession = Depends(get_db)) -> dict[str, Any]:
-    try:
-        return await generate_strategies(
-            session,
-            business_id=body.businessId.strip(),
-            site_id=body.siteId,
-            limit=body.limit,
-            action_budget=body.actionBudget,
-            site_quotas=body.siteQuotas,
-            min_impressions=body.minImpressions,
-        )
-    except ValueError as error:
-        raise HTTPException(status_code=400, detail=str(error)) from error
-
-
 @router.get("/workflow/strategies/candidates")
 async def get_strategy_candidates(
     business_id: str,
@@ -516,28 +447,6 @@ async def get_strategy_effects(
 ) -> dict[str, Any]:
     scoped_business_id = business_id.strip()
     return {"items": await list_effects(session, business_id=scoped_business_id, limit=limit)}
-
-
-@router.get("/workflow/strategies/plan")
-async def get_current_strategy_plan(
-    business_id: str,
-    session: AsyncSession = Depends(get_db),
-) -> dict[str, Any] | None:
-    return await get_strategy_plan(session, business_id=business_id.strip())
-
-
-@router.put("/workflow/strategies/plan")
-async def put_strategy_plan(body: StrategyPlanBody, session: AsyncSession = Depends(get_db)) -> dict[str, Any]:
-    try:
-        return await save_strategy_plan(
-            session,
-            business_id=body.businessId.strip(),
-            action_budget=body.actionBudget,
-            site_quotas=body.siteQuotas,
-            selected_candidate_ids=body.selectedCandidateIds,
-        )
-    except ValueError as error:
-        raise HTTPException(status_code=400, detail=str(error)) from error
 
 
 @router.get("/workflow/strategies")
@@ -567,140 +476,9 @@ async def get_strategy_tasks(
     }
 
 
-@router.post("/workflow/strategies/{task_id}/review")
-async def review_strategy_task(task_id: str, body: StrategyReviewBody, session: AsyncSession = Depends(get_db)) -> dict[str, Any]:
-    try:
-        result = await review_strategy(session, task_id=task_id, approved=body.approved)
-        if body.approved and body.executeNow:
-            return await start_execution(session, task_id)
-        return result
-    except ValueError as error:
-        raise HTTPException(status_code=404, detail=str(error)) from error
-
-
-@router.post("/workflow/strategies/{task_id}/execute")
-async def execute_strategy_task(task_id: str, session: AsyncSession = Depends(get_db)) -> dict[str, Any]:
-    try:
-        return await execute_strategy(session, task_id=task_id)
-    except ValueError as error:
-        raise HTTPException(status_code=400, detail=str(error)) from error
-
-
-@router.post("/workflow/strategies/{task_id}/on-page/preview")
-async def preview_strategy_on_page_task(
-    task_id: str,
-    body: StrategyOnPagePreviewBody,
-    session: AsyncSession = Depends(get_db),
-) -> dict[str, Any]:
-    try:
-        return await preview_strategy_on_page(
-            session,
-            strategy_task_id=task_id,
-            patch=body.patch,
-            generation_mode=body.generationMode,
-            generation_provider=body.generationProvider,
-            generation_model=body.generationModel,
-            generation_run_id=body.generationRunId,
-        )
-    except ValueError as error:
-        raise HTTPException(status_code=400, detail=str(error)) from error
-
-
-@router.post("/workflow/strategies/{task_id}/on-page/execute")
-async def execute_strategy_on_page_task(
-    task_id: str,
-    body: StrategyOnPageExecuteBody,
-    session: AsyncSession = Depends(get_db),
-) -> dict[str, Any]:
-    try:
-        return await execute_strategy_on_page(
-            session,
-            strategy_task_id=task_id,
-            patch=body.patch,
-            expected_snapshot_hash=body.expectedSnapshotHash,
-            confirm=body.confirm,
-            confirm_variant_recreation=body.confirmVariantRecreation,
-            confirm_membership_top_reset=body.confirmMembershipTopReset,
-            generation_mode=body.generationMode,
-            generation_provider=body.generationProvider,
-            generation_model=body.generationModel,
-            generation_run_id=body.generationRunId,
-        )
-    except ValueError as error:
-        raise HTTPException(status_code=400, detail=str(error)) from error
-
-
-@router.post("/workflow/strategies/{task_id}/cancel")
-async def cancel_strategy_task(task_id: str, session: AsyncSession = Depends(get_db)) -> dict[str, Any]:
-    try:
-        return await cancel_strategy(session, task_id=task_id)
-    except ValueError as error:
-        raise HTTPException(status_code=400, detail=str(error)) from error
-
-
-@router.post("/workflow/automation/run-once")
-async def run_automation_task(session: AsyncSession = Depends(get_db)) -> dict[str, Any]:
-    settings = get_settings()
-    return await run_automation_once(
-        session,
-        batch_size=settings.automation_batch_size,
-        min_impressions=settings.automation_min_impressions,
-    )
-
-
-@router.post("/workflow/strategies/{strategy_task_id}/stop")
-async def stop_automation_execution(strategy_task_id: str, session: AsyncSession = Depends(get_db)) -> dict[str, Any]:
-    try:
-        return await stop_execution(session, strategy_task_id)
-    except ValueError as error:
-        return {"ok": False, "status": "not_running", "execution_task_id": None, "error": str(error)}
-
-
-@router.post("/workflow/automation/clear-queue")
-async def clear_automation_queue(business_id: str, session: AsyncSession = Depends(get_db)) -> dict[str, int]:
-    try:
-        return await clear_strategy_queue(session, business_id=business_id.strip())
-    except ValueError as error:
-        raise HTTPException(status_code=409, detail=str(error)) from error
-
-
 @router.get("/workflow/automation/status")
 async def automation_status(business_id: str | None = None, session: AsyncSession = Depends(get_db)) -> dict[str, Any]:
     return await get_execution_status(session, business_id=business_id.strip() if business_id else None)
-
-
-class AutomationSettingsBody(BaseModel):
-    enabled: bool = False
-    intervalSeconds: int = Field(default=3600, ge=60, le=604800)
-    batchSize: int = Field(default=1, ge=1, le=5)
-    minImpressions: int = Field(default=20, ge=0, le=1000000)
-
-
-@router.post("/workflow/automation/settings")
-async def save_automation_settings(body: AutomationSettingsBody) -> dict[str, Any]:
-    from pathlib import Path
-
-    target = Path(__file__).resolve().parents[3] / ".env"
-    lines = target.read_text(encoding="utf-8").splitlines() if target.exists() else []
-    updates = {
-        "AUTOMATION_ENABLED": str(body.enabled).lower(),
-        "AUTOMATION_INTERVAL_SECONDS": str(body.intervalSeconds),
-        "AUTOMATION_BATCH_SIZE": str(body.batchSize),
-        "AUTOMATION_MIN_IMPRESSIONS": str(body.minImpressions),
-    }
-    seen: set[str] = set()
-    output: list[str] = []
-    for line in lines:
-        key = line.split("=", 1)[0].strip() if "=" in line else ""
-        if key in updates:
-            output.append(f"{key}={updates[key]}")
-            seen.add(key)
-        else:
-            output.append(line)
-    output.extend(f"{key}={value}" for key, value in updates.items() if key not in seen)
-    target.write_text("\n".join(output) + "\n", encoding="utf-8")
-    get_settings.cache_clear()
-    return {"saved": True, "restart_required": True, **updates}
 
 
 # ---------- Brief / Prompt / Article ----------

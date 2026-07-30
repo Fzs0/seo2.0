@@ -9,15 +9,18 @@ from __future__ import annotations
 
 import json
 import re
-from datetime import UTC, datetime
+import hashlib
+from datetime import UTC, datetime, timedelta
 from html import unescape
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
+from uuid import uuid4
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
+from app.clients.publishers import ImageUploadRequest, connector_for_site
 from app.services.article_generation_service import _qa, _slug
 from app.services.article_service import save_article
 from app.services.publish_service import publish_article
@@ -27,7 +30,8 @@ from app.services.strategy_effect_service import (
     ensure_effect,
     mark_effect_published,
 )
-from app.services.strategy_service import review_strategy
+from app.services.site_capability_service import get_site_capabilities
+from app.services.strategy_action_service import SQLActionStore
 
 
 ARTICLE_ACTIONS = frozenset({"new_article", "update_article"})
@@ -89,6 +93,11 @@ class StrategyArticleActionAdapter:
             return {
                 "result": "blocked",
                 "block_reason": "action_adapter_not_configured_for_action_type",
+            }
+        if action.get("run_mode") != "approval_execution":
+            return {
+                "result": "blocked",
+                "block_reason": "dry_run_actions_cannot_execute",
             }
         context = await _load_action_context(self.session, action)
         patch = canonical_article_patch(
@@ -330,8 +339,9 @@ async def get_article_generation_context(
     session: AsyncSession,
     *,
     action_id: str,
+    preflight_token: str | None = None,
 ) -> dict[str, Any]:
-    """Return read-only evidence required for Codex to author an article patch."""
+    """Return evidence only after the formal-plan preflight has passed."""
     action_row = (
         await session.execute(
             text(
@@ -344,6 +354,222 @@ async def get_article_generation_context(
     if not action_row:
         raise ValueError("strategy action not found")
     action = dict(action_row["payload"] or {})
+    _validate_preflight_token(action, preflight_token)
+    await SQLActionStore(session).validate_lineage(action)
+    await _validate_current_preflight_capability(session, action)
+    return await _build_article_generation_context(
+        session, action_id=action_id, action=action
+    )
+
+
+async def preflight_article_action(
+    session: AsyncSession,
+    *,
+    action_id: str,
+    idempotency_key: str,
+) -> dict[str, Any]:
+    """Validate lineage, capabilities, identity, readback, and media before generation."""
+    store = SQLActionStore(session)
+    action = await store.get(action_id, lock=True)
+    if action.get("action_type") not in ARTICLE_ACTIONS:
+        raise ValueError("preflight is available only for article actions")
+    await store.validate_lineage(action, lock=True)
+    if action.get("status") not in {"planned", "previewed"}:
+        raise ValueError("article generation preflight requires a planned Action")
+    receipts = dict(action.get("preflight_receipts") or {})
+    prior = receipts.get(idempotency_key)
+    if prior and prior == action.get("preflight_token"):
+        _validate_preflight_token(action, prior)
+        await _validate_current_preflight_capability(session, action)
+        context = await _build_article_generation_context(
+            session, action_id=action_id, action=action
+        )
+        return {
+            "ready": True,
+            "preflight_token": prior,
+            "expires_at": action.get("preflight_expires_at"),
+            "idempotency_replayed": True,
+            "generation_context": context,
+        }
+    context = await _load_action_context(session, action)
+    current_capability = await get_site_capabilities(
+        session,
+        str(action["site_id"]),
+        expected_business_id=str(action["business_id"]),
+    )
+    if not current_capability:
+        raise ValueError("current site capability snapshot is unavailable")
+    stored_capability = action.get("capability_snapshot") or {}
+    if (
+        current_capability.get("capability_snapshot_hash")
+        != stored_capability.get("capability_snapshot_hash")
+    ):
+        raise ValueError("site capability changed; re-plan before generation")
+    permission = (current_capability.get("supported_actions") or {}).get(
+        action["action_type"]
+    )
+    if permission not in {"approval_required", "allowed", "execute"}:
+        raise ValueError("article action capability is no longer executable")
+    if not context.get("market") or not context.get("language_code"):
+        raise ValueError("target market and language must be configured")
+    public_site = _public_site(context["site"])
+    if not public_site.get("domain") and not public_site.get("base_url"):
+        raise ValueError("public site identity is unavailable")
+    if action.get("action_type") == "update_article" and not context.get(
+        "post_external_id"
+    ):
+        raise ValueError("approved update target has no remote article ID")
+    if not _image_patch_supported(action) or not _cover_patch_supported(action):
+        raise ValueError(
+            "strategy article requires both content-image upload and cover-image capability"
+        )
+    token = str(uuid4())
+    expires_at = (datetime.now(UTC) + timedelta(minutes=30)).isoformat()
+    receipts[idempotency_key] = token
+    action.update(
+        {
+            "preflight_status": "ready",
+            "preflight_token": token,
+            "preflight_expires_at": expires_at,
+            "preflight_capability_snapshot_hash": current_capability.get(
+                "capability_snapshot_hash"
+            ),
+            "preflight_plan_id": action.get("plan_id"),
+            "preflight_strategy_task_id": action.get(
+                "source_strategy_task_id"
+            ),
+            "preflight_receipts": receipts,
+        }
+    )
+    await store.save(action)
+    generation_context = await _build_article_generation_context(
+        session, action_id=action_id, action=action
+    )
+    return {
+        "ready": True,
+        "preflight_token": token,
+        "expires_at": expires_at,
+        "generation_context": generation_context,
+    }
+
+
+async def upload_strategy_article_image(
+    session: AsyncSession,
+    *,
+    action_id: str,
+    preflight_token: str,
+    idempotency_key: str,
+    request: ImageUploadRequest,
+    dry_run: bool,
+) -> dict[str, Any]:
+    """Upload media only for a currently valid, preflighted Strategy Action."""
+    store = SQLActionStore(session)
+    action = await store.get(action_id, lock=True)
+    _validate_preflight_token(action, preflight_token)
+    await store.validate_lineage(action)
+    await _validate_current_preflight_capability(session, action)
+    if action.get("run_mode") == "dry_run" and not dry_run:
+        raise ValueError("dry-run Strategy Actions cannot upload remote media")
+    if not _image_patch_supported(action) or not _cover_patch_supported(action):
+        raise ValueError("strategy media upload capability is unavailable")
+    request_hash = hashlib.sha256(
+        json.dumps(
+            {
+                "payload": request.payload(),
+                "filename": request.filename,
+                "alt_text": request.alt_text,
+                "title": request.title,
+                "caption": request.caption,
+                "dry_run": dry_run,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+    receipts = dict(action.get("media_upload_receipts") or {})
+    receipt = receipts.get(idempotency_key)
+    if receipt:
+        if receipt.get("request_hash") != request_hash:
+            raise ValueError("media upload idempotency key is bound to another request")
+        if receipt.get("status") == "completed":
+            return {**dict(receipt.get("response") or {}), "idempotency_replayed": True}
+        raise ValueError(
+            "media upload outcome is unresolved; verify remotely before retrying"
+        )
+    receipts[idempotency_key] = {
+        "request_hash": request_hash,
+        "status": "in_progress",
+    }
+    action["media_upload_receipts"] = receipts
+    await store.save(action)
+    row = (
+        await session.execute(
+            text(
+                """
+                SELECT id, site_key, name, site_type, domain, base_url,
+                       api_base_url, status, api_config
+                  FROM seo_agent.sites
+                 WHERE id=CAST(:id AS uuid)
+                """
+            ),
+            {"id": action["site_id"]},
+        )
+    ).mappings().first()
+    if not row or row["status"] != "active":
+        raise ValueError("strategy media target site is not active")
+    connector = connector_for_site(dict(row), dry_run=dry_run)
+    try:
+        result = await connector.upload_image(request)
+    except Exception as error:
+        action = await store.get(action_id, lock=True)
+        receipts = dict(action.get("media_upload_receipts") or {})
+        receipts[idempotency_key] = {
+            "request_hash": request_hash,
+            "status": "unknown_remote_state",
+            "error_type": type(error).__name__,
+        }
+        action["media_upload_receipts"] = receipts
+        await store.save(action)
+        raise ValueError(
+            "strategy image upload outcome is unknown; verify remotely before retrying"
+        ) from error
+    if not result.ok:
+        action = await store.get(action_id, lock=True)
+        receipts = dict(action.get("media_upload_receipts") or {})
+        receipts[idempotency_key] = {
+            "request_hash": request_hash,
+            "status": "failed",
+        }
+        action["media_upload_receipts"] = receipts
+        await store.save(action)
+        raise ValueError(result.error or "strategy image upload failed")
+    response = {
+        "ok": True,
+        "dry_run": result.dry_run,
+        "site_id": str(action["site_id"]),
+        "action_id": action_id,
+        "image_id": result.image_id,
+        "src": result.src,
+        "raw": result.raw,
+    }
+    action = await store.get(action_id, lock=True)
+    receipts = dict(action.get("media_upload_receipts") or {})
+    receipts[idempotency_key] = {
+        "request_hash": request_hash,
+        "status": "completed",
+        "response": response,
+    }
+    action["media_upload_receipts"] = receipts
+    await store.save(action)
+    return response
+
+
+async def _build_article_generation_context(
+    session: AsyncSession,
+    *,
+    action_id: str,
+    action: dict[str, Any],
+) -> dict[str, Any]:
     if action.get("action_type") not in ARTICLE_ACTIONS:
         raise ValueError("generation context is available only for article actions")
     context = await _load_action_context(session, action)
@@ -395,12 +621,50 @@ async def get_article_generation_context(
             "status",
         ],
         "image_upload_endpoint": (
-            f"/api/v1/sites/{action['site_id']}/images/upload"
+            f"/api/v1/strategy-actions/{action_id}/images/upload"
             if image_patch_supported or cover_patch_supported
             else None
         ),
         "next_step": f"POST /api/v1/strategy-actions/{action_id}/preview",
     }
+
+
+def _validate_preflight_token(
+    action: dict[str, Any], preflight_token: str | None
+) -> None:
+    if not preflight_token or preflight_token != action.get("preflight_token"):
+        raise ValueError("a valid strategy Action preflight token is required")
+    expires_at = action.get("preflight_expires_at")
+    try:
+        expiry = datetime.fromisoformat(str(expires_at).replace("Z", "+00:00"))
+    except (TypeError, ValueError) as error:
+        raise ValueError("strategy Action preflight token is invalid") from error
+    if not expiry.tzinfo:
+        expiry = expiry.replace(tzinfo=UTC)
+    if expiry <= datetime.now(UTC):
+        raise ValueError("strategy Action preflight token has expired")
+    if action.get("preflight_plan_id") != action.get("plan_id"):
+        raise ValueError("strategy plan changed after preflight")
+    if action.get("preflight_strategy_task_id") != action.get(
+        "source_strategy_task_id"
+    ):
+        raise ValueError("formal strategy changed after preflight")
+
+
+async def _validate_current_preflight_capability(
+    session: AsyncSession, action: dict[str, Any]
+) -> None:
+    current = await get_site_capabilities(
+        session,
+        str(action["site_id"]),
+        expected_business_id=str(action["business_id"]),
+    )
+    if not current:
+        raise ValueError("current site capability snapshot is unavailable")
+    if current.get("capability_snapshot_hash") != action.get(
+        "preflight_capability_snapshot_hash"
+    ):
+        raise ValueError("site capability changed after preflight")
 
 
 async def _load_action_context(
@@ -675,22 +939,150 @@ async def _ensure_approved_execution(
     action: dict[str, Any],
     context: dict[str, Any],
 ) -> str:
-    decision = dict(context.get("strategy_decision") or {})
-    execution_id = str(decision.get("execution_task_id") or "")
-    if context.get("strategy_status") == "queued":
-        reviewed = await review_strategy(
-            session,
-            task_id=str(action["source_strategy_task_id"]),
-            approved=True,
+    if action.get("run_mode") != "approval_execution":
+        raise ValueError("dry-run Strategy Actions cannot create execution records")
+    source_strategy_task_id = str(action["source_strategy_task_id"])
+    await session.execute(
+        text("SELECT pg_advisory_xact_lock(hashtext(:key))"),
+        {"key": f"strategy-action-execution:{action['action_id']}"},
+    )
+    existing = (
+        await session.execute(
+            text(
+                """
+                SELECT id::text AS id
+                  FROM seo_agent.tasks
+                 WHERE task_type IN ('new_article','update_article')
+                   AND payload->>'strategy_action_id'=:action_id
+                 ORDER BY created_at ASC
+                 LIMIT 1
+                """
+            ),
+            {"action_id": str(action["action_id"])},
         )
-        execution_id = str(reviewed.get("execution_task_id") or "")
-    elif context.get("strategy_status") == "done":
-        if decision.get("review_status") != "approved":
-            raise ValueError("bound seo_strategy is not approved")
-    else:
-        raise ValueError("bound seo_strategy is no longer approvable")
-    if not execution_id:
-        raise ValueError("approved seo_strategy did not create an execution task")
+    ).mappings().first()
+    if existing:
+        await session.commit()
+        return str(existing["id"])
+
+    strategy = (
+        await session.execute(
+            text(
+                """
+                SELECT t.id::text AS id, t.status, t.priority, t.score,
+                       t.site_id::text AS site_id, t.keyword_id::text AS keyword_id,
+                       t.post_id::text AS post_id, t.article_id::text AS article_id,
+                       t.title, t.decision,
+                       t.payload->>'business_id' AS business_id,
+                       t.payload->>'plan_id' AS plan_id,
+                       t.payload->>'strategy_run_id' AS strategy_run_id,
+                       t.payload->>'schedule_class' AS schedule_class
+                  FROM seo_agent.tasks t
+                 WHERE t.id=CAST(:id AS uuid)
+                   AND t.task_type='review'
+                   AND t.payload->>'kind'='seo_strategy'
+                 FOR UPDATE
+                """
+            ),
+            {"id": source_strategy_task_id},
+        )
+    ).mappings().first()
+    if not strategy:
+        raise ValueError("bound seo_strategy task not found")
+    if strategy["status"] not in {"queued", "done"}:
+        raise ValueError("bound seo_strategy is no longer executable")
+    if strategy["schedule_class"] != "execute_now":
+        raise ValueError("only execute_now formal strategies can create Actions")
+    if (
+        str(strategy["business_id"]) != str(action["business_id"])
+        or str(strategy["site_id"]) != str(action["site_id"])
+        or str(strategy["plan_id"]) != str(action["plan_id"])
+        or str(strategy["strategy_run_id"]) != str(action["run_id"])
+    ):
+        raise ValueError("Strategy Action lineage changed before execution")
+
+    decision = dict(strategy.get("decision") or {})
+    execution_type = str(action["action_type"])
+    execution_id = str(uuid4())
+    target_url = str(action.get("target_url") or "").strip() or None
+    await session.execute(
+        text(
+            """
+            INSERT INTO seo_agent.tasks
+              (id, task_type, status, priority, score, site_id, keyword_id,
+               post_id, article_id, title, target_url, payload, required_data,
+               decision, logs, started_at)
+            VALUES
+              (CAST(:id AS uuid), :task_type, 'running', :priority, :score,
+               CAST(:site_id AS uuid), CAST(:keyword_id AS uuid),
+               CAST(:post_id AS uuid), CAST(:article_id AS uuid), :title,
+               :target_url, CAST(:payload AS jsonb), :required_data,
+               CAST(:execution_decision AS jsonb),
+               jsonb_build_array(jsonb_build_object(
+                 'stage','running',
+                 'message','Unified Strategy Action claimed the execution.',
+                 'at',now()
+               )),
+               now())
+            """
+        ),
+        {
+            "id": execution_id,
+            "task_type": execution_type,
+            "priority": strategy["priority"] or "P2",
+            "score": strategy["score"] or 0,
+            "site_id": strategy["site_id"],
+            "keyword_id": strategy["keyword_id"],
+            "post_id": strategy["post_id"],
+            "article_id": strategy["article_id"],
+            "title": f"Strategy Action: {strategy['title']}",
+            "target_url": target_url,
+            "payload": json.dumps(
+                {
+                    "strategy_task_id": source_strategy_task_id,
+                    "strategy_action_id": str(action["action_id"]),
+                    "strategy_run_id": str(action["run_id"]),
+                    "strategy": decision,
+                    "scope_key": decision.get("scope_key"),
+                    "strategy_fingerprint": decision.get("strategy_fingerprint"),
+                    "evidence_fingerprint": decision.get("evidence_fingerprint"),
+                },
+                ensure_ascii=False,
+            ),
+            "required_data": ["approved_strategy_action"],
+            "execution_decision": json.dumps(
+                {
+                    "source_strategy_id": source_strategy_task_id,
+                    "strategy_action_id": str(action["action_id"]),
+                    "strategy_type": execution_type,
+                    "current_stage": "running",
+                },
+                ensure_ascii=False,
+            ),
+        },
+    )
+    decision.update(
+        {
+            "review_status": "approved_via_strategy_action",
+            "execution_task_id": execution_id,
+            "execution_status": "running",
+        }
+    )
+    await session.execute(
+        text(
+            """
+            UPDATE seo_agent.tasks
+               SET status='done', decision=CAST(:decision AS jsonb),
+                   finished_at=COALESCE(finished_at, now()), updated_at=now()
+             WHERE id=CAST(:id AS uuid)
+            """
+        ),
+        {
+            "id": source_strategy_task_id,
+            "decision": json.dumps(decision, ensure_ascii=False),
+        },
+    )
+    await session.commit()
     return execution_id
 
 
@@ -1237,5 +1629,7 @@ __all__ = [
     "StrategyArticleActionAdapter",
     "canonical_article_patch",
     "get_article_generation_context",
+    "preflight_article_action",
+    "upload_strategy_article_image",
     "normalize_remote_article",
 ]

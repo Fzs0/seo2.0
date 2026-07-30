@@ -1,6 +1,17 @@
 # SEO Workbench 项目进度
 
-更新时间：2026-07-28（Asia/Shanghai）
+更新时间：2026-07-30（Asia/Shanghai）
+
+2026-07-30 AI On-page 统一 Action 已完成后端接入：AI 仍以 `on_page_fix`
+提交编辑决策，Formal Plan 转换为具体首页、产品、分类或图片 ALT Action；新增
+精确 `(connector_type, action_type)` Router、OEMApps 首页/产品/分类 Adapter
+和 Shopify 产品 SEO Adapter。Run-local 会从现有数据库校验业务、站点、本地
+资产、远端 ID、公开 URL 与连接器归属；审批绑定能力、before、patch、目标、
+Adapter 版本及平台副作用确认；写后独立回读，不一致只生成一次 P1 且不创建
+正向观察。成功动作建立 T+0/7/14/28/56/90 天页面级观察。旧 workflow
+On-page 旁路保持退役，前端未修改，仍为只读看板。Custom OpenAPI 未声明安全
+写入和独立回读时继续 Hold；Shopify 首页/分类继续 Hold；WordPress TDK 继续
+走 `update_article`。本轮没有连接生产数据库，也没有执行任何真实远端写入。
 
 > 新窗口先阅读本文，再检查 `git status --short`。工作区有大量已有修改，禁止 `git reset --hard`、批量回滚或覆盖无关文件。
 >
@@ -24,11 +35,31 @@
 | 自定义商品数据连接器 | 后端已实现并完成本地验证 | 通用连接器保持只读；支持配置、样例预览、真实请求测试、版本、激活、分页同步和 SEO 缺口审计；尚未制作前端配置页 |
 | 自建站 OEMApps 商品接口 | 后端已实现，待站点配置验收 | 所有自建站共用内置读取/修改协议，每站只配置 Token；SEO 修改要求预览、快照确认、单商品 PUT、审计和回读；Shopify 暂缓 |
 | SEO 自主运营后端 V2 | 人工审批执行版已实现 | PostgreSQL 17、完整 Strategy Run、全站覆盖、能力快照、统一 Action、执行租约、平台回读、异常脱敏和效果观察已接入；生产真实写 adapter 仍受认证与业务授权门禁阻塞 |
+| 正式策略执行链 | 代码与 PG17 门禁已收口 | Action 执行/恢复到终态后自动推动父级 Run 完成验证、观察和收口；`/reconcile` 仅作为幂等人工兜底，不再依赖第二次 `/start` |
 | 内容审计长任务 | 已改为异步可轮询 | POST 快速返回批次，同业务进行中任务自动复用；客户端超时不再等同于审计失败 |
 | Strategy Run 启动 | SQL 根因已修复，待受控重放 | PG17 参数类型、同键重放、冲突检测和失败标记清理已通过真实数据库测试；原三个 queued Run 尚未重放 |
 | 当前运行环境 | 本轮源码已加载并通过指纹校验 | 本地 8000 后端健康，`source_drift=false`；后续源码变化必须重启 |
 
 当前最近的安全动作是：先对 HealthyOxy、Avinoti、Exdivo 现有三个 queued Strategy Run 做一次受控重放，只检查事件、站点覆盖矩阵、能力快照和 Action 预览，不批准或执行远端写入。三站回读通过后，再选择 1 条低风险动作进行人工审批验收。真实回读完成前，不能把 V2 描述为全自动生产上线。
+
+### 2026-07-30 正式 Strategy 生命周期收口
+
+- 正式生产路由现统一调用 Action 生命周期协调接口：Action 执行或恢复到终态后，
+  自动从已持久化 Action 结果推动父级 Run 的 `executing → verifying → observing`
+  及最终状态，不再要求客户端额外调用第二次 `/start`。
+- 增加 `POST /strategy-runs/{run_id}/reconcile` 幂等人工恢复入口；该入口只做数据库
+  状态收口，不调用远端写接口。多个 Action 同时结束时，CAS 冲突会重新读取最新
+  Run 状态并有限重试。
+- PG17 无网络写入端到端门禁已覆盖
+  `Run → Formal Plan → Action → preview → approve → execute → readback
+  → Observation → Run completed`，并核对观察任务只创建 1 条。
+- 本轮验证：主项目 `593 passed, 19 skipped`；PG17 发布门禁 `17 passed`；
+  前端测试 `11 passed`，生产构建通过；修改文件 Python 编译通过。PG17 使用独立
+  临时测试库，未连接生产数据库、未执行生产 migration、未调用真实远端写入。
+- 本地 8000 后端已通过项目规定的 `start-backend.bat restart` 加载本轮源码；
+  健康接口为 `ok=true`、`source_drift=false`，运行态 OpenAPI 为 7 个 Run 路径、
+  11 个 Action 路径、旧执行旁路 0。启动脚本本身以前台方式驻留，Codex 调用会
+  显示超时，但后端进程和健康检查均正常。
 
 ### 2026-07-26 主项目稳定化检查点
 
@@ -336,6 +367,11 @@ POST /api/v1/publish
 ## 6. 最近验证结果
 
 ```text
+2026-07-30 AI On-page 统一 Action 后端全量回归：621 passed, 25 skipped
+2026-07-30 PostgreSQL 17.10 隔离发布门禁：23 passed（含 OEMApps/Shopify product_seo 完整 Run-local→Plan→Action→Observation，以及能力变化、回读不一致、缺失 Adapter 的默认禁止场景）
+2026-07-30 On-page/Action/Capability/底层 writer 组合回归：109 passed
+2026-07-30 前端 TypeScript + Vite production build：通过；未修改前端源码
+2026-07-30 Python compileall：通过；真实远端写入：0；生产数据库迁移：0
 2026-07-28 当前主项目普通全量回归：536 passed, 9 skipped（PG17 集成项在无测试 DSN 时跳过）
 2026-07-28 PostgreSQL 17.10 独立发布门禁：9 passed，缺少 PG17 测试连接时硬失败
 2026-07-28 内容审计与 Strategy Run 针对性组合回归：36 passed

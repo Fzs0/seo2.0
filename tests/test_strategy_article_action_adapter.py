@@ -261,7 +261,7 @@ async def test_article_adapter_preview_reads_the_bound_update_target() -> None:
 
 
 @pytest.mark.asyncio
-async def test_generation_context_hides_image_patch_when_snapshot_cannot_upload() -> None:
+async def test_generation_context_is_blocked_before_preflight() -> None:
     class Rows:
         def __init__(self, rows):
             self.rows = rows
@@ -350,13 +350,11 @@ async def test_generation_context_hides_image_patch_when_snapshot_cannot_upload(
                 return Rows([])
             raise AssertionError(f"unexpected SQL: {sql}")
 
-    result = await service.get_article_generation_context(
-        Session(),  # type: ignore[arg-type]
-        action_id="action-1",
-    )
-
-    assert result["optional_patch_fields"] == []
-    assert result["image_upload_endpoint"] is None
+    with pytest.raises(ValueError, match="preflight token"):
+        await service.get_article_generation_context(
+            Session(),  # type: ignore[arg-type]
+            action_id="action-1",
+        )
 
 
 @pytest.mark.asyncio
@@ -438,9 +436,10 @@ async def test_article_adapter_execute_bridges_approval_publish_readback_and_eff
     adapter = service.StrategyArticleActionAdapter(Session())  # type: ignore[arg-type]
     result = await adapter.execute(
         {
-            "action_id": "action-1",
-            "run_id": "run-1",
-            "business_id": "avinoti",
+                "action_id": "action-1",
+                "run_id": "run-1",
+                "run_mode": "approval_execution",
+                "business_id": "avinoti",
             "site_id": "site-1",
             "source_strategy_task_id": "strategy-1",
             "action_type": "new_article",

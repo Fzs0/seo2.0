@@ -5,10 +5,9 @@ from app.services.strategy_service import (
     _build_strategy,
     _candidate_keys,
     _required_strategy_data,
-    _finish_execution_task,
+    _schedule_strategy_options,
     _select_daily_candidates,
     generate_strategies,
-    review_strategy,
 )
 
 
@@ -16,6 +15,95 @@ def test_required_data_matches_the_selected_action_type():
     assert "gsc_28d" not in _required_strategy_data("new_article")
     assert _required_strategy_data("on_page_fix") == ["site_asset", "seo_audit"]
     assert "gsc_28d" in _required_strategy_data("update_article")
+
+
+def test_safety_ceiling_defers_but_never_drops_qualified_options():
+    options = [
+        {
+            "id": f"candidate-{index}",
+            "site_id": f"site-{index}",
+            "strategy_type": "new_article",
+            "priority": "P1",
+            "score": 90 - index,
+            "risk_gate_passed": True,
+            "site_configuration_ready": True,
+        }
+        for index in range(3)
+    ]
+
+    scheduled = _schedule_strategy_options(
+        options,
+        safety_action_ceiling=1,
+        site_safety_ceilings={},
+    )
+
+    assert len(scheduled) == 3
+    assert [item["schedule_class"] for item in scheduled].count("execute_now") == 1
+    assert [item["schedule_class"] for item in scheduled].count("deferred") == 2
+    assert all(item.get("schedule_reason") for item in scheduled)
+
+
+def test_candidate_and_keyword_are_optional_strategy_sources():
+    scheduled = _schedule_strategy_options(
+        [
+            {
+                "option_id": "run-local-option",
+                "candidate_id": None,
+                "keyword_id": None,
+                "site_id": "site-a",
+                "strategy_type": "new_article",
+                "priority": "P1",
+                "score": 88,
+                "risk_gate_passed": True,
+                "site_configuration_ready": True,
+            }
+        ],
+        safety_action_ceiling=10,
+        site_safety_ceilings={},
+    )
+
+    assert scheduled[0]["schedule_class"] == "execute_now"
+    assert scheduled[0]["candidate_id"] is None
+    assert scheduled[0]["keyword_id"] is None
+
+
+def test_codex_research_schedule_is_preserved_instead_of_reselected_by_score():
+    scheduled = _schedule_strategy_options(
+        [
+            {
+                "option_id": "deferred-high-score",
+                "option_origin": "codex_research",
+                "requested_schedule_class": "deferred",
+                "schedule_class": "deferred",
+                "schedule_reason": "Wait for the active observation window.",
+                "site_id": "site-a",
+                "strategy_type": "new_article",
+                "priority": "P0",
+                "score": 100,
+                "risk_gate_passed": True,
+                "site_configuration_ready": True,
+            },
+            {
+                "option_id": "execute-lower-score",
+                "option_origin": "codex_research",
+                "requested_schedule_class": "execute_now",
+                "schedule_class": "execute_now",
+                "schedule_reason": "Current evidence is ready.",
+                "site_id": "site-b",
+                "strategy_type": "new_article",
+                "priority": "P2",
+                "score": 40,
+                "risk_gate_passed": True,
+                "site_configuration_ready": True,
+            },
+        ],
+        safety_action_ceiling=10,
+        site_safety_ceilings={},
+    )
+
+    by_id = {item["option_id"]: item for item in scheduled}
+    assert by_id["deferred-high-score"]["schedule_class"] == "deferred"
+    assert by_id["execute-lower-score"]["schedule_class"] == "execute_now"
 
 
 def test_hold_refresh_is_claimed_only_after_coverage_decides_all_hold():
@@ -26,14 +114,6 @@ def test_hold_refresh_is_claimed_only_after_coverage_decides_all_hold():
         "register_hold_decision_and_claim_refresh"
     )
     assert "claim_hold_evidence_refresh(" not in source
-
-
-def test_finish_execution_task_uses_explicit_text_casts():
-    import inspect
-
-    source = inspect.getsource(_finish_execution_task)
-    assert "CAST(:status AS text)" in source
-    assert "CAST(:error_message AS text)" in source
 
 
 def test_strategy_scope_uses_business_and_explicit_site_switch():
@@ -154,13 +234,6 @@ async def test_strategy_generation_without_business_audit_is_read_only():
 
     assert len(session.statements) == 2
     assert not any(statement.lstrip().upper().startswith(("INSERT", "UPDATE", "DELETE")) for statement in session.statements)
-
-
-def test_strategy_scope_is_rechecked_before_external_execution():
-    import app.services.strategy_service as service
-
-    assert service.execute_strategy.__module__ == "app.services.strategy_execution"
-    assert service._validate_current_strategy.__module__ == "app.services.strategy_execution"
 
 
 def test_daily_candidates_cover_each_site_first():
@@ -411,17 +484,9 @@ def test_site_coverage_keeps_decisions_when_daily_budget_is_zero():
     coverage = _build_site_coverage(sites, candidates=candidates, selected=[])
 
     assert coverage["complete"] is True
-    assert coverage["decisions"] == [
-        {
-            "site_id": "site-a",
-            "site_name": "A",
-            "action": "hold",
-            "reason": "Candidate exists but is not in the current action budget.",
-            "unlock_condition": "Increase or free the site action budget, then re-evaluate the candidate.",
-            "candidate_count": 1,
-            "selected_candidate_id": None,
-        }
-    ]
+    assert coverage["decisions"][0]["action"] == "new_article"
+    assert coverage["decisions"][0]["schedule_class"] == "deferred"
+    assert coverage["decisions"][0]["selected_option_id"] == "candidate-a"
 
 
 def test_strategy_generation_persists_full_pool_before_daily_selection():
@@ -435,9 +500,12 @@ def test_strategy_generation_persists_full_pool_before_daily_selection():
     assert '"min_impressions": max(1, min_impressions)' in source
     assert '"kind": "strategy_candidate"' in source
     assert "('review', 'done', :priority, :score" in source
-    assert source.index("for row in candidate_rows") < source.index("_select_daily_candidates(candidates")
+    assert source.index("for row in candidate_rows") < source.index(
+        "_schedule_strategy_options("
+    )
     assert '"total_candidates": len(candidates)' in source
-    assert '"planned_actions": len(plan["items"])' in source
+    assert '"planned_actions": len(selected)' in source
+    assert '"deferred_actions": len(deferred)' in source
 
 
 def test_candidate_keys_are_stable_and_evidence_version_changes():
@@ -469,119 +537,25 @@ def test_candidate_keys_are_stable_and_evidence_version_changes():
     )[0]
 
 
-def test_clear_queue_cancels_instead_of_deleting_history():
-    import inspect
-    import app.services.strategy_service as service
-
-    source = inspect.getsource(service.clear_strategy_queue)
-    assert "DELETE FROM seo_agent.tasks" not in source
-    assert "status = 'canceled'" in source
-    assert "strategy_plan" in source
-    assert "strategy_candidate" in source
-    assert "strategy_analysis_batch" in source
-    assert "business_id: str" in source
-    assert "s.business_id = :business_id" in source
-    assert "payload->>'business_id' = :business_id" in source
-
-
 def test_canceled_strategy_batches_are_hidden_from_candidate_pool():
     import inspect
     import app.services.strategy_service as service
 
     source = inspect.getsource(service.list_strategy_candidates)
     assert "AND status = 'done'" in source
-    assert "AND status = 'done'" in inspect.getsource(service.save_strategy_plan)
 
 
-@pytest.mark.asyncio
-async def test_clear_strategy_queue_clears_workspace_counts_without_deleting_history():
-    from app.services.strategy_service import clear_strategy_queue
-
-    class Result:
-        def __init__(self, rows=(), scalar=None):
-            self.rows = list(rows)
-            self.scalar = scalar
-
-        def scalar_one(self):
-            return self.scalar
-
-        def mappings(self):
-            return self
-
-        def all(self):
-            return self.rows
-
-    class Session:
-        committed = False
-
-        async def execute(self, statement, params=None):
-            sql = str(statement)
-            if "SELECT count(*)" in sql:
-                return Result(scalar=0)
-            if sql.lstrip().startswith("SELECT t.id::text"):
-                return Result()
-            if "status = 'queued' AND t.payload->>'kind' = 'seo_strategy'" in sql:
-                return Result()
-            if "payload->>'kind' = 'strategy_plan'" in sql:
-                return Result([("plan-1",)])
-            if "strategy_candidate', 'strategy_analysis_batch" in sql:
-                return Result([("strategy_candidate",), ("strategy_candidate",), ("strategy_analysis_batch",)])
-            return Result()
-
-        async def commit(self):
-            self.committed = True
-
-    session = Session()
-    result = await clear_strategy_queue(session, business_id="exdivo")
-
-    assert result["plans_cleared"] == 1
-    assert result["candidates_cleared"] == 2
-    assert result["analysis_batches_cleared"] == 1
-    assert session.committed is True
-
-
-def test_plan_and_candidate_lifecycle_guards_are_persisted():
+def test_formal_plan_lifecycle_guards_are_persisted():
     import inspect
     import app.services.strategy_service as service
 
     candidates = inspect.getsource(service.list_strategy_candidates)
-    save = inspect.getsource(service.save_strategy_plan)
     replace = inspect.getsource(service._replace_strategy_plan)
-    current = inspect.getsource(service.get_strategy_plan)
     assert "execution_task_id" in candidates
     assert 'THEN \'executed\'' in candidates
-    assert "已批准或执行的策略候选不能再次加入计划" in save
     assert "pg_advisory_xact_lock(hashtext(:business_id))" in replace
     assert 'ZoneInfo("Asia/Shanghai")' in replace
-    assert "AT TIME ZONE 'Asia/Shanghai'" in current
-
-
-def test_review_revalidates_candidate_plan_analysis_keyword_and_post_snapshot():
-    import inspect
-    import app.services.strategy_service as service
-
-    source = inspect.getsource(service._validate_current_strategy)
-    for token in (
-        "candidate_ok",
-        "plan_ok",
-        "analysis_ok",
-        "keyword_ok",
-        "target_ok",
-        "strategy_candidate",
-        "strategy_analysis_batch",
-        "source_audit_batch_id",
-        "source_audit_scanned_at",
-        "content_audit_batch",
-        "latest_audit",
-        "selected_candidate_ids",
-        "keyword.assigned_site_id",
-        "seo_agent.post_analyses",
-        "post_analysis_id",
-        "payload->>'analysis_batch_id' = CAST(:analysis_batch_id AS text)",
-        "payload->>'execution_task_id' <> CAST(:current_execution_id AS text)",
-    ):
-        assert token in source
-    assert "策略证据或业务范围已变化，请重新运行全站内容扫描并生成策略" in source
+    assert "strategy_run_id" in replace
 
 
 def test_strategy_uses_content_audit_evidence():
@@ -819,86 +793,6 @@ def test_ai_relevance_can_override_unconfigured_local_scope():
 
 
 
-def test_strategy_approval_enables_auto_publish_for_new_articles():
-    import inspect
-
-    source = inspect.getsource(__import__("app.services.strategy_service", fromlist=["review_strategy"]).review_strategy)
-    assert '"auto_publish": execution_type == "new_article"' in source
-    assert "Hold 策略必须先补齐诊断证据" in source
-    assert "FOR UPDATE OF t" in source
-
-
-@pytest.mark.asyncio
-async def test_approving_on_page_decision_never_creates_article_execution() -> None:
-    calls: list[tuple[str, dict]] = []
-
-    class Result:
-        def __init__(self, rows=None):
-            self.rows = rows or []
-
-        def mappings(self):
-            return self
-
-        def first(self):
-            return self.rows[0] if self.rows else None
-
-    class Session:
-        committed = False
-
-        async def execute(self, statement, params=None):
-            sql = str(statement)
-            calls.append((sql, params or {}))
-            if "FOR UPDATE OF t" in sql:
-                return Result(
-                    [
-                        {
-                            "id": "strategy-id",
-                            "site_id": "site-id",
-                            "keyword_id": None,
-                            "post_id": None,
-                            "article_id": None,
-                            "title": "修复产品页 SEO",
-                            "decision": {
-                                "strategy_type": "on_page_fix",
-                                "business_id": "business",
-                                "requires_publish": False,
-                            },
-                            "site_type": "main",
-                            "site_status": "active",
-                            "business_id": "business",
-                            "strategy_enabled": True,
-                            "task_business_id": "business",
-                            "candidate_id": "candidate-id",
-                            "plan_id": "plan-id",
-                            "analysis_batch_id": "analysis-id",
-                        }
-                    ]
-                )
-            return Result()
-
-        async def commit(self):
-            self.committed = True
-
-    session = Session()
-    result = await review_strategy(
-        session,  # type: ignore[arg-type]
-        task_id="strategy-id",
-        approved=True,
-    )
-
-    assert result["strategy_type"] == "on_page_fix"
-    assert result["execution_task_id"] is None
-    assert result["execution_status"] == "blocked_pending_preview"
-    assert result["requires_publish"] is True
-    assert f"/workflow/strategies/strategy-id/on-page/preview" in result["unlock_condition"]
-    assert session.committed is True
-    assert not any(
-        "INSERT INTO seo_agent.tasks" in sql
-        and params.get("task_type") in {"new_article", "update_article"}
-        for sql, params in calls
-    )
-
-
 def test_blog_update_is_executable_when_evidence_exists():
     strategy = _build_strategy(
         {
@@ -917,11 +811,3 @@ def test_blog_update_is_executable_when_evidence_exists():
     assert strategy is not None
     assert strategy["strategy_type"] == "update_article"
     assert strategy["priority"] == "P0"
-
-
-def test_cancel_strategy_claim_is_atomic():
-    import inspect
-
-    source = inspect.getsource(__import__("app.services.strategy_service", fromlist=["cancel_strategy"]).cancel_strategy)
-    assert "RETURNING id" in source
-    assert "execution task is already running or done" in source

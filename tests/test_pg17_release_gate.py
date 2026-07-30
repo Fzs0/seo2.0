@@ -11,7 +11,7 @@ import json
 import os
 from pathlib import Path
 from urllib.parse import urlparse
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import asyncpg
 import pytest
@@ -23,18 +23,123 @@ import app.services.publish_service as publish_service
 from app.clients.publishers import PublishResult
 from app.services.content_audit_service import start_content_audit
 from app.core.time_values import require_aware_datetime
-from app.services.strategy_action_service import SQLActionStore, create_action
+from app.services.strategy_action_service import (
+    SQLActionStore,
+    approve_action,
+    create_action,
+    execute_action,
+    execute_action_and_reconcile,
+    preview_action,
+)
 from app.services.post_sync_service import sync_site_posts
 from app.services.strategy_run_service import (
     cancel_strategy_run,
     create_strategy_run,
+    get_strategy_run,
     list_strategy_runs,
     retry_strategy_run,
     run_strategy_run,
+    submit_strategy_run_local_options,
 )
+from app.services.strategy_service import _replace_strategy_plan
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+async def _seed_pg17_action_lineage(engine, *, action_type: str = "product_seo"):
+    ids = {
+        "business_id": f"pg17-action-{uuid4()}",
+        "site_id": uuid4(),
+        "run_id": uuid4(),
+        "plan_id": uuid4(),
+        "strategy_id": uuid4(),
+    }
+    async with engine.begin() as connection:
+        await connection.exec_driver_sql(
+            """
+            INSERT INTO seo_agent.sites
+              (id, site_key, name, site_type, business_id, strategy_enabled,
+               status, domain, base_url, market, language_code)
+            VALUES ($1::uuid, $2, 'PG17 Action', 'main', $3, true, 'active',
+                    $4, $5, 'US', 'en')
+            """,
+            (
+                ids["site_id"],
+                f"pg17-action-{ids['site_id']}",
+                ids["business_id"],
+                f"{ids['site_id']}.test",
+                f"https://{ids['site_id']}.test",
+            ),
+        )
+        await connection.exec_driver_sql(
+            """
+            INSERT INTO seo_agent.tasks
+              (id, task_type, status, priority, site_id, title, payload, decision)
+            VALUES
+              ($1::uuid, 'review', 'running', 'P1', NULL, 'run',
+               jsonb_build_object(
+                 'kind','strategy_run','business_id',$4::text
+               ),
+               '{"status":"awaiting_approval","current_stage":"awaiting_approval"}'::jsonb),
+              ($2::uuid, 'review', 'queued', 'P1', NULL, 'plan',
+               jsonb_build_object(
+                 'kind','strategy_plan','business_id',$4::text,
+                 'strategy_run_id',$1::text
+               ),
+               jsonb_build_object(
+                 'strategy_task_ids',jsonb_build_array($3::text),
+                 'execute_now_strategy_ids',jsonb_build_array($3::text)
+               )),
+              ($3::uuid, 'review', 'queued', 'P1', $5::uuid, 'strategy',
+               jsonb_build_object(
+                 'kind','seo_strategy','business_id',$4::text,
+                 'strategy_run_id',$1::text,'plan_id',$2::text,
+                 'schedule_class','execute_now'
+               ),
+               jsonb_build_object('strategy_type',$6::text))
+            """,
+            (
+                str(ids["run_id"]),
+                str(ids["plan_id"]),
+                str(ids["strategy_id"]),
+                ids["business_id"],
+                str(ids["site_id"]),
+                action_type,
+            ),
+        )
+    return ids
+
+
+def _pg17_on_page_capability(capability_hash: str):
+    adapter_identity = {
+        "adapter_id": "oemapps_on_page",
+        "adapter_version": "1",
+        "connector_type": "oemapps",
+        "read": True,
+        "write": True,
+        "readback": True,
+    }
+    capability = {
+        "capability_snapshot_hash": capability_hash,
+        "supported_actions": {"product_seo": "approval_required"},
+        "supported_fields": {
+            "product_seo": ["meta_title", "meta_description"]
+        },
+        "protected_fields": {"product_seo": ["price", "inventory", "variants"]},
+        "connectors": {
+            "products": {
+                "status": "available",
+                "read": True,
+                "write": True,
+                "checked_at": "2099-01-01T00:00:00+00:00",
+            }
+        },
+        "configuration_issues": [],
+        "side_effects": {},
+        "action_adapters": {"product_seo": adapter_identity},
+    }
+    return capability, adapter_identity
 
 
 def _dsn() -> str:
@@ -71,6 +176,101 @@ async def test_pg17_full_migrations_and_repair_migrations_are_idempotent():
         assert await connection.fetchval("SELECT to_regclass('seo_agent.tasks')") is not None
     finally:
         await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_replanning_one_run_does_not_supersede_another_run_plan():
+    sqlalchemy_dsn = _dsn().replace("postgresql://", "postgresql+asyncpg://", 1)
+    engine = create_async_engine(sqlalchemy_dsn)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    business_id = f"pg17-plan-isolation-{uuid4()}"
+    site_id = uuid4()
+    run_a, run_b = str(uuid4()), str(uuid4())
+    async with engine.begin() as connection:
+        await connection.exec_driver_sql(
+            """
+            INSERT INTO seo_agent.sites
+              (id, site_key, name, site_type, business_id, strategy_enabled)
+            VALUES ($1::uuid, $2, 'Plan isolation', 'main', $3, true)
+            """,
+            (site_id, f"plan-isolation-{site_id}", business_id),
+        )
+
+    def option(label: str) -> dict:
+        return {
+            "option_id": f"option-{label}",
+            "option_origin": "run_local",
+            "candidate_id": None,
+            "keyword_id": None,
+            "site_id": str(site_id),
+            "strategy_type": "new_article",
+            "schedule_class": "execute_now",
+            "schedule_reason": "PG17 plan isolation test",
+            "wave_number": 1,
+            "priority": "P1",
+            "score": 90,
+            "title": f"Strategy {label}",
+        }
+
+    async def persist(run_id: str, label: str) -> dict:
+        async with factory() as session:
+            result = await _replace_strategy_plan(
+                session,
+                business_id=business_id,
+                analysis_batch_id=str(uuid4()),
+                source_audit_batch_id=str(uuid4()),
+                source_audit_scanned_at="2026-07-30T00:00:00+00:00",
+                action_budget=200,
+                site_quotas={},
+                candidates=[option(label)],
+                strategy_run_id=run_id,
+            )
+            await session.commit()
+            return result
+
+    plan_a1 = await persist(run_a, "a1")
+    plan_b = await persist(run_b, "b")
+    plan_a2 = await persist(run_a, "a2")
+
+    async with engine.begin() as connection:
+        statuses = {
+            str(row["id"]): row["status"]
+            for row in (
+                await connection.exec_driver_sql(
+                    """
+                    SELECT id, status
+                      FROM seo_agent.tasks
+                     WHERE id = ANY($1::uuid[])
+                    """,
+                    (
+                        [
+                            UUID(plan_a1["id"]),
+                            UUID(plan_b["id"]),
+                            UUID(plan_a2["id"]),
+                        ],
+                    ),
+                )
+            ).mappings()
+        }
+        run_b_queued = (
+            await connection.exec_driver_sql(
+                """
+                SELECT count(*)
+                  FROM seo_agent.tasks
+                 WHERE payload->>'business_id'=$1
+                   AND payload->>'strategy_run_id'=$2
+                   AND payload->>'kind' IN ('strategy_plan','seo_strategy')
+                   AND status='queued'
+                """,
+                (business_id, run_b),
+            )
+        ).scalar_one()
+
+    assert statuses[plan_a1["id"]] == "canceled"
+    assert statuses[plan_b["id"]] == "queued"
+    assert statuses[plan_a2["id"]] == "queued"
+    assert run_b_queued == 2
+    await engine.dispose()
 
 
 @pytest.mark.asyncio
@@ -111,6 +311,99 @@ async def test_pg17_strategy_run_list_accepts_null_optional_filters():
             await connection.exec_driver_sql(
                 "DELETE FROM seo_agent.tasks WHERE id=$1::uuid",
                 (run_id,),
+            )
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_pg17_keywordless_run_local_options_persist_and_replay():
+    sqlalchemy_dsn = _dsn().replace("postgresql://", "postgresql+asyncpg://", 1)
+    engine = create_async_engine(sqlalchemy_dsn)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    business_id = f"pg17-research-options-{uuid4()}"
+    site_id = uuid4()
+    run_id = None
+    async with engine.begin() as connection:
+        await connection.exec_driver_sql(
+            """
+            INSERT INTO seo_agent.sites
+              (id, site_key, name, site_type, business_id, strategy_enabled,
+               status, market, language_code, domain, base_url)
+            VALUES
+              ($1::uuid, $2, 'Research option site', 'main', $3, true,
+               'active', 'US', 'en', 'research.example.test',
+               'https://research.example.test')
+            """,
+            (site_id, f"research-option-{site_id}", business_id),
+        )
+    try:
+        async with factory() as session:
+            run = await create_strategy_run(
+                session,
+                business_id=business_id,
+                site_ids=[str(site_id)],
+                scope="selected_sites",
+                mode="approval_execution",
+                requested_by="codex",
+                idempotency_key=f"create-{uuid4()}",
+                action_budget=200,
+                site_quotas={},
+                approval_policy="use_site_capabilities",
+            )
+            run_id = run["run_id"]
+            options = [
+                {
+                    "site_id": str(site_id),
+                    "action": "new_article",
+                    "schedule_class": "execute_now",
+                    "topic": "independently researched topic",
+                    "title": "Independent Research Topic",
+                    "reason": "Current product and SERP evidence support it.",
+                    "user_intent": "Learn before choosing a product.",
+                    "evidence": {"product_api": ["product-1"]},
+                    "candidate_id": None,
+                    "keyword_id": None,
+                }
+            ]
+            first = await submit_strategy_run_local_options(
+                session,
+                run_id=run_id,
+                requested_by="codex",
+                idempotency_key="pg17-research-submit",
+                options=options,
+            )
+            replay = await submit_strategy_run_local_options(
+                session,
+                run_id=run_id,
+                requested_by="codex",
+                idempotency_key="pg17-research-submit",
+                options=options,
+            )
+
+            assert first["run_local_option_count"] == 1
+            assert first["run_local_options"][0]["candidate_id"] is None
+            assert first["run_local_options"][0]["keyword_id"] is None
+            assert replay["idempotency_replayed"] is True
+        async with engine.begin() as connection:
+            saved = await connection.exec_driver_sql(
+                """
+                SELECT decision->'run_local_options'->0->>'option_origin'
+                  FROM seo_agent.tasks
+                 WHERE id=$1::uuid
+                """,
+                (UUID(run_id),),
+            )
+            assert saved.scalar_one() == "codex_research"
+    finally:
+        async with engine.begin() as connection:
+            if run_id:
+                await connection.exec_driver_sql(
+                    "DELETE FROM seo_agent.tasks WHERE id=$1::uuid",
+                    (UUID(run_id),),
+                )
+            await connection.exec_driver_sql(
+                "DELETE FROM seo_agent.sites WHERE id=$1::uuid",
+                (site_id,),
             )
         await engine.dispose()
 
@@ -242,6 +535,8 @@ async def test_same_scoped_idempotency_key_concurrently_creates_one_action():
     site_id = str(uuid4())
     business_id = "pg17-idempotency-test"
     run_id = str(uuid4())
+    plan_id = str(uuid4())
+    strategy_id = str(uuid4())
     async with engine.begin() as connection:
         await connection.exec_driver_sql(
             """
@@ -258,16 +553,57 @@ async def test_same_scoped_idempotency_key_concurrently_creates_one_action():
                 (f"pg17-{site_id}",),
             )
         ).scalar_one()
+        await connection.exec_driver_sql(
+            """
+            INSERT INTO seo_agent.tasks
+              (id, task_type, status, priority, site_id, title, payload, decision)
+            VALUES
+              ($1::uuid, 'review', 'running', 'P1', NULL, 'PG17 strategy run',
+               jsonb_build_object('kind','strategy_run','business_id',$4::text),
+               jsonb_build_object('status','planning')),
+              ($2::uuid, 'review', 'queued', 'P2', NULL, 'PG17 strategy plan',
+               jsonb_build_object(
+                 'kind','strategy_plan','business_id',$4::text,
+                 'strategy_run_id',($1::uuid)::text
+               ),
+               jsonb_build_object(
+                 'strategy_task_ids',jsonb_build_array(($3::uuid)::text),
+                 'execute_now_strategy_ids',jsonb_build_array(($3::uuid)::text)
+               )),
+              ($3::uuid, 'review', 'queued', 'P2', $5::uuid, 'PG17 strategy',
+               jsonb_build_object(
+                 'kind','seo_strategy','business_id',$4::text,
+                 'strategy_run_id',($1::uuid)::text,
+                 'plan_id',($2::uuid)::text,
+                 'schedule_class','execute_now'
+               ),
+               jsonb_build_object('strategy_type','update_article'))
+            """,
+            (
+                UUID(run_id),
+                UUID(plan_id),
+                UUID(strategy_id),
+                business_id,
+                actual_site_id,
+            ),
+        )
 
     async def create_once():
         async with factory() as session:
             return await create_action(
                 SQLActionStore(session),
                 run_id=run_id,
+                plan_id=plan_id,
+                source_strategy_task_id=strategy_id,
                 business_id=business_id,
                 site_id=str(actual_site_id),
                 action_type="update_article",
                 idempotency_key="same-key",
+                capability_snapshot={
+                    "supported_actions": {
+                        "update_article": "approval_required"
+                    }
+                },
             )
 
     first, second = await asyncio.gather(create_once(), create_once())
@@ -450,6 +786,763 @@ async def test_strategy_run_start_control_idempotency_executes_on_pg17():
     assert persisted_retry["root_run_id"] == failed_run["root_run_id"]
     assert persisted_retry["attempt"] == 2
     assert persisted_retry["idempotency_key"] == retry_key
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_formal_run_action_readback_observation_chain_closes_on_pg17():
+    """One no-network formal run must close without a second /start call."""
+    sqlalchemy_dsn = _dsn().replace("postgresql://", "postgresql+asyncpg://", 1)
+    engine = create_async_engine(sqlalchemy_dsn)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    business_id = f"pg17-formal-lifecycle-{uuid4()}"
+    site_id = uuid4()
+    capability_hash = f"pg17-capability-{uuid4()}"
+
+    async with engine.begin() as connection:
+        await connection.exec_driver_sql(
+            """
+            INSERT INTO seo_agent.sites
+              (id, site_key, name, site_type, business_id, strategy_enabled, status)
+            VALUES ($1::uuid, $2, 'Formal lifecycle', 'main', $3, true, 'active')
+            """,
+            (site_id, f"formal-lifecycle-{site_id}", business_id),
+        )
+
+    async with factory() as session:
+        created_run = await create_strategy_run(
+            session,
+            business_id=business_id,
+            site_ids=[str(site_id)],
+            scope="selected_sites",
+            mode="approval_execution",
+            requested_by="pytest",
+            idempotency_key=f"formal-create-{uuid4()}",
+            action_budget=10,
+            site_quotas={},
+            approval_policy="use_site_capabilities",
+        )
+
+    async def discoverer(*_args, **_kwargs):
+        return [{"id": str(site_id), "name": "Formal lifecycle", "site_type": "main"}]
+
+    async def capabilities(_session, requested_business_id):
+        assert requested_business_id == business_id
+        return {
+            "business_id": business_id,
+            "generated_at": "2099-01-01T00:00:00+00:00",
+            "sites": [{
+                "site_id": str(site_id),
+                "capability_snapshot_hash": capability_hash,
+                "supported_actions": {"update_article": "approval_required"},
+                "supported_fields": {"articles": ["title"]},
+                "connectors": {
+                    "articles": {
+                        "status": "available",
+                        "write": True,
+                        "checked_at": "2099-01-01T00:00:00+00:00",
+                    }
+                },
+                "configuration_issues": [],
+            }],
+        }
+
+    async def evidence(*_args, **_kwargs):
+        return {"snapshot_id": f"evidence-{uuid4()}"}
+
+    async def planner(session, *, business_id, _strategy_run_id, **_kwargs):
+        option_id = f"formal-option-{uuid4()}"
+        analysis_batch_id = str(uuid4())
+        audit_batch_id = str(uuid4())
+        plan = await _replace_strategy_plan(
+            session,
+            business_id=business_id,
+            analysis_batch_id=analysis_batch_id,
+            source_audit_batch_id=audit_batch_id,
+            source_audit_scanned_at="2099-01-01T00:00:00+00:00",
+            action_budget=10,
+            site_quotas={},
+            candidates=[{
+                "option_id": option_id,
+                "option_origin": "run_local",
+                "candidate_id": None,
+                "keyword_id": None,
+                "site_id": str(site_id),
+                "strategy_type": "update_article",
+                "action_type": "update_article",
+                "schedule_class": "execute_now",
+                "schedule_reason": "PG17 formal lifecycle gate",
+                "wave_number": 1,
+                "priority": "P1",
+                "score": 90,
+                "title": "Formal lifecycle update",
+                "target_url": "https://example.com/blogs/formal-lifecycle",
+                "query": "formal lifecycle",
+            }],
+            strategy_run_id=_strategy_run_id,
+        )
+        return {
+            "analysis_batch_id": analysis_batch_id,
+            "site_scope": [{"id": str(site_id)}],
+            "plan": plan,
+            "coverage_matrix": {
+                "discovered_site_count": 1,
+                "decided_site_count": 1,
+                "decisions": [{
+                    "site_id": str(site_id),
+                    "action": "update_article",
+                    "selected_option_id": option_id,
+                }],
+            },
+        }
+
+    async with factory() as session:
+        awaiting = await run_strategy_run(
+            session,
+            run_id=created_run["run_id"],
+            idempotency_key=f"formal-start-{uuid4()}",
+            site_discoverer=discoverer,
+            capability_loader=capabilities,
+            evidence_gatherer=evidence,
+            planner=planner,
+        )
+    assert awaiting["status"] == "awaiting_approval"
+    assert len(awaiting["action_ids"]) == 1
+    action_id = awaiting["action_ids"][0]
+
+    class NoNetworkAdapter:
+        async def preview(self, _action, patch):
+            return {
+                "before_snapshot": {"title": "Before"},
+                "proposed_patch": patch,
+            }
+
+        async def execute(self, action):
+            patch = dict(action["proposed_patch"])
+            return {
+                "result": "updated",
+                "submitted_patch": patch,
+                "remote_response": {"ok": True, "source": "pg17-no-network-gate"},
+                "readback": patch,
+                "target_url": action["target_url"],
+            }
+
+        async def recover(self, _action):
+            return {"recovery_status": "confirmed_not_applied"}
+
+    adapter = NoNetworkAdapter()
+    async with factory() as session:
+        store = SQLActionStore(session)
+        preview = await preview_action(
+            store,
+            action_id=action_id,
+            patch={"title": "After"},
+            adapter=adapter,
+            capability_snapshot_hash=capability_hash,
+            idempotency_key=f"formal-preview-{uuid4()}",
+        )
+        approved = await approve_action(
+            store,
+            action_id=action_id,
+            snapshot_hash=preview["snapshot_hash"],
+            patch_hash=preview["patch_hash"],
+            generation_mode="manual",
+            capability_snapshot_hash=capability_hash,
+            idempotency_key=f"formal-approve-{uuid4()}",
+        )
+        assert approved["status"] == "approved"
+        executed = await execute_action_and_reconcile(
+            store,
+            action_id=action_id,
+            adapter=adapter,
+            capability_snapshot_hash=capability_hash,
+            idempotency_key=f"formal-execute-{uuid4()}",
+        )
+        closed_run = await get_strategy_run(session, run_id=created_run["run_id"])
+
+    assert executed["status"] == "completed"
+    assert executed["observation_id"]
+    assert closed_run["status"] == "completed"
+    assert closed_run["observation_ids"] == [executed["observation_id"]]
+
+    async with engine.begin() as connection:
+        observations = (
+            await connection.exec_driver_sql(
+                """
+                SELECT count(*)
+                  FROM seo_agent.tasks
+                 WHERE payload->>'kind'='strategy_action_observation'
+                   AND payload->>'action_id'=$1
+                """,
+                (action_id,),
+            )
+        ).scalar_one()
+    assert observations == 1
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("connector_type", "remote_object_id"),
+    [
+        ("oemapps", "oem-product-42"),
+        ("shopify", "gid://shopify/Product/42"),
+    ],
+)
+async def test_on_page_product_run_local_to_observation_closes_on_pg17(
+    connector_type: str,
+    remote_object_id: str,
+):
+    """The real PG17 lineage must preserve platform identity end to end."""
+    sqlalchemy_dsn = _dsn().replace("postgresql://", "postgresql+asyncpg://", 1)
+    engine = create_async_engine(sqlalchemy_dsn)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    business_id = f"pg17-on-page-{connector_type}-{uuid4()}"
+    site_id = uuid4()
+    connector_id = uuid4() if connector_type == "oemapps" else None
+    target_url = f"https://{connector_type}-{site_id}.test/products/example"
+    capability_hash = f"pg17-on-page-capability-{uuid4()}"
+
+    async with engine.begin() as connection:
+        await connection.exec_driver_sql(
+            """
+            INSERT INTO seo_agent.sites
+              (id, site_key, name, site_type, business_id, strategy_enabled,
+               status, domain, base_url, market, language_code, api_config)
+            VALUES
+              ($1::uuid, $2, $3, $4, $5, true, 'active', $6, $7, 'US', 'en',
+               CAST($8 AS jsonb))
+            """,
+            (
+                site_id,
+                f"on-page-{site_id}",
+                f"On-page {connector_type}",
+                "shopify" if connector_type == "shopify" else "main",
+                business_id,
+                f"{connector_type}-{site_id}.test",
+                f"https://{connector_type}-{site_id}.test",
+                json.dumps({"connector_type": connector_type}),
+            ),
+        )
+        if connector_id:
+            await connection.exec_driver_sql(
+                """
+                INSERT INTO seo_agent.custom_connectors
+                  (id, site_id, name, capability, status, current_version,
+                   active_version)
+                VALUES ($1::uuid, $2::uuid, 'OEMApps PG17', 'products.list',
+                        'active', 1, 1)
+                """,
+                (connector_id, site_id),
+            )
+            await connection.exec_driver_sql(
+                """
+                INSERT INTO seo_agent.custom_connector_versions
+                  (connector_id, version, config, verified_at)
+                VALUES ($1::uuid, 1, '{"adapter":"oemapps"}'::jsonb, now())
+                """,
+                (connector_id,),
+            )
+        product_id = (
+            await connection.exec_driver_sql(
+                """
+                INSERT INTO seo_agent.products
+                  (external_id, site_id, title, url, source, source_connector_id,
+                   meta_title, meta_description, source_updated_at)
+                VALUES ($1, $2::uuid, 'PG17 product', $3, $4, $5::uuid,
+                        'Before title', 'Before description', now())
+                RETURNING id
+                """,
+                (
+                    remote_object_id,
+                    site_id,
+                    target_url,
+                    (
+                        "shopify_admin_graphql"
+                        if connector_type == "shopify"
+                        else "oemapps"
+                    ),
+                    connector_id,
+                ),
+            )
+        ).scalar_one()
+
+    async with factory() as session:
+        created_run = await create_strategy_run(
+            session,
+            business_id=business_id,
+            site_ids=[str(site_id)],
+            scope="selected_sites",
+            mode="approval_execution",
+            requested_by="pytest",
+            idempotency_key=f"on-page-create-{uuid4()}",
+            action_budget=10,
+            site_quotas={},
+            approval_policy="use_site_capabilities",
+        )
+        submitted = await submit_strategy_run_local_options(
+            session,
+            run_id=created_run["run_id"],
+            requested_by="pytest",
+            idempotency_key=f"on-page-options-{uuid4()}",
+            options=[
+                {
+                    "site_id": str(site_id),
+                    "action": "on_page_fix",
+                    "action_type": "product_seo",
+                    "page_type": "product",
+                    "target_asset_id": str(product_id),
+                    "remote_object_id": remote_object_id,
+                    "target_url": target_url,
+                    "connector_id": str(connector_id) if connector_id else None,
+                    "connector_type": connector_type,
+                    "reason": "PG17 on-page lifecycle evidence.",
+                    "user_intent": "Evaluate this exact product before purchase.",
+                    "evidence": {
+                        "product_api": {"remote_object_id": remote_object_id}
+                    },
+                    "schedule_class": "execute_now",
+                    "priority": "P1",
+                    "risk_level": "medium",
+                    "expected_fields": [
+                        "meta_title",
+                        "meta_description",
+                    ],
+                }
+            ],
+        )
+    assert submitted["run_local_option_count"] == 1
+
+    async def discoverer(*_args, **_kwargs):
+        return [
+            {
+                "id": str(site_id),
+                "name": f"On-page {connector_type}",
+                "site_type": (
+                    "shopify" if connector_type == "shopify" else "main"
+                ),
+            }
+        ]
+
+    adapter_identity = {
+        "adapter_id": (
+            "shopify_product_seo"
+            if connector_type == "shopify"
+            else "oemapps_on_page"
+        ),
+        "adapter_version": "1",
+        "connector_type": connector_type,
+        "read": True,
+        "write": True,
+        "readback": True,
+    }
+
+    async def capabilities(_session, requested_business_id):
+        assert requested_business_id == business_id
+        return {
+            "business_id": business_id,
+            "generated_at": "2099-01-01T00:00:00+00:00",
+            "sites": [
+                {
+                    "site_id": str(site_id),
+                    "capability_snapshot_hash": capability_hash,
+                    "supported_actions": {
+                        "product_seo": "approval_required"
+                    },
+                    "supported_fields": {
+                        "product_seo": [
+                            "meta_title",
+                            "meta_description",
+                        ]
+                    },
+                    "connectors": {
+                        "products": {
+                            "status": "available",
+                            "read": True,
+                            "write": True,
+                            "checked_at": "2099-01-01T00:00:00+00:00",
+                        }
+                    },
+                    "configuration_issues": [],
+                    "side_effects": (
+                        {
+                            "product_seo": {
+                                "requires_variant_confirmation": True
+                            }
+                        }
+                        if connector_type == "oemapps"
+                        else {}
+                    ),
+                    "action_adapters": {
+                        "product_seo": adapter_identity
+                    },
+                }
+            ],
+        }
+
+    async def evidence(*_args, **_kwargs):
+        return {"snapshot_id": f"evidence-{uuid4()}"}
+
+    async def planner(
+        session,
+        *,
+        business_id,
+        _strategy_run_id,
+        run_local_options,
+        **_kwargs,
+    ):
+        plan = await _replace_strategy_plan(
+            session,
+            business_id=business_id,
+            analysis_batch_id=str(uuid4()),
+            source_audit_batch_id=str(uuid4()),
+            source_audit_scanned_at="2099-01-01T00:00:00+00:00",
+            action_budget=10,
+            site_quotas={},
+            candidates=run_local_options,
+            strategy_run_id=_strategy_run_id,
+        )
+        option = run_local_options[0]
+        return {
+            "analysis_batch_id": str(uuid4()),
+            "site_scope": [{"id": str(site_id)}],
+            "plan": plan,
+            "coverage_matrix": {
+                "discovered_site_count": 1,
+                "decided_site_count": 1,
+                "decisions": [
+                    {
+                        "site_id": str(site_id),
+                        "action": "product_seo",
+                        "selected_option_id": option["option_id"],
+                    }
+                ],
+            },
+        }
+
+    async with factory() as session:
+        awaiting = await run_strategy_run(
+            session,
+            run_id=created_run["run_id"],
+            idempotency_key=f"on-page-start-{uuid4()}",
+            site_discoverer=discoverer,
+            capability_loader=capabilities,
+            evidence_gatherer=evidence,
+            planner=planner,
+        )
+    assert awaiting["status"] == "awaiting_approval"
+    action_id = awaiting["action_ids"][0]
+
+    class NoNetworkOnPageAdapter:
+        writes = 0
+
+        async def preview(self, action, patch):
+            assert action["connector_type"] == connector_type
+            assert action["remote_object_id"] == remote_object_id
+            assert action["target_asset_id"] == str(product_id)
+            return {
+                "before_snapshot": {
+                    "meta_title": "Before title",
+                    "meta_description": "Before description",
+                },
+                "proposed_patch": patch,
+            }
+
+        async def execute(self, action):
+            self.writes += 1
+            patch = dict(action["approved_patch"])
+            return {
+                "result": "updated",
+                "submitted_patch": patch,
+                "remote_response": {
+                    "ok": True,
+                    "source": "pg17-no-network-on-page",
+                },
+                "readback": patch,
+                "target_url": action["target_url"],
+            }
+
+        async def recover(self, _action):
+            return {"recovery_status": "confirmed_not_applied"}
+
+    adapter = NoNetworkOnPageAdapter()
+    patch = {
+        "meta_title": "After title",
+        "meta_description": "After description",
+    }
+    async with factory() as session:
+        store = SQLActionStore(session)
+        preview = await preview_action(
+            store,
+            action_id=action_id,
+            patch=patch,
+            adapter=adapter,
+            capability_snapshot_hash=capability_hash,
+            generation_mode="model",
+            generation_provider="openai",
+            generation_model="not_exposed_by_runtime",
+            generation_run_id=f"pg17-generation-{uuid4()}",
+            idempotency_key=f"on-page-preview-{uuid4()}",
+        )
+        approved = await approve_action(
+            store,
+            action_id=action_id,
+            snapshot_hash=preview["snapshot_hash"],
+            patch_hash=preview["patch_hash"],
+            generation_mode=preview["generation_mode"],
+            generation_provider=preview["generation_provider"],
+            generation_model=preview["generation_model"],
+            generation_run_id=preview["generation_run_id"],
+            side_effect_confirmations=(
+                {"requires_variant_confirmation": True}
+                if connector_type == "oemapps"
+                else {}
+            ),
+            capability_snapshot_hash=capability_hash,
+            idempotency_key=f"on-page-approve-{uuid4()}",
+        )
+        assert approved["status"] == "approved"
+        executed = await execute_action_and_reconcile(
+            store,
+            action_id=action_id,
+            adapter=adapter,
+            capability_snapshot_hash=capability_hash,
+            idempotency_key=f"on-page-execute-{uuid4()}",
+        )
+        closed_run = await get_strategy_run(
+            session, run_id=created_run["run_id"]
+        )
+
+    assert adapter.writes == 1
+    assert executed["status"] == "completed"
+    assert executed["action_type"] == "product_seo"
+    assert executed["connector_type"] == connector_type
+    assert executed["observation_id"]
+    assert closed_run["status"] == "completed"
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_on_page_capability_change_invalidates_pg17_approval_before_write():
+    sqlalchemy_dsn = _dsn().replace("postgresql://", "postgresql+asyncpg://", 1)
+    engine = create_async_engine(sqlalchemy_dsn)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    ids = await _seed_pg17_action_lineage(engine)
+    capability_hash = f"capability-{uuid4()}"
+    capability, adapter_identity = _pg17_on_page_capability(capability_hash)
+
+    async with factory() as session:
+        action = await create_action(
+            SQLActionStore(session),
+            run_id=str(ids["run_id"]),
+            run_mode="approval_execution",
+            plan_id=str(ids["plan_id"]),
+            source_strategy_task_id=str(ids["strategy_id"]),
+            business_id=ids["business_id"],
+            site_id=str(ids["site_id"]),
+            action_type="product_seo",
+            page_type="product",
+            target_asset_id="42",
+            remote_object_id="product-42",
+            target_url=f"https://{ids['site_id']}.test/products/example",
+            connector_type="oemapps",
+            expected_fields=["meta_title"],
+            adapter_identity=adapter_identity,
+            idempotency_key=f"capability-action-{uuid4()}",
+            capability_snapshot=capability,
+        )
+
+    class Adapter:
+        writes = 0
+
+        async def preview(self, _action, patch):
+            return {
+                "before_snapshot": {"meta_title": "Before"},
+                "proposed_patch": patch,
+            }
+
+        async def execute(self, _action):
+            self.writes += 1
+            return {"result": "updated", "readback": {"meta_title": "After"}}
+
+        async def recover(self, _action):
+            return {"recovery_status": "unknown_remote_state"}
+
+    adapter = Adapter()
+    async with factory() as session:
+        store = SQLActionStore(session)
+        preview = await preview_action(
+            store,
+            action_id=action["action_id"],
+            patch={"meta_title": "After"},
+            adapter=adapter,
+            capability_snapshot_hash=capability_hash,
+        )
+        await approve_action(
+            store,
+            action_id=action["action_id"],
+            snapshot_hash=preview["snapshot_hash"],
+            patch_hash=preview["patch_hash"],
+            capability_snapshot_hash=capability_hash,
+            generation_mode="manual",
+        )
+        result = await execute_action(
+            store,
+            action_id=action["action_id"],
+            adapter=adapter,
+            capability_snapshot_hash=f"changed-{uuid4()}",
+        )
+
+    assert result["block_reason"] == "capability_snapshot_changed"
+    assert adapter.writes == 0
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_on_page_readback_mismatch_creates_one_pg17_p1_and_no_observation():
+    sqlalchemy_dsn = _dsn().replace("postgresql://", "postgresql+asyncpg://", 1)
+    engine = create_async_engine(sqlalchemy_dsn)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    ids = await _seed_pg17_action_lineage(engine)
+    capability_hash = f"capability-{uuid4()}"
+    capability, adapter_identity = _pg17_on_page_capability(capability_hash)
+
+    async with factory() as session:
+        action = await create_action(
+            SQLActionStore(session),
+            run_id=str(ids["run_id"]),
+            run_mode="approval_execution",
+            plan_id=str(ids["plan_id"]),
+            source_strategy_task_id=str(ids["strategy_id"]),
+            business_id=ids["business_id"],
+            site_id=str(ids["site_id"]),
+            action_type="product_seo",
+            page_type="product",
+            target_asset_id="42",
+            remote_object_id="product-42",
+            target_url=f"https://{ids['site_id']}.test/products/example",
+            connector_type="oemapps",
+            expected_fields=["meta_title"],
+            adapter_identity=adapter_identity,
+            idempotency_key=f"mismatch-action-{uuid4()}",
+            capability_snapshot=capability,
+        )
+
+    class MismatchAdapter:
+        async def preview(self, _action, patch):
+            return {
+                "before_snapshot": {"meta_title": "Before"},
+                "proposed_patch": patch,
+            }
+
+        async def execute(self, _action):
+            return {
+                "result": "updated",
+                "submitted_patch": {"meta_title": "After"},
+                "remote_response": {"ok": True},
+                "readback": {"meta_title": "Wrong"},
+            }
+
+        async def recover(self, _action):
+            return {"recovery_status": "partially_applied"}
+
+    async with factory() as session:
+        store = SQLActionStore(session)
+        preview = await preview_action(
+            store,
+            action_id=action["action_id"],
+            patch={"meta_title": "After"},
+            adapter=MismatchAdapter(),
+            capability_snapshot_hash=capability_hash,
+        )
+        await approve_action(
+            store,
+            action_id=action["action_id"],
+            snapshot_hash=preview["snapshot_hash"],
+            patch_hash=preview["patch_hash"],
+            capability_snapshot_hash=capability_hash,
+            generation_mode="manual",
+        )
+        result = await execute_action(
+            store,
+            action_id=action["action_id"],
+            adapter=MismatchAdapter(),
+            capability_snapshot_hash=capability_hash,
+        )
+
+    assert result["result"] == "readback_mismatch"
+    assert result["observation_id"] is None
+    async with engine.begin() as connection:
+        exception_count = (
+            await connection.exec_driver_sql(
+                """
+                SELECT count(*) FROM seo_agent.tasks
+                 WHERE payload->>'kind'='strategy_exception'
+                   AND payload->>'action_id'=$1
+                   AND payload->>'error_code'='ACTION_READBACK_MISMATCH'
+                """,
+                (action["action_id"],),
+            )
+        ).scalar_one()
+        observation_count = (
+            await connection.exec_driver_sql(
+                """
+                SELECT count(*) FROM seo_agent.tasks
+                 WHERE payload->>'kind'='strategy_action_observation'
+                   AND payload->>'action_id'=$1
+                """,
+                (action["action_id"],),
+            )
+        ).scalar_one()
+    assert exception_count == 1
+    assert observation_count == 0
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_on_page_missing_adapter_cannot_create_pg17_action():
+    sqlalchemy_dsn = _dsn().replace("postgresql://", "postgresql+asyncpg://", 1)
+    engine = create_async_engine(sqlalchemy_dsn)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    ids = await _seed_pg17_action_lineage(engine)
+    capability, _adapter_identity = _pg17_on_page_capability(
+        f"capability-{uuid4()}"
+    )
+
+    async with factory() as session:
+        with pytest.raises(ValueError, match="requires an exact readable"):
+            await create_action(
+                SQLActionStore(session),
+                run_id=str(ids["run_id"]),
+                run_mode="approval_execution",
+                plan_id=str(ids["plan_id"]),
+                source_strategy_task_id=str(ids["strategy_id"]),
+                business_id=ids["business_id"],
+                site_id=str(ids["site_id"]),
+                action_type="product_seo",
+                page_type="product",
+                target_asset_id="42",
+                remote_object_id="product-42",
+                target_url=f"https://{ids['site_id']}.test/products/example",
+                connector_type="custom_openapi",
+                expected_fields=["meta_title"],
+                adapter_identity=None,
+                idempotency_key=f"missing-adapter-{uuid4()}",
+                capability_snapshot=capability,
+            )
+        await session.rollback()
+    async with engine.begin() as connection:
+        action_count = (
+            await connection.exec_driver_sql(
+                """
+                SELECT count(*) FROM seo_agent.tasks
+                 WHERE payload->>'kind'='strategy_action'
+                   AND payload->>'run_id'=$1
+                """,
+                (str(ids["run_id"]),),
+            )
+        ).scalar_one()
+    assert action_count == 0
     await engine.dispose()
 
 

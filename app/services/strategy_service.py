@@ -13,13 +13,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.time_values import require_aware_datetime
 from app.engine.classifier import keyword_scope
-from app.services.strategy_execution import (
-    _execution_heartbeat,
-    _finish_execution_task,
-    _validate_current_strategy,
-    cancel_strategy,
-    execute_strategy,
-)
 from app.services.strategy_effect_service import (
     load_scope_locks,
     resolve_strategy_target_url,
@@ -79,6 +72,7 @@ async def generate_strategies(
     *,
     business_id: str,
     site_id: str | None = None,
+    site_ids: list[str] | None = None,
     limit: int = 4,
     action_budget: int | None = None,
     site_quotas: dict[str, int] | None = None,
@@ -86,24 +80,39 @@ async def generate_strategies(
     evidence_refreshers: dict[str, EvidenceCollector] | None = None,
     _strategy_run_id: str | None = None,
     _replanning_after_refresh: bool = False,
+    run_local_options: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    budget = max(0, min(action_budget if action_budget is not None else limit, 200))
+    if site_id and site_ids:
+        raise ValueError("site_id and site_ids cannot be used together")
+    requested_site_ids = list(dict.fromkeys(site_ids or ([site_id] if site_id else [])))
+    safety_action_ceiling = max(
+        0, min(action_budget if action_budget is not None else limit, 200)
+    )
     scope = await session.execute(
         text(
             "SELECT id, name, site_type, strategy_enabled, market, language_code, "
             "domain, base_url, api_base_url FROM seo_agent.sites "
             "WHERE business_id = :business_id AND status = 'active' "
-            "AND (CAST(:site_id AS uuid) IS NULL OR id = CAST(:site_id AS uuid)) ORDER BY name"
+            "AND (:all_sites OR id = ANY(CAST(:site_ids AS uuid[]))) ORDER BY name"
         ),
-        {"business_id": business_id, "site_id": site_id},
+        {
+            "business_id": business_id,
+            "all_sites": not requested_site_ids,
+            "site_ids": requested_site_ids,
+        },
     )
     site_scope = [dict(row) for row in scope.mappings().all()]
     scope_by_id = {str(site["id"]): site for site in site_scope}
     if not site_scope:
         raise ValueError(f"业务 {business_id} 没有符合条件的已启用策略站点")
     source_audit = await _load_latest_source_audit(session, business_id=business_id)
-    if not source_audit:
+    if not source_audit and not run_local_options:
         raise ValueError("请先运行当前业务的全站内容扫描")
+    if not source_audit:
+        source_audit = {
+            "id": None,
+            "scanned_at": datetime.now(ZoneInfo("UTC")).isoformat(),
+        }
     strategy_run_id = _strategy_run_id or str(uuid4())
     refresh_claim: dict[str, Any] = {
         "should_refresh": False,
@@ -111,7 +120,11 @@ async def generate_strategies(
         "site_consecutive_hold_counts": {},
     }
     evidence_refreshes: list[dict[str, Any]] = []
-    quarantined = await _quarantine_invalid_assignments(session, business_id)
+    quarantined = (
+        0
+        if run_local_options
+        else await _quarantine_invalid_assignments(session, business_id)
+    )
 
     rows = await session.execute(
         text(
@@ -187,7 +200,7 @@ async def generate_strategies(
                AND s.status = 'active'
                AND s.business_id = :business_id
                AND s.strategy_enabled = true
-               AND (CAST(:site_id AS uuid) IS NULL OR s.id = CAST(:site_id AS uuid))
+                AND (:all_sites OR s.id = ANY(CAST(:site_ids AS uuid[])))
              ORDER BY CASE audit.decision->>'priority'
                         WHEN 'P0' THEN 0 WHEN 'P1' THEN 1 WHEN 'P2' THEN 2 WHEN 'P3' THEN 3 ELSE 4
                       END,
@@ -198,7 +211,8 @@ async def generate_strategies(
             """
         ),
         {
-            "site_id": site_id,
+            "all_sites": not requested_site_ids,
+            "site_ids": requested_site_ids,
             "business_id": business_id,
             "source_audit_scanned_at": require_aware_datetime(
                 source_audit["scanned_at"],
@@ -206,7 +220,11 @@ async def generate_strategies(
             ),
         },
     )
-    candidate_rows = [dict(row) for row in rows.mappings().all()]
+    candidate_rows = (
+        []
+        if run_local_options
+        else [dict(row) for row in rows.mappings().all()]
+    )
     ga4_rows = await session.execute(
         text(
             "SELECT g.site_id, g.sessions, g.conversions FROM seo_agent.v_ga4_site_28d g "
@@ -235,7 +253,9 @@ async def generate_strategies(
                     "kind": "strategy_analysis_batch",
                     "business_id": business_id,
                     "site_scope": site_scope,
-                    "source_audit_batch_id": str(source_audit["id"]),
+                    "source_audit_batch_id": (
+                        str(source_audit["id"]) if source_audit.get("id") else None
+                    ),
                     "source_audit_scanned_at": source_audit["scanned_at"],
                     "strategy_run_id": strategy_run_id,
                     "hold_refresh_claim": refresh_claim,
@@ -330,6 +350,10 @@ async def generate_strategies(
         candidate_id = inserted.scalar_one()
         candidates.append({
             "id": str(candidate_id),
+            "candidate_id": None,
+            "research_candidate_id": str(candidate_id),
+            "candidate_influence": "current_evidence_option_recorded_for_research",
+            "option_origin": "run_local",
             "site_id": str(row["site_id"]),
             "site_name": row["site_name"],
             "keyword_id": str(row["keyword_id"]) if row.get("keyword_id") else None,
@@ -338,13 +362,14 @@ async def generate_strategies(
             **strategy,
         })
 
-    for candidate in [
+    on_page_candidates = [] if run_local_options else [
         candidate
         for site_key, assets in on_page_assets.items()
         if (site := scope_by_id.get(site_key))
         and site.get("strategy_enabled")
         for candidate in build_on_page_candidates(site={**site, "business_id": business_id}, assets=assets)
-    ]:
+    ]
+    for candidate in on_page_candidates:
         candidate["site_configuration_ready"] = bool(
             site.get("strategy_enabled")
             and (site.get("base_url") or site.get("domain"))
@@ -399,10 +424,72 @@ async def generate_strategies(
                 "decision": json.dumps(candidate, ensure_ascii=False),
             },
         )
-        candidates.append({**candidate, "id": str(inserted.scalar_one())})
+        research_candidate_id = str(inserted.scalar_one())
+        candidates.append(
+            {
+                **candidate,
+                "id": research_candidate_id,
+                "candidate_id": None,
+                "research_candidate_id": research_candidate_id,
+                "candidate_influence": (
+                    "current_evidence_option_recorded_for_research"
+                ),
+                "option_origin": "run_local",
+            }
+        )
 
-    selected = _select_daily_candidates(candidates, budget, site_quotas)
-    coverage_matrix = _build_site_coverage(site_scope, candidates, selected)
+    if run_local_options:
+        submitted_site_ids = {
+            str(option.get("site_id") or "") for option in run_local_options
+        }
+        unknown_site_ids = sorted(submitted_site_ids - set(scope_by_id))
+        if unknown_site_ids:
+            raise ValueError(
+                "run-local options are outside the active planning scope: "
+                + ", ".join(unknown_site_ids)
+            )
+        # The submitted current-research decisions are authoritative for this
+        # Run. Automatically discovered audit/candidate records remain research
+        # evidence, but cannot compete for selection or create an Action.
+        candidates = [
+            {
+                **dict(option),
+                "option_origin": "codex_research",
+                "candidate_id": option.get("candidate_id"),
+                "keyword_id": option.get("keyword_id"),
+            }
+            for option in run_local_options
+        ]
+        for candidate in candidates:
+            scope_key = str(candidate.get("scope_key") or "")
+            if scope_key and scope_key in scope_locks:
+                candidate.update(
+                    {
+                        "in_cooldown": True,
+                        "cooldown_reason": scope_locks[scope_key],
+                        "reevaluation_condition": (
+                            candidate.get("reevaluation_condition")
+                            or "Re-evaluate after the active observation cooldown ends."
+                        ),
+                    }
+                )
+
+    scheduled_options = _schedule_strategy_options(
+        candidates,
+        safety_action_ceiling=safety_action_ceiling,
+        site_safety_ceilings=site_quotas or {},
+    )
+    selected = [
+        option
+        for option in scheduled_options
+        if option.get("schedule_class") == "execute_now"
+    ]
+    deferred = [
+        option
+        for option in scheduled_options
+        if option.get("schedule_class") == "deferred"
+    ]
+    coverage_matrix = _build_site_coverage(site_scope, scheduled_options)
     if not coverage_matrix["complete"]:
         raise RuntimeError("Strategy coverage is incomplete; every discovered active site must have one decision.")
     site_hold_flags = {
@@ -410,7 +497,22 @@ async def generate_strategies(
         for decision in coverage_matrix["decisions"]
     }
     all_hold = bool(site_hold_flags) and all(site_hold_flags.values())
-    if _replanning_after_refresh:
+    if run_local_options:
+        # A submitted Hold is an explicit current-research decision, not a
+        # symptom that the legacy candidate collector should immediately
+        # replace. A later Run may submit a fresh decision after more research.
+        coordination = {
+            "should_refresh": False,
+            "wait_for_refresh": False,
+            "business_consecutive_hold_count": 1 if all_hold else 0,
+            "site_consecutive_hold_counts": {
+                site_id: 1 if held else 0
+                for site_id, held in site_hold_flags.items()
+            },
+            "emit_strategy_stagnation": False,
+            "refresh": None,
+        }
+    elif _replanning_after_refresh:
         coordination = await reconcile_refreshed_hold_decision(
             session,
             business_id=business_id,
@@ -438,12 +540,14 @@ async def generate_strategies(
                 session,
                 business_id=business_id,
                 site_id=site_id,
+                site_ids=site_ids,
                 limit=limit,
                 action_budget=action_budget,
                 site_quotas=site_quotas,
                 min_impressions=min_impressions,
                 evidence_refreshers=evidence_refreshers,
                 _strategy_run_id=strategy_run_id,
+                run_local_options=run_local_options,
             )
             replanned["evidence_refreshes"] = evidence_refreshes
             replanned["replanned_after_waited_hold_refresh"] = True
@@ -516,6 +620,7 @@ async def generate_strategies(
                 session,
                 business_id=business_id,
                 site_id=site_id,
+                site_ids=site_ids,
                 limit=limit,
                 action_budget=action_budget,
                 site_quotas=site_quotas,
@@ -523,6 +628,7 @@ async def generate_strategies(
                 evidence_refreshers=evidence_refreshers,
                 _strategy_run_id=strategy_run_id,
                 _replanning_after_refresh=True,
+                run_local_options=run_local_options,
             )
             replanned["evidence_refreshes"] = evidence_refreshes
             replanned["replanned_after_hold_refresh"] = True
@@ -551,11 +657,14 @@ async def generate_strategies(
         session,
         business_id=business_id,
         analysis_batch_id=analysis_batch_id,
-        source_audit_batch_id=str(source_audit["id"]),
+        source_audit_batch_id=(
+            str(source_audit["id"]) if source_audit.get("id") else None
+        ),
         source_audit_scanned_at=source_audit["scanned_at"],
-        action_budget=budget,
+        action_budget=safety_action_ceiling,
         site_quotas=site_quotas or {},
-        candidates=selected,
+        candidates=scheduled_options,
+        strategy_run_id=strategy_run_id,
     )
     hold_state.update(
         {
@@ -594,6 +703,7 @@ async def generate_strategies(
                 {
                     "total_candidates": len(candidates),
                     "planned_actions": len(selected),
+                    "deferred_actions": len(deferred),
                     "coverage_matrix": coverage_matrix,
                     "hold_state": hold_state,
                     "evidence_refreshes": evidence_refreshes,
@@ -612,7 +722,8 @@ async def generate_strategies(
         "created": len(plan["items"]),
         "candidates": len(candidates),
         "total_candidates": len(candidates),
-        "planned_actions": len(plan["items"]),
+        "planned_actions": len(selected),
+        "deferred_actions": len(deferred),
         "unassigned": 0,
         "quarantined": quarantined,
         "coverage_matrix": coverage_matrix,
@@ -653,14 +764,35 @@ def _failed_hold_refresh_records(
 def _build_site_coverage(
     site_scope: list[dict[str, Any]],
     candidates: list[dict[str, Any]],
-    selected: list[dict[str, Any]],
+    selected: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     candidates_by_site: dict[str, list[dict[str, Any]]] = {}
-    selected_by_site: dict[str, dict[str, Any]] = {}
+    selected_ids = {
+        str(candidate.get("option_id") or candidate.get("candidate_id") or candidate.get("id"))
+        for candidate in (selected or [])
+    }
+    normalized_options: list[dict[str, Any]] = []
     for candidate in candidates:
-        candidates_by_site.setdefault(str(candidate.get("site_id")), []).append(candidate)
-    for candidate in selected:
-        selected_by_site[str(candidate.get("site_id"))] = candidate
+        option = dict(candidate)
+        option_id = str(
+            option.get("option_id")
+            or option.get("strategy_fingerprint")
+            or option.get("candidate_id")
+            or option.get("id")
+            or uuid4()
+        )
+        option["option_id"] = option_id
+        if selected is not None and not option.get("schedule_class"):
+            option["schedule_class"] = (
+                "execute_now" if option_id in selected_ids else "deferred"
+            )
+            option["schedule_reason"] = (
+                "Selected by the current plan."
+                if option_id in selected_ids
+                else "Qualified option retained for a later execution wave."
+            )
+        normalized_options.append(option)
+        candidates_by_site.setdefault(str(option.get("site_id")), []).append(option)
 
     decisions: list[dict[str, Any]] = []
     discovered_ids: set[str] = set()
@@ -668,7 +800,21 @@ def _build_site_coverage(
         site_id = str(site["id"])
         discovered_ids.add(site_id)
         site_candidates = candidates_by_site.get(site_id, [])
-        selected_candidate = selected_by_site.get(site_id)
+        execute_now = [
+            item for item in site_candidates
+            if item.get("schedule_class") == "execute_now"
+        ]
+        deferred = [
+            item for item in site_candidates
+            if item.get("schedule_class") == "deferred"
+        ]
+        held = [
+            item for item in site_candidates
+            if item.get("schedule_class") == "hold"
+            or item.get("strategy_type") == "hold"
+            or item.get("priority") == "Hold"
+        ]
+        primary_option = (execute_now or deferred or held or [None])[0]
         missing_configuration = [
             field
             for field, value in (
@@ -726,48 +872,39 @@ def _build_site_coverage(
                     "selected_candidate_id": None,
                 }
             )
-        elif selected_candidate:
+        elif primary_option:
+            schedule_class = str(primary_option.get("schedule_class") or "hold")
+            action = str(primary_option.get("strategy_type") or "hold")
             decisions.append(
                 {
                     "site_id": site_id,
                     "site_name": site.get("name"),
-                    "action": selected_candidate.get("strategy_type"),
-                    "reason": selected_candidate.get("reason") or "Selected by the daily strategy plan.",
-                    "candidate_count": len(site_candidates),
-                    "selected_candidate_id": str(selected_candidate.get("id")),
-                }
-            )
-        elif site_candidates:
-            blocked = [
-                candidate
-                for candidate in site_candidates
-                if candidate.get("strategy_type") == "hold"
-                or candidate.get("priority") == "Hold"
-                or candidate.get("in_cooldown")
-                or candidate.get("risk_gate_passed", True) is False
-            ]
-            fully_blocked = len(blocked) == len(site_candidates)
-            first_blocked = blocked[0] if blocked else {}
-            decisions.append(
-                {
-                    "site_id": site_id,
-                    "site_name": site.get("name"),
-                    "action": "hold",
+                    "action": action,
+                    "schedule_class": schedule_class,
                     "reason": (
-                        first_blocked.get("block_reason")
-                        or first_blocked.get("reason")
-                        or "Every candidate is blocked by an evidence, safety, or cooldown gate."
-                        if fully_blocked
-                        else "Candidate exists but is not in the current action budget."
-                    ),
-                    "unlock_condition": (
-                        first_blocked.get("unlock_condition")
-                        or "Satisfy the candidate evidence and safety requirements, then re-evaluate."
-                        if fully_blocked
-                        else "Increase or free the site action budget, then re-evaluate the candidate."
+                        primary_option.get("schedule_reason")
+                        or primary_option.get("reason")
+                        or "Selected by the current strategy plan."
                     ),
                     "candidate_count": len(site_candidates),
-                    "selected_candidate_id": None,
+                    "qualified_option_count": len(execute_now) + len(deferred),
+                    "selected_option_id": str(primary_option.get("option_id")),
+                    "selected_candidate_id": (
+                        str(
+                            primary_option.get("candidate_id")
+                            or primary_option.get("id")
+                        )
+                        if primary_option.get("candidate_id")
+                        or (
+                            primary_option.get("id")
+                            and not primary_option.get("option_origin") == "run_local"
+                        )
+                        else None
+                    ),
+                    "reevaluate_at": primary_option.get("reevaluate_at"),
+                    "reevaluation_condition": primary_option.get(
+                        "reevaluation_condition"
+                    ),
                 }
             )
         else:
@@ -776,6 +913,7 @@ def _build_site_coverage(
                     "site_id": site_id,
                     "site_name": site.get("name"),
                     "action": "hold",
+                    "schedule_class": "hold",
                     "reason": "No executable candidate was found for this site.",
                     "unlock_condition": "Refresh site evidence and candidate discovery, then re-evaluate the site.",
                     "candidate_count": 0,
@@ -789,6 +927,7 @@ def _build_site_coverage(
         "discovered_sites": len(discovered_ids),
         "decided_sites": len(decided_ids),
         "decisions": decisions,
+        "options": normalized_options,
     }
 
 
@@ -871,6 +1010,162 @@ def _select_daily_candidates(
     return selected[:wanted]
 
 
+def _schedule_strategy_options(
+    rows: list[dict[str, Any]],
+    *,
+    safety_action_ceiling: int,
+    site_safety_ceilings: dict[str, int] | None = None,
+) -> list[dict[str, Any]]:
+    """Classify every option without letting a numeric ceiling erase research.
+
+    The ceiling is applied only after qualification. Overflow remains persisted
+    as ``deferred`` with an explicit re-evaluation condition.
+    """
+    ceiling = max(0, min(int(safety_action_ceiling), 200))
+    site_ceilings = {
+        str(key): max(0, int(value))
+        for key, value in (site_safety_ceilings or {}).items()
+    }
+    priority_weight = {"P0": 4, "P1": 3, "P2": 2, "P3": 1}
+
+    def rank(row: dict[str, Any]) -> tuple[float, float, float, float, float]:
+        return (
+            float(priority_weight.get(str(row.get("priority") or "P2"), 0)),
+            float(row.get("opportunity_score", row.get("score", 0)) or 0),
+            float(row.get("readiness_score", row.get("confidence", 0.5)) or 0),
+            -float(row.get("risk_score", 0) or 0),
+            float(row.get("days_since_last_action", 0) or 0),
+        )
+
+    scheduled: list[dict[str, Any]] = []
+    execute_count = 0
+    site_execute_counts: dict[str, int] = {}
+    for raw in sorted(rows, key=rank, reverse=True):
+        option = dict(raw)
+        candidate_id = option.get("candidate_id")
+        if "candidate_id" not in option and option.get("id"):
+            candidate_id = str(option["id"])
+        option_id = str(
+            option.get("option_id")
+            or option.get("strategy_fingerprint")
+            or candidate_id
+            or uuid4()
+        )
+        site_id = str(option.get("site_id") or "")
+        option.update(
+            {
+                "option_id": option_id,
+                "candidate_id": str(candidate_id) if candidate_id else None,
+                "option_origin": option.get("option_origin") or "run_local",
+            }
+        )
+        requested_schedule = str(
+            option.get("requested_schedule_class")
+            or (
+                option.get("schedule_class")
+                if option.get("option_origin") == "codex_research"
+                else ""
+            )
+            or ""
+        )
+        blocked = (
+            option.get("strategy_type") == "hold"
+            or option.get("priority") == "Hold"
+            or option.get("risk_gate_passed", True) is False
+            or option.get("site_configuration_ready", True) is False
+        )
+        if option.get("strategy_type") == "configuration_repair":
+            option.update(
+                {
+                    "schedule_class": "configuration_repair",
+                    "schedule_reason": (
+                        option.get("schedule_reason")
+                        or option.get("reason")
+                        or "Site configuration must be repaired before execution."
+                    ),
+                    "wave_number": None,
+                    "reevaluation_condition": (
+                        option.get("reevaluation_condition")
+                        or option.get("unlock_condition")
+                        or "Repair the required configuration and re-evaluate."
+                    ),
+                }
+            )
+        elif blocked or requested_schedule == "hold":
+            option.update(
+                {
+                    "schedule_class": "hold",
+                    "schedule_reason": (
+                        option.get("block_reason")
+                        or option.get("reason")
+                        or "Evidence, safety, or site configuration gate is not satisfied."
+                    ),
+                    "wave_number": None,
+                    "reevaluation_condition": (
+                        option.get("unlock_condition")
+                        or "Refresh the missing evidence or configuration and re-evaluate."
+                    ),
+                }
+            )
+        elif option.get("in_cooldown") or requested_schedule == "deferred":
+            option.update(
+                {
+                    "schedule_class": "deferred",
+                    "schedule_reason": (
+                        option.get("schedule_reason")
+                        or option.get("cooldown_reason")
+                        or "The target is inside an active observation cooldown."
+                    ),
+                    "wave_number": None,
+                    "reevaluation_condition": (
+                        option.get("reevaluation_condition")
+                        or "Re-evaluate when the active observation cooldown ends."
+                    ),
+                }
+            )
+        elif execute_count >= ceiling:
+            option.update(
+                {
+                    "schedule_class": "deferred",
+                    "schedule_reason": "Qualified option exceeded the run safety ceiling.",
+                    "wave_number": None,
+                    "reevaluation_condition": (
+                        "Resume in a later bounded wave after completed Actions pass readback."
+                    ),
+                }
+            )
+        elif site_execute_counts.get(site_id, 0) >= site_ceilings.get(
+            site_id, ceiling
+        ):
+            option.update(
+                {
+                    "schedule_class": "deferred",
+                    "schedule_reason": "Qualified option exceeded the site safety ceiling.",
+                    "wave_number": None,
+                    "reevaluation_condition": (
+                        "Resume after the site's earlier Action passes independent readback."
+                    ),
+                }
+            )
+        else:
+            site_count = site_execute_counts.get(site_id, 0) + 1
+            option.update(
+                {
+                    "schedule_class": "execute_now",
+                    "schedule_reason": (
+                        option.get("schedule_reason")
+                        or "Qualified by current evidence, readiness, risk, and cooldown gates."
+                    ),
+                    "wave_number": site_count,
+                    "reevaluation_condition": None,
+                }
+            )
+            execute_count += 1
+            site_execute_counts[site_id] = site_count
+        scheduled.append(option)
+    return scheduled
+
+
 def _required_strategy_data(strategy_type: str) -> list[str]:
     if strategy_type == "new_article":
         return ["site_content", "site_knowledge", "content_audit", "serp"]
@@ -884,22 +1179,24 @@ async def _replace_strategy_plan(
     *,
     business_id: str,
     analysis_batch_id: str,
-    source_audit_batch_id: str,
+    source_audit_batch_id: str | None,
     source_audit_scanned_at: Any,
     action_budget: int,
     site_quotas: dict[str, int],
     candidates: list[dict[str, Any]],
+    strategy_run_id: str,
 ) -> dict[str, Any]:
     await session.execute(text("SELECT pg_advisory_xact_lock(hashtext(:business_id))"), {"business_id": business_id})
-    await session.execute(
-        text(
-            "UPDATE seo_agent.tasks SET status = 'canceled', finished_at = now(), updated_at = now() "
-            "WHERE task_type = 'review' AND status = 'queued' AND payload->>'business_id' = :business_id "
-            "AND payload->>'kind' IN ('strategy_plan', 'seo_strategy')"
-        ),
-        {"business_id": business_id},
-    )
-    selected_ids = [str(candidate["id"]) for candidate in candidates]
+    planned_options = [
+        dict(candidate)
+        for candidate in candidates
+        if candidate.get("schedule_class") in {"execute_now", "deferred"}
+    ]
+    source_candidate_ids = [
+        str(candidate.get("candidate_id") or candidate.get("research_candidate_id"))
+        for candidate in planned_options
+        if candidate.get("candidate_id") or candidate.get("research_candidate_id")
+    ]
     plan_date = datetime.now(ZoneInfo("Asia/Shanghai")).date().isoformat()
     inserted = await session.execute(
         text(
@@ -914,14 +1211,21 @@ async def _replace_strategy_plan(
             "payload": json.dumps({
                 "kind": "strategy_plan",
                 "business_id": business_id,
+                "strategy_run_id": strategy_run_id,
                 "analysis_batch_id": analysis_batch_id,
                 "source_audit_batch_id": source_audit_batch_id,
                 "source_audit_scanned_at": source_audit_scanned_at,
+                "plan_contract_version": "2",
             }, ensure_ascii=False),
             "decision": json.dumps({
                 "action_budget": action_budget,
+                "safety_action_ceiling": action_budget,
                 "site_quotas": site_quotas,
-                "selected_candidate_ids": selected_ids,
+                "source_candidate_ids": source_candidate_ids,
+                "selected_candidate_ids": source_candidate_ids,
+                "strategy_task_ids": [],
+                "execute_now_strategy_ids": [],
+                "deferred_strategy_ids": [],
                 "plan_date": plan_date,
             }, ensure_ascii=False),
         },
@@ -929,9 +1233,11 @@ async def _replace_strategy_plan(
     plan_row = inserted.mappings().one()
     plan_id = str(plan_row["id"])
     items: list[dict[str, Any]] = []
-    for candidate in candidates:
+    for candidate in planned_options:
         strategy = {key: value for key, value in candidate.items() if key not in {"id", "site_id", "site_name", "keyword_id", "post_id", "article_id", "status", "created_at", "updated_at", "candidate_status", "executed"}}
         strategy["business_id"] = business_id
+        schedule_class = str(candidate.get("schedule_class") or "deferred")
+        candidate_id = candidate.get("candidate_id")
         task = await session.execute(
             text(
                 """
@@ -956,9 +1262,18 @@ async def _replace_strategy_plan(
                 "payload": json.dumps({
                     "kind": "seo_strategy",
                     "business_id": business_id,
+                    "strategy_run_id": strategy_run_id,
                     "analysis_batch_id": analysis_batch_id,
-                    "candidate_id": str(candidate["id"]),
+                    "candidate_id": str(candidate_id) if candidate_id else None,
+                    "option_id": str(candidate["option_id"]),
                     "plan_id": plan_id,
+                    "schedule_class": schedule_class,
+                    "schedule_reason": candidate.get("schedule_reason"),
+                    "wave_number": candidate.get("wave_number"),
+                    "reevaluate_at": candidate.get("reevaluate_at"),
+                    "reevaluation_condition": candidate.get(
+                        "reevaluation_condition"
+                    ),
                     "scope_key": strategy.get("scope_key"),
                     "strategy_fingerprint": strategy.get("strategy_fingerprint"),
                     "evidence_fingerprint": strategy.get("evidence_fingerprint"),
@@ -974,10 +1289,69 @@ async def _replace_strategy_plan(
             **candidate,
             **strategy,
             "id": task_id,
-            "candidate_id": str(candidate["id"]),
+            "candidate_id": str(candidate_id) if candidate_id else None,
+            "option_id": str(candidate["option_id"]),
             "plan_id": plan_id,
+            "strategy_run_id": strategy_run_id,
+            "schedule_class": schedule_class,
             "status": "pending",
         })
+    strategy_ids = [str(item["id"]) for item in items]
+    execute_now_ids = [
+        str(item["id"])
+        for item in items
+        if item.get("schedule_class") == "execute_now"
+    ]
+    deferred_ids = [
+        str(item["id"])
+        for item in items
+        if item.get("schedule_class") == "deferred"
+    ]
+    plan_decision = {
+        "action_budget": action_budget,
+        "safety_action_ceiling": action_budget,
+        "site_quotas": site_quotas,
+        "source_candidate_ids": source_candidate_ids,
+        "selected_candidate_ids": source_candidate_ids,
+        "strategy_task_ids": strategy_ids,
+        "execute_now_strategy_ids": execute_now_ids,
+        "deferred_strategy_ids": deferred_ids,
+        "plan_date": plan_date,
+    }
+    await session.execute(
+        text(
+            """
+            UPDATE seo_agent.tasks
+               SET decision=CAST(:decision AS jsonb), updated_at=now()
+             WHERE id=CAST(:plan_id AS uuid)
+               AND payload->>'kind'='strategy_plan'
+            """
+        ),
+        {
+            "plan_id": plan_id,
+            "decision": json.dumps(plan_decision, ensure_ascii=False),
+        },
+    )
+    await session.execute(
+        text(
+            """
+            UPDATE seo_agent.tasks
+               SET status='canceled', finished_at=now(), updated_at=now(),
+                   decision=decision || '{"superseded": true}'::jsonb
+             WHERE task_type='review' AND status='queued'
+               AND payload->>'business_id'=:business_id
+               AND payload->>'strategy_run_id'=:strategy_run_id
+               AND payload->>'kind' IN ('strategy_plan','seo_strategy')
+               AND id<>CAST(:plan_id AS uuid)
+               AND COALESCE(payload->>'plan_id', id::text)<>CAST(:plan_id AS text)
+            """
+        ),
+        {
+            "business_id": business_id,
+            "strategy_run_id": strategy_run_id,
+            "plan_id": plan_id,
+        },
+    )
     return {
         "id": plan_id,
         "business_id": business_id,
@@ -986,9 +1360,15 @@ async def _replace_strategy_plan(
         "source_audit_scanned_at": source_audit_scanned_at,
         "action_budget": action_budget,
         "site_quotas": site_quotas,
-        "selected_candidate_ids": selected_ids,
+        "strategy_run_id": strategy_run_id,
+        "source_candidate_ids": source_candidate_ids,
+        "selected_candidate_ids": source_candidate_ids,
+        "strategy_task_ids": strategy_ids,
+        "execute_now_strategy_ids": execute_now_ids,
+        "deferred_strategy_ids": deferred_ids,
         "plan_date": plan_date,
-        "planned_actions": len(items),
+        "planned_actions": len(execute_now_ids),
+        "deferred_actions": len(deferred_ids),
         "status": "active",
         "created_at": plan_row["created_at"],
         "items": items,
@@ -1071,135 +1451,6 @@ async def list_strategy_candidates(
         "limit": limit,
         "analysis_batch_id": items[0].get("analysis_batch_id") if items else None,
     }
-
-
-async def get_strategy_plan(session: AsyncSession, *, business_id: str) -> dict[str, Any] | None:
-    plan = (
-        await session.execute(
-            text(
-                """
-                SELECT id, status, payload, decision, created_at, updated_at
-                  FROM seo_agent.tasks
-                 WHERE task_type = 'review' AND status = 'queued'
-                   AND payload->>'kind' = 'strategy_plan' AND payload->>'business_id' = :business_id
-                   AND decision->>'plan_date' = (now() AT TIME ZONE 'Asia/Shanghai')::date::text
-                 ORDER BY created_at DESC LIMIT 1
-                """
-            ),
-            {"business_id": business_id},
-        )
-    ).mappings().first()
-    if not plan:
-        return None
-    payload = dict(plan["payload"] or {})
-    decision = dict(plan["decision"] or {})
-    strategies = await list_strategies(session, status="pending", limit=200, business_id=business_id)
-    plan_id = str(plan["id"])
-    items = [item for item in strategies if item.get("plan_id") == plan_id]
-    return {
-        "id": plan_id,
-        "business_id": business_id,
-        "analysis_batch_id": payload.get("analysis_batch_id"),
-        "source_audit_batch_id": payload.get("source_audit_batch_id"),
-        "source_audit_scanned_at": payload.get("source_audit_scanned_at"),
-        "action_budget": int(decision.get("action_budget") or 0),
-        "site_quotas": decision.get("site_quotas") or {},
-        "selected_candidate_ids": decision.get("selected_candidate_ids") or [],
-        "plan_date": decision.get("plan_date"),
-        "planned_actions": len(items),
-        "status": "active",
-        "created_at": plan["created_at"],
-        "updated_at": plan["updated_at"],
-        "items": items,
-    }
-
-
-async def save_strategy_plan(
-    session: AsyncSession,
-    *,
-    business_id: str,
-    action_budget: int,
-    site_quotas: dict[str, int] | None = None,
-    selected_candidate_ids: list[str] | None = None,
-) -> dict[str, Any]:
-    budget = max(0, min(action_budget, 200))
-    quotas = {str(key): max(0, int(value)) for key, value in (site_quotas or {}).items()}
-    await session.execute(text("SELECT pg_advisory_xact_lock(hashtext(:business_id))"), {"business_id": business_id})
-    analysis_batch = (
-        await session.execute(
-            text(
-                "SELECT id::text AS id, payload->>'source_audit_batch_id' AS source_audit_batch_id, "
-                "payload->>'source_audit_scanned_at' AS source_audit_scanned_at "
-                "FROM seo_agent.tasks WHERE task_type = 'review' "
-                "AND status = 'done' AND payload->>'kind' = 'strategy_analysis_batch' "
-                "AND payload->>'business_id' = :business_id "
-                "ORDER BY created_at DESC LIMIT 1"
-            ),
-            {"business_id": business_id},
-        )
-    ).mappings().first()
-    if not analysis_batch:
-        raise ValueError("请先生成策略候选池")
-    analysis_batch_id = str(analysis_batch["id"])
-    rows = await session.execute(
-        text(
-            """
-            SELECT t.id, t.priority, t.score, t.site_id, s.name AS site_name, t.keyword_id,
-                   t.post_id, t.article_id, t.title, t.decision, t.created_at, t.updated_at,
-                   EXISTS (
-                     SELECT 1 FROM seo_agent.tasks strategy
-                      WHERE strategy.task_type = 'review'
-                        AND strategy.payload->>'kind' = 'seo_strategy'
-                        AND strategy.payload->>'candidate_id' = t.id::text
-                        AND (strategy.status = 'done' OR strategy.decision ? 'execution_task_id')
-                   ) AS executed
-              FROM seo_agent.tasks t JOIN seo_agent.sites s ON s.id = t.site_id
-             WHERE t.task_type = 'review' AND t.payload->>'kind' = 'strategy_candidate'
-               AND t.status = 'done'
-               AND t.payload->>'business_id' = :business_id
-               AND t.payload->>'analysis_batch_id' = :analysis_batch_id
-             ORDER BY t.score DESC NULLS LAST, t.created_at DESC
-            """
-        ),
-        {"business_id": business_id, "analysis_batch_id": analysis_batch_id},
-    )
-    candidates = [_strategy_row(dict(row)) for row in rows.mappings().all()]
-    if selected_candidate_ids is None:
-        selected = _select_daily_candidates(candidates, budget, quotas)
-    else:
-        selected_candidate_ids = list(dict.fromkeys(selected_candidate_ids))
-        by_id = {str(candidate["id"]): candidate for candidate in candidates}
-        missing = [candidate_id for candidate_id in selected_candidate_ids if candidate_id not in by_id]
-        if missing:
-            raise ValueError("所选策略候选不属于当前业务分析批次")
-        selected = [by_id[candidate_id] for candidate_id in selected_candidate_ids]
-        if len(selected) > budget:
-            raise ValueError("所选策略数量超过今日动作预算")
-        counts: dict[str, int] = {}
-        for candidate in selected:
-            if candidate.get("executed"):
-                raise ValueError("已批准或执行的策略候选不能再次加入计划")
-            if candidate.get("strategy_type") == "hold" or candidate.get("priority") == "Hold":
-                raise ValueError("Hold 候选不能进入今日计划")
-            candidate_site = str(candidate["site_id"])
-            counts[candidate_site] = counts.get(candidate_site, 0) + 1
-            if candidate_site in quotas and counts[candidate_site] > quotas[candidate_site]:
-                raise ValueError("所选策略数量超过站点配额")
-    plan = await _replace_strategy_plan(
-        session,
-        business_id=business_id,
-        analysis_batch_id=analysis_batch_id,
-        source_audit_batch_id=str(analysis_batch["source_audit_batch_id"]),
-        source_audit_scanned_at=require_aware_datetime(
-            analysis_batch["source_audit_scanned_at"],
-            field="source_audit_scanned_at",
-        ),
-        action_budget=budget,
-        site_quotas=quotas,
-        candidates=selected,
-    )
-    await session.commit()
-    return plan
 
 
 async def _quarantine_invalid_assignments(session: AsyncSession, business_id: str) -> int:
@@ -1319,217 +1570,6 @@ async def list_strategies(
         params,
     )
     return [_strategy_row(dict(row)) for row in rows.mappings().all()]
-
-
-async def review_strategy(session: AsyncSession, *, task_id: str, approved: bool) -> dict[str, Any]:
-    row = (
-        await session.execute(
-            text(
-                "SELECT t.id, t.site_id, t.keyword_id, t.post_id, t.article_id, t.title, t.decision, "
-                "       s.site_type, s.status AS site_status, s.business_id, s.strategy_enabled, "
-                "       t.payload->>'business_id' AS task_business_id, "
-                "       t.payload->>'candidate_id' AS candidate_id, t.payload->>'plan_id' AS plan_id, "
-                "       t.payload->>'analysis_batch_id' AS analysis_batch_id "
-                "FROM seo_agent.tasks t JOIN seo_agent.sites s ON s.id = t.site_id "
-                "WHERE t.id = CAST(:id AS uuid) AND t.task_type = 'review' AND t.status = 'queued' "
-                "AND t.payload->>'kind' = 'seo_strategy' "
-                "FOR UPDATE OF t"
-            ),
-            {"id": task_id},
-        )
-    ).mappings().first()
-    if not row:
-        raise ValueError("strategy task not found")
-    decision = dict(row["decision"] or {})
-    if approved and decision.get("strategy_type") == "on_page_fix":
-        if (
-            row["site_status"] != "active"
-            or not row["strategy_enabled"]
-            or not row["business_id"]
-            or row["task_business_id"] != row["business_id"]
-        ):
-            raise ValueError("目标站点已退出当前业务策略范围，请重新扫描并生成策略")
-        decision.update(
-            {
-                "approved": True,
-                "execution_task_id": None,
-                "execution_status": "blocked_pending_preview",
-                "requires_publish": True,
-                "blocker": "A safe on-page preview and explicit confirmation are required before execution.",
-                "unlock_condition": f"Call /workflow/strategies/{task_id}/on-page/preview, review the snapshot hash, then confirm through the on-page execute API.",
-            }
-        )
-        await session.execute(
-            text(
-                "UPDATE seo_agent.tasks SET status = 'done', decision = CAST(:decision AS jsonb), "
-                "finished_at = now(), updated_at = now() WHERE id = CAST(:id AS uuid)"
-            ),
-            {
-                "id": task_id,
-                "decision": json.dumps(decision, ensure_ascii=False),
-            },
-        )
-        await session.commit()
-        return _strategy_row({**dict(row), "status": "done", "decision": decision})
-    if approved:
-        await _validate_current_strategy(session, row=dict(row), decision=decision)
-        if decision.get("strategy_type") == "hold" or decision.get("priority") == "Hold":
-            raise ValueError("Hold 策略必须先补齐诊断证据，不能批准执行")
-        execution_type = "new_article" if decision.get("strategy_type") == "new_article" else "update_article"
-        target_url = resolve_strategy_target_url(decision)
-        execution_strategy = {**decision, **({"target_url": target_url} if target_url else {})}
-        execution = await session.execute(
-            text(
-                """
-                INSERT INTO seo_agent.tasks
-                  (task_type, status, priority, score, site_id, keyword_id, post_id, article_id,
-                   title, target_url, payload, required_data, decision, logs)
-                VALUES
-                  (:task_type, 'queued', :priority, :score, :site_id, :keyword_id, :post_id, :article_id,
-                   :title, :target_url, CAST(:payload AS jsonb), :required_data, CAST(:decision AS jsonb),
-                   jsonb_build_array(jsonb_build_object('stage', 'queued', 'message', '人工审核通过，已进入待执行队列', 'at', now())))
-                RETURNING id
-                """
-            ),
-            {
-                "task_type": execution_type,
-                "priority": decision.get("priority") or "P2",
-                "score": decision.get("score") or 0,
-                "site_id": row["site_id"],
-                "keyword_id": row["keyword_id"],
-                "post_id": row["post_id"],
-                "article_id": row["article_id"],
-                "title": f"执行策略：{row['title']}",
-                "target_url": target_url,
-                "payload": json.dumps({
-                    "strategy_task_id": str(task_id),
-                    "strategy": execution_strategy,
-                    "scope_key": decision.get("scope_key"),
-                    "strategy_fingerprint": decision.get("strategy_fingerprint"),
-                    "evidence_fingerprint": decision.get("evidence_fingerprint"),
-                    "policy_version": decision.get("policy_version"),
-                    "auto_publish": execution_type == "new_article",
-                }, ensure_ascii=False),
-                "required_data": ["approved_strategy"],
-                "decision": json.dumps({"source_strategy_id": str(task_id), "strategy_type": execution_type}, ensure_ascii=False),
-            },
-        )
-        execution_id = execution.scalar_one()
-        if row["keyword_id"]:
-            await session.execute(
-                text(
-                    "UPDATE seo_agent.keywords SET assigned_site_id = CAST(:site_id AS uuid), "
-                    "status = CASE WHEN :type = 'new_article' THEN 'queued' ELSE status END, updated_at = now() "
-                    "WHERE id = CAST(:id AS uuid) AND status NOT IN ('written', 'published')"
-                ),
-                {"site_id": row["site_id"], "type": execution_type, "id": row["keyword_id"]},
-            )
-        decision.update({"review_status": "approved", "execution_task_id": str(execution_id)})
-        status = "done"
-    else:
-        decision["review_status"] = "rejected"
-        status = "canceled"
-        execution_id = None
-    await session.execute(
-        text(
-            "UPDATE seo_agent.tasks SET status = :status, decision = CAST(:decision AS jsonb), "
-            "finished_at = now(), updated_at = now() WHERE id = CAST(:id AS uuid)"
-        ),
-        {"status": status, "decision": json.dumps(decision, ensure_ascii=False), "id": task_id},
-    )
-    await session.commit()
-    return {"ok": True, "status": decision["review_status"], "execution_task_id": execution_id}
-
-
-async def clear_strategy_queue(session: AsyncSession, *, business_id: str) -> dict[str, int]:
-    await session.execute(text("SELECT pg_advisory_xact_lock(hashtext(:business_id))"), {"business_id": business_id})
-    running = int(
-        (await session.execute(
-            text(
-                "SELECT count(*) FROM seo_agent.tasks t JOIN seo_agent.sites s ON s.id = t.site_id "
-                "WHERE s.business_id = :business_id AND t.task_type IN ('new_article', 'update_article') AND t.status = 'running'"
-            ),
-            {"business_id": business_id},
-        )).scalar_one()
-        or 0
-    )
-    if running:
-        raise ValueError("仍有任务正在执行，不能清空队列")
-
-    executions = (
-        await session.execute(
-            text(
-                "SELECT t.id::text, t.keyword_id::text, t.payload->>'strategy_task_id' AS review_id "
-                "FROM seo_agent.tasks t JOIN seo_agent.sites s ON s.id = t.site_id "
-                "WHERE s.business_id = :business_id AND t.task_type IN ('new_article', 'update_article') "
-                "AND t.status = 'queued' AND t.article_id IS NULL "
-                "AND NOT EXISTS (SELECT 1 FROM seo_agent.articles a WHERE a.task_id = t.id)"
-            ),
-            {"business_id": business_id},
-        )
-    ).mappings().all()
-    pending_reviews = (
-        await session.execute(
-            text(
-                "SELECT t.id::text, t.keyword_id::text FROM seo_agent.tasks t "
-                "WHERE t.task_type = 'review' AND t.status = 'queued' AND t.payload->>'kind' = 'seo_strategy' "
-                "AND t.payload->>'business_id' = :business_id "
-                "AND NOT EXISTS (SELECT 1 FROM seo_agent.tasks e WHERE e.payload->>'strategy_task_id' = t.id::text OR e.decision->>'source_strategy_id' = t.id::text) "
-                "AND NOT EXISTS (SELECT 1 FROM seo_agent.articles a WHERE a.task_id = t.id)"
-            ),
-            {"business_id": business_id},
-        )
-    ).mappings().all()
-    execution_ids = [row["id"] for row in executions]
-    review_ids = [row["review_id"] for row in executions if row["review_id"]] + [row["id"] for row in pending_reviews]
-    keyword_ids = [row["keyword_id"] for row in executions if row["keyword_id"]] + [row["keyword_id"] for row in pending_reviews if row["keyword_id"]]
-
-    executions_canceled = 0
-    if execution_ids:
-        canceled = await session.execute(
-            text("UPDATE seo_agent.tasks SET status = 'canceled', finished_at = now(), updated_at = now() WHERE id::text = ANY(:ids) RETURNING id"),
-            {"ids": execution_ids},
-        )
-        executions_canceled = len(canceled.all())
-    strategies_canceled = 0
-    if review_ids:
-        reviews = await session.execute(
-            text("UPDATE seo_agent.tasks SET status = 'canceled', finished_at = now(), updated_at = now() WHERE id::text = ANY(:ids) RETURNING id"),
-            {"ids": review_ids},
-        )
-        strategies_canceled = len(reviews.all())
-    plans = await session.execute(
-        text(
-            "UPDATE seo_agent.tasks SET status = 'canceled', finished_at = now(), updated_at = now() "
-            "WHERE task_type = 'review' AND status = 'queued' AND payload->>'kind' = 'strategy_plan' "
-            "AND payload->>'business_id' = :business_id RETURNING id"
-        ),
-        {"business_id": business_id},
-    )
-    plans_cleared = len(plans.all())
-    workspace = await session.execute(
-        text(
-            "UPDATE seo_agent.tasks SET status = 'canceled', finished_at = now(), updated_at = now() "
-            "WHERE task_type = 'review' AND status = 'done' "
-            "AND payload->>'kind' IN ('strategy_candidate', 'strategy_analysis_batch') "
-            "AND payload->>'business_id' = :business_id RETURNING payload->>'kind' AS kind"
-        ),
-        {"business_id": business_id},
-    )
-    cleared_kinds = [row[0] for row in workspace.all()]
-    if keyword_ids:
-        await session.execute(
-            text("UPDATE seo_agent.keywords SET status = 'analyzed', updated_at = now() WHERE id::text = ANY(:ids) AND status = 'queued'"),
-            {"ids": keyword_ids},
-        )
-    await session.commit()
-    return {
-        "executions_canceled": executions_canceled,
-        "strategies_canceled": strategies_canceled,
-        "plans_cleared": plans_cleared,
-        "candidates_cleared": cleared_kinds.count("strategy_candidate"),
-        "analysis_batches_cleared": cleared_kinds.count("strategy_analysis_batch"),
-    }
 
 
 async def _load_site_content(session: AsyncSession) -> dict[str, list[dict[str, Any]]]:

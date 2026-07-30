@@ -179,8 +179,7 @@
 | POST | `/api/v1/connectors/{connector_id}/home-seo/update/preview` | 首页 SEO patch | 实时读取首页 SEO，返回字段差异和快照哈希，不写外部站点。 |
 | POST | `/api/v1/connectors/{connector_id}/home-seo/update/execute` | 首页 SEO patch、`expected_snapshot_hash`、`confirm=true` | 仅发送三个 SEO 字段到 `/seoplans`，写后回读并保存前后审计。 |
 | GET | `/api/v1/connectors/{connector_id}/home-seo-update-runs` | `limit?` | 查看首页 SEO 写回记录和验证结果。 |
-| POST | `/api/v1/workflow/strategies/{task_id}/on-page/preview` | `{patch, generationMode, generationProvider?, generationModel?, generationRunId?}` | 将已批准的 `on_page_fix` 策略路由到现有首页、产品或分类 SEO 预览服务；`generationMode` 必须明确为 `manual` 或 `model`。模型生成时必须提供精确厂商和模型 ID；人工提交时模型字段保存为 `null`。 |
-| POST | `/api/v1/workflow/strategies/{task_id}/on-page/execute` | `{patch, generationMode, generationProvider?, generationModel?, generationRunId?, expectedSnapshotHash, confirm, confirmVariantRecreation?, confirmMembershipTopReset?}` | 使用预览快照执行受保护的 SEO 写入并回读验证；执行 provenance 必须与预览一致，缺少精确模型信息会在 PUT 前阻塞。商品变体重建和分类成员置顶重置必须分别显式确认，失败不会标记成功。 |
+| 已退役 | `/api/v1/workflow/strategies/{task_id}/on-page/*` | 不适用 | 旧 On-page 旁路不再注册。AI On-page 必须从 Run-local option 进入 Formal Plan，再使用统一 Strategy Action 生命周期。 |
 
 网络保护包括：仅允许 HTTPS 443、逐次校验跳转目标、DNS 解析结果必须全部为公网地址、精确主机白名单、超时和响应大小限制、JSON 内容类型校验。通用自定义连接器保持只读；只有固定域名的 OEMApps 适配器提供显式 SEO 写回，且要求连接器已激活、单商品预览、快照匹配、variant 重建确认、完整审计和写后回读。
 
@@ -521,15 +520,25 @@ curl -X POST http://127.0.0.1:8010/api/v1/knowledge/retrieve \
 完整契约、状态机和安全边界见
 `docs/SEO_AUTONOMOUS_OPERATIONS_BACKEND_V2.md`。
 
-- `POST /api/v1/strategy-runs`：创建幂等 dry-run。
+- `POST /api/v1/strategy-runs`：创建幂等 `dry_run` 或 `approval_execution` Run。
+- `POST /api/v1/strategy-runs/{run_id}/run-local-options`：在 Run 启动前提交本轮实时研究得到的自主选题。`candidate_id`、`keyword_id` 均为可选来源；On-page 以 `action=on_page_fix` 表达编辑决策，同时提交具体 `action_type`、`page_type`、`target_asset_id` 或稳定远端 ID、`target_url`、连接器身份和 `expected_fields`。后端从现有数据库回查业务、站点、本地资产、远端对象、URL 和连接器归属，再交给 Formal Plan。已提交选题不能在同一 Run 中静默替换，需要更改时创建新 Run。
 - `GET /api/v1/strategy-runs/{run_id}`：查询统一运行状态。
 - `GET /api/v1/strategy-runs/{run_id}/events`：查询结构化事件。
 - `POST /api/v1/strategy-runs/{run_id}/start`：幂等启动或恢复人工审批运行。
 - `POST /api/v1/strategy-runs/{run_id}/cancel|retry`：协作式取消或关联重试。
-- `/api/v1/strategy-actions/{action_id}/*`：统一预览、审批、执行、心跳、恢复和回滚门禁。
+- `POST /api/v1/strategy-actions/{action_id}/preview`：提交字段白名单内的 patch、能力快照哈希及可选的精确生成来源。模型 ID 未由运行时暴露时使用 `not_exposed_by_runtime`，不得填写泛化模型名。
+- `POST /api/v1/strategy-actions/{action_id}/approve`：绑定 before/patch/capability/target/Adapter 身份及平台副作用确认。
+- `POST /api/v1/strategy-actions/{action_id}/execute`：按精确 `(connector_type, action_type)` 路由一次远端写入并立即独立回读；当前 On-page 注册 OEMApps 首页/产品/分类和 Shopify 产品 SEO。
+- `POST /api/v1/strategy-actions/{action_id}/recover`：只读恢复；确认未写入后回到 `planned`，必须重新 Preview 和审批，不能复用旧审批。
+- `/api/v1/strategy-actions/{action_id}/heartbeat|rollback-*`：执行租约心跳；未声明真实回滚时继续阻塞。
 - `/api/v1/businesses/{business_id}/sites/capabilities`：读取业务全站能力。
 - `/api/v1/sites/{site_id}/capabilities`：读取单站能力。
 
+自主选题的标准顺序是：
+`创建 Run → 实时研究 → 提交 run-local-options → start → Formal Plan → Action`。
+一旦存在已提交的 run-local options，旧审计候选和关键词只保留研究参考价值，
+不能与提交选题竞争或自动创建 Action。
+
 以上 Run、Action 和 Capabilities 接口统一返回
-`{ok, request_id, data, error}`；所有写接口要求幂等键。生产真实写 adapter
-在全局身份认证与 business scope 授权完成前保持禁用。
+`{ok, request_id, data, error}`；所有写接口要求幂等键。前端只承担只读看板，
+不参与选题、路由或执行决策。全局身份认证与 business scope 授权仍是独立生产门禁。

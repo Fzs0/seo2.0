@@ -14,6 +14,7 @@ class MemoryStore:
         self.action = deepcopy(action)
         self.exceptions: list[dict] = []
         self.observations: list[dict] = []
+        self.reconciled_run_ids: list[str] = []
         self.lock_held = False
 
     async def get(self, _action_id: str, *, lock: bool = False) -> dict:
@@ -32,6 +33,9 @@ class MemoryStore:
         if not self.observations:
             self.observations.append(deepcopy(observation))
         return deepcopy(self.observations[0])
+
+    async def reconcile_parent_run(self, run_id: str) -> None:
+        self.reconciled_run_ids.append(run_id)
 
 
 class Adapter:
@@ -66,9 +70,13 @@ def action() -> dict:
     return {
         "action_id": "action-1",
         "run_id": "run-1",
+        "run_mode": "approval_execution",
         "business_id": "business-1",
         "site_id": "site-1",
         "action_type": "product_seo",
+        "page_type": "product",
+        "target_asset_id": "42",
+        "connector_type": "oemapps",
         "target_url": "https://example.com/p/1",
         "status": "planned",
         "idempotency_key": "run-1:action-1",
@@ -76,6 +84,32 @@ def action() -> dict:
         "approval_requirement": "approval_required",
         "legacy_capability_compatibility": True,
     }
+
+
+@pytest.mark.asyncio
+async def test_dry_run_action_never_calls_writer() -> None:
+    dry_action = action()
+    dry_action.update(
+        {
+            "run_mode": "dry_run",
+            "status": "approved",
+            "approved_snapshot_hash": service._hash({}),
+            "approved_patch_hash": service._hash({"title": "After"}),
+            "before_snapshot": {},
+            "proposed_patch": {"title": "After"},
+        }
+    )
+    store, adapter = MemoryStore(dry_action), Adapter()
+
+    result = await service.execute_action(
+        store,
+        action_id="action-1",
+        adapter=adapter,
+    )
+
+    assert result["result"] == "blocked"
+    assert result["block_reason"] == "dry_run_actions_cannot_execute"
+    assert adapter.writes == 0
 
 
 @pytest.mark.asyncio
@@ -120,6 +154,26 @@ async def test_model_provenance_must_be_exact() -> None:
 
 
 @pytest.mark.asyncio
+async def test_preview_persists_exact_generation_provenance() -> None:
+    store, adapter = MemoryStore(action()), Adapter()
+    preview = await service.preview_action(
+        store,
+        action_id="action-1",
+        patch={"title": "After"},
+        adapter=adapter,
+        generation_mode="model",
+        generation_provider="openai",
+        generation_model="not_exposed_by_runtime",
+        generation_run_id="generation-1",
+    )
+
+    assert preview["generation_mode"] == "model"
+    assert preview["generation_provider"] == "openai"
+    assert preview["generation_model"] == "not_exposed_by_runtime"
+    assert preview["generation_run_id"] == "generation-1"
+
+
+@pytest.mark.asyncio
 async def test_execute_is_idempotent_and_uses_fixed_result_semantics() -> None:
     store, adapter = MemoryStore(action()), Adapter()
     preview = await service.preview_action(
@@ -143,6 +197,29 @@ async def test_execute_is_idempotent_and_uses_fixed_result_semantics() -> None:
     assert store.action["execution_token"]
     assert store.action["execution_claimed_at"]
     assert store.action["generation_model"] == "gpt-5.1-2026-01-15"
+
+
+@pytest.mark.asyncio
+async def test_formal_execute_reconciles_parent_run_without_changing_action_response() -> None:
+    store, adapter = MemoryStore(action()), Adapter()
+    preview = await service.preview_action(
+        store, action_id="action-1", patch={"title": "After"}, adapter=adapter
+    )
+    await service.approve_action(
+        store,
+        action_id="action-1",
+        snapshot_hash=preview["snapshot_hash"],
+        patch_hash=preview["patch_hash"],
+        generation_mode="manual",
+    )
+
+    result = await service.execute_action_and_reconcile(
+        store, action_id="action-1", adapter=adapter
+    )
+
+    assert result["status"] == "completed"
+    assert result["result"] == "updated"
+    assert store.reconciled_run_ids == ["run-1"]
 
 
 @pytest.mark.asyncio
@@ -231,7 +308,21 @@ async def test_platform_verifies_normalized_fields_and_creates_one_observation_p
     assert second["result"] == "already_applied"
     assert all(item["match"] for item in first["field_differences"])
     assert len(store.observations) == 1
-    assert store.observations[0]["checkpoints_days"] == [7, 14, 28, 56]
+    assert store.observations[0]["checkpoints_days"] == [0, 7, 14, 28, 56, 90]
+    assert store.observations[0]["checkpoint_statuses"]["0"] == "pending"
+    assert store.observations[0]["page_type"] == "product"
+    assert store.observations[0]["target_asset_id"] == "42"
+    assert store.observations[0]["before_snapshot_hash"]
+    assert store.observations[0]["after_snapshot_hash"]
+    assert store.observations[0]["t0_required_checks"] == [
+        "http_status",
+        "title",
+        "description",
+        "canonical",
+        "robots",
+        "page_accessibility",
+    ]
+    assert store.observations[0]["next_check_at"]
     assert store.observations[0]["action_id"] == "action-1"
 
 
@@ -341,6 +432,149 @@ async def test_persisted_capability_snapshot_blocks_undeclared_fields() -> None:
 
 
 @pytest.mark.asyncio
+async def test_side_effect_confirmation_is_bound_at_approval_not_preview() -> None:
+    item = action()
+    item["legacy_capability_compatibility"] = False
+    item["capability_snapshot"] = {
+        "capability_snapshot_hash": "capability-hash-v1",
+        "supported_actions": {"product_seo": "approval_required"},
+        "supported_fields": {"product_seo": ["meta_title"]},
+        "connectors": {
+            "products": {
+                "status": "available",
+                "write": True,
+                "checked_at": datetime.now(UTC).isoformat(),
+            }
+        },
+        "configuration_issues": [],
+        "side_effects": {
+            "product_seo": {"requires_variant_confirmation": True}
+        },
+    }
+    store = MemoryStore(item)
+    preview = await service.preview_action(
+        store,
+        action_id="action-1",
+        patch={"meta_title": "After"},
+        adapter=Adapter(),
+        capability_snapshot_hash="capability-hash-v1",
+    )
+
+    assert preview["status"] == "previewed"
+    with pytest.raises(ValueError, match="side-effect confirmation"):
+        await service.approve_action(
+            store,
+            action_id="action-1",
+            snapshot_hash=preview["snapshot_hash"],
+            patch_hash=preview["patch_hash"],
+            capability_snapshot_hash="capability-hash-v1",
+            generation_mode="manual",
+        )
+
+    approved = await service.approve_action(
+        store,
+        action_id="action-1",
+        snapshot_hash=preview["snapshot_hash"],
+        patch_hash=preview["patch_hash"],
+        capability_snapshot_hash="capability-hash-v1",
+        generation_mode="manual",
+        side_effect_confirmations={"requires_variant_confirmation": True},
+    )
+
+    assert approved["status"] == "approved"
+    assert approved["side_effect_confirmations"] == {
+        "requires_variant_confirmation": True
+    }
+
+
+@pytest.mark.asyncio
+async def test_adapter_identity_is_bound_to_capability_and_approval() -> None:
+    item = action()
+    item["legacy_capability_compatibility"] = False
+    item["adapter_identity"] = {
+        "adapter_id": "oemapps_on_page",
+        "adapter_version": "1",
+        "connector_type": "oemapps",
+        "read": True,
+        "write": True,
+        "readback": True,
+    }
+    item["capability_snapshot"] = {
+        "capability_snapshot_hash": "capability-hash-v1",
+        "supported_actions": {"product_seo": "approval_required"},
+        "supported_fields": {"product_seo": ["meta_title"]},
+        "connectors": {
+            "products": {
+                "status": "available",
+                "write": True,
+                "checked_at": datetime.now(UTC).isoformat(),
+            }
+        },
+        "configuration_issues": [],
+        "side_effects": {},
+        "action_adapters": {"product_seo": item["adapter_identity"]},
+    }
+    store, adapter = MemoryStore(item), Adapter()
+    preview = await service.preview_action(
+        store,
+        action_id="action-1",
+        patch={"meta_title": "After"},
+        adapter=adapter,
+        capability_snapshot_hash="capability-hash-v1",
+    )
+    await service.approve_action(
+        store,
+        action_id="action-1",
+        snapshot_hash=preview["snapshot_hash"],
+        patch_hash=preview["patch_hash"],
+        capability_snapshot_hash="capability-hash-v1",
+        generation_mode="manual",
+    )
+    store.action["adapter_identity"] = {
+        **store.action["adapter_identity"],
+        "adapter_version": "2",
+    }
+
+    result = await service.execute_action(
+        store,
+        action_id="action-1",
+        adapter=adapter,
+        capability_snapshot_hash="capability-hash-v1",
+    )
+
+    assert result["result"] == "blocked"
+    assert result["block_reason"] == "adapter_identity_changed"
+    assert adapter.writes == 0
+
+
+@pytest.mark.asyncio
+async def test_target_identity_change_invalidates_approval_before_write() -> None:
+    store, adapter = MemoryStore(action()), Adapter()
+    preview = await service.preview_action(
+        store,
+        action_id="action-1",
+        patch={"title": "After"},
+        adapter=adapter,
+    )
+    await service.approve_action(
+        store,
+        action_id="action-1",
+        snapshot_hash=preview["snapshot_hash"],
+        patch_hash=preview["patch_hash"],
+        generation_mode="manual",
+    )
+    store.action["target_asset_id"] = "99"
+
+    result = await service.execute_action(
+        store, action_id="action-1", adapter=adapter
+    )
+
+    assert result["result"] == "blocked"
+    assert result["block_reason"] == "target_identity_changed"
+    assert adapter.writes == 0
+
+
+@pytest.mark.asyncio
 async def test_missing_capability_snapshot_is_blocked_by_default() -> None:
     item = action()
     item.pop("legacy_capability_compatibility")
@@ -381,7 +615,9 @@ async def test_expired_execution_lease_recovery_classifies_remote_state_and_reje
     recovered = await service.recover_action(
         store, action_id="action-1", adapter=NotAppliedAdapter()
     )
-    assert recovered["status"] == "approved"
+    assert recovered["status"] == "planned"
+    assert recovered["approved_at"] is None
+    assert recovered["approved_patch_hash"] is None
     assert recovered["execution_token"] is None
     with pytest.raises(ValueError, match="stale execution token"):
         await service.complete_execution(
@@ -517,6 +753,18 @@ async def test_adapter_failure_becomes_auditable_unknown_remote_state() -> None:
     assert store.exceptions[0]["type"] == "connector_error"
     assert store.exceptions[0]["retryable"] is False
     assert store.exceptions[0]["remote_write_occurred"] is None
+    assert store.action["submitted_patch"] == {"title": "After"}
+    assert "secret-value" not in str(store.action["remote_response"])
+
+    class ReadOnlyRecovery(Adapter):
+        async def recover(self, _action):
+            return {"recovery_status": "confirmed_not_applied"}
+
+    recovered = await service.recover_action(
+        store, action_id="action-1", adapter=ReadOnlyRecovery()
+    )
+    assert recovered["recovery_status"] == "confirmed_not_applied"
+    assert recovered["status"] == "blocked"
 
 
 @pytest.mark.asyncio

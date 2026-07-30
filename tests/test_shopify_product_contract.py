@@ -5,6 +5,7 @@ import pytest
 
 from app.services.shopify_product_service import (
     ShopifyProductError,
+    _database_timestamp,
     _map_product,
     _iso_timestamp,
     _preview_token,
@@ -80,6 +81,13 @@ def test_shopify_timestamps_use_one_canonical_utc_representation() -> None:
     assert _iso_timestamp("2026-07-24T00:00:00.000Z") == expected
     assert _iso_timestamp("2026-07-24T08:00:00+08:00") == expected
     assert _iso_timestamp(datetime(2026, 7, 24, tzinfo=timezone.utc)) == expected
+
+
+def test_shopify_remote_timestamp_is_converted_for_asyncpg() -> None:
+    converted = _database_timestamp("2026-07-30T13:38:57Z")
+
+    assert isinstance(converted, datetime)
+    assert converted == datetime(2026, 7, 30, 13, 38, 57, tzinfo=timezone.utc)
 
 
 def test_shopify_product_migration_scopes_ids_and_audits_uncertain_writes() -> None:

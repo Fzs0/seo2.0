@@ -95,6 +95,11 @@ async def preview_collection_seo_update(
         "ok": True,
         "collection_id": str(collection["id"]),
         "title": collection.get("title"),
+        "current": {
+            "meta_title": collection.get("meta_title") or "",
+            "meta_description": collection.get("meta_descript") or "",
+            "meta_keywords": collection.get("meta_keywords") or [],
+        },
         "expected_snapshot_hash": prepared.snapshot_hash,
         "changes": prepared.changes,
         "change_count": len(prepared.changes),

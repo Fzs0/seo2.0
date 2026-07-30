@@ -64,6 +64,11 @@ async def preview_home_seo_update(
         "ok": True,
         "expected_snapshot_hash": prepared.snapshot_hash,
         "current": current,
+        "current_public": {
+            "meta_title": current.get("meta_title") or "",
+            "meta_description": current.get("meta_descript") or "",
+            "meta_keywords": current.get("meta_keywords") or [],
+        },
         "changes": prepared.changes,
         "change_count": len(prepared.changes),
     }

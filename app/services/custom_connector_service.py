@@ -462,6 +462,16 @@ async def preview_oemapps_seo_update(
         "ok": True,
         "product_id": str(product["id"]),
         "title": product.get("title"),
+        "current": {
+            "meta_title": product.get("meta_title") or "",
+            "meta_description": product.get("meta_descript") or "",
+            "meta_keywords": product.get("meta_keywords") or [],
+            "image_alts": {
+                str(image.get("image_id")): image.get("alt") or ""
+                for image in (product.get("images") or [])
+                if image.get("image_id") is not None
+            },
+        },
         "expected_snapshot_hash": prepared.snapshot_hash,
         "changes": prepared.changes,
         "change_count": len(prepared.changes),

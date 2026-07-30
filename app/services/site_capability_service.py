@@ -81,10 +81,20 @@ def build_site_capability(
 
     for connector in connectors:
         adapter = str(connector.get("adapter") or "").casefold()
-        declared = contract["connector_capabilities"] if adapter == "oemapps" else {}
+        declared = (
+            contract["connector_capabilities"]
+            if adapter in {"oemapps", "shopify"}
+            else {}
+        )
         for name, access in declared.items():
-            capability_health[name] = _connector_health(
-                connector, access=access, checked_at=generated_at
+            capability_health[name] = (
+                _shopify_connector_health(
+                    connector, access=access, checked_at=generated_at
+                )
+                if adapter == "shopify"
+                else _connector_health(
+                    connector, access=access, checked_at=generated_at
+                )
             )
 
     if contract["supported_fields"].get("articles"):
@@ -127,6 +137,12 @@ def build_site_capability(
             )
         )
 
+    action_adapters = _action_adapters(
+        safe_site,
+        connectors=connectors,
+        actions=actions,
+        connector_health=capability_health,
+    )
     result = {
         "site_id": str(safe_site["id"]),
         "site_name": safe_site.get("name"),
@@ -141,7 +157,9 @@ def build_site_capability(
         "connectors": capability_health,
         "supported_actions": actions,
         "supported_fields": contract["supported_fields"],
+        "protected_fields": contract["protected_fields"],
         "side_effects": contract["side_effects"],
+        "action_adapters": action_adapters,
         "approval_policy": actions,
         "publishing": {
             "public_url_scheme": "https",
@@ -203,6 +221,7 @@ async def _load_connectors(
             SELECT c.id::text, c.site_id::text, c.status,
                    v.config->>'adapter' AS adapter,
                    COALESCE(sec.secret_names, ARRAY[]::text[]) AS secret_names,
+                   ARRAY[]::text[] AS scopes,
                    v.verified_at,
                    latest.finished_at AS last_success_at,
                    latest.error_summary AS last_error
@@ -216,6 +235,16 @@ async def _load_connectors(
                      WHERE r.connector_id = c.id AND r.status = 'succeeded'
                      ORDER BY r.started_at DESC LIMIT 1
                    ) latest ON TRUE
+             WHERE c.site_id = ANY(CAST(:site_ids AS uuid[]))
+            UNION ALL
+            SELECT c.site_id::text AS id, c.site_id::text, c.status,
+                   'shopify'::text AS adapter,
+                   ARRAY[]::text[] AS secret_names,
+                   c.scopes,
+                   c.last_tested_at AS verified_at,
+                   c.last_tested_at AS last_success_at,
+                   c.last_error
+              FROM seo_agent.shopify_connections c
              WHERE c.site_id = ANY(CAST(:site_ids AS uuid[]))
             """
         ),
@@ -262,6 +291,117 @@ def _connector_health(
         "error_summary": summary,
         "unlock_condition": unlock,
     }
+
+
+def _shopify_connector_health(
+    connector: dict[str, Any],
+    *,
+    access: dict[str, bool],
+    checked_at: datetime,
+) -> dict[str, Any]:
+    status = str(connector.get("status") or "").casefold()
+    granted_scopes = {
+        str(value).casefold() for value in (connector.get("scopes") or [])
+    }
+    effective_scopes = set(granted_scopes)
+    if "write_products" in granted_scopes:
+        effective_scopes.add("read_products")
+    missing = {
+        scope
+        for scope, required in (
+            ("read_products", bool(access.get("read"))),
+            ("write_products", bool(access.get("write"))),
+        )
+        if required and scope not in effective_scopes
+    }
+    available = status == "active" and not missing
+    return {
+        "status": "available" if available else "misconfigured",
+        "read": available and bool(access.get("read")),
+        "write": available and bool(access.get("write")),
+        "checked_at": checked_at.isoformat(),
+        "last_success_at": _iso(connector.get("last_success_at")),
+        "error_code": (
+            None
+            if available
+            else "SHOPIFY_PRODUCT_SCOPE_MISSING"
+            if missing
+            else "SHOPIFY_CONNECTION_NOT_ACTIVE"
+        ),
+        "error_summary": (
+            None
+            if available
+            else "Required Shopify product permissions are unavailable."
+        ),
+        "unlock_condition": (
+            None
+            if available
+            else "Activate Shopify with read_products and write_products scopes."
+        ),
+        "connector_id": str(connector.get("id") or ""),
+        "granted_scopes": sorted(granted_scopes),
+        "effective_scopes": sorted(effective_scopes),
+    }
+
+
+def _action_adapters(
+    site: dict[str, Any],
+    *,
+    connectors: list[dict[str, Any]],
+    actions: dict[str, str],
+    connector_health: dict[str, dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    adapters = {
+        str(item.get("adapter") or "").casefold() for item in connectors
+    }
+    result: dict[str, dict[str, Any]] = {}
+    if "oemapps" in adapters:
+        for action in (
+            "homepage_seo",
+            "product_seo",
+            "category_seo",
+            "product_image_alt",
+        ):
+            if actions.get(action) != "forbidden":
+                connector_name = {
+                    "homepage_seo": "homepage",
+                    "category_seo": "collections",
+                }.get(action, "products")
+                health = connector_health[connector_name]
+                result[action] = {
+                    "adapter_id": "oemapps_on_page",
+                    "adapter_version": "1",
+                    "connector_type": "oemapps",
+                    "read": health.get("read") is True,
+                    "write": health.get("write") is True,
+                    "readback": health.get("read") is True,
+                }
+    if "shopify" in adapters and actions.get("product_seo") != "forbidden":
+        health = connector_health["products"]
+        result["product_seo"] = {
+            "adapter_id": "shopify_product_seo",
+            "adapter_version": "1",
+            "connector_type": "shopify",
+            "read": health.get("read") is True,
+            "write": health.get("write") is True,
+            "readback": health.get("read") is True,
+        }
+    if actions.get("new_article") != "forbidden":
+        connector_type = str(
+            (_mapping(site.get("api_config")).get("connector_type"))
+            or site.get("site_type")
+            or "custom_openapi"
+        ).casefold()
+        for action in ("new_article", "update_article"):
+            result[action] = {
+                "adapter_id": "strategy_article_action",
+                "adapter_version": "1",
+                "connector_type": connector_type,
+                "read": True,
+                "write": True,
+                "readback": True,
+            }
+    return result
 
 
 def _default_health(name: str, checked_at: datetime) -> dict[str, Any]:
@@ -435,7 +575,9 @@ def _capability_snapshot_hash(capability: dict[str, Any]) -> str:
             "language_code",
             "supported_actions",
             "supported_fields",
+            "protected_fields",
             "side_effects",
+            "action_adapters",
             "configuration_issues",
         )
     }

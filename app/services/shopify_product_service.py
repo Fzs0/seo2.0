@@ -361,10 +361,11 @@ async def update_shopify_product_seo(
             "Shopify write result is unknown; sync the product before retrying"
         ) from error
     assert remote is not None
+    remote_updated_at = _database_timestamp(remote.get("updatedAt"))
     after = {
         "meta_title": str((remote.get("seo") or {}).get("title") or ""),
         "meta_description": str((remote.get("seo") or {}).get("description") or ""),
-        "source_updated_at": _iso_timestamp(remote.get("updatedAt")),
+        "source_updated_at": _iso_timestamp(remote_updated_at),
     }
     await session.execute(
         text(
@@ -382,7 +383,7 @@ async def update_shopify_product_seo(
             "site_id": site_id,
             "meta_title": after["meta_title"],
             "meta_description": after["meta_description"],
-            "source_updated_at": after["source_updated_at"],
+            "source_updated_at": remote_updated_at,
             "seo_audit": json.dumps(_seo_audit(after["meta_title"], after["meta_description"])),
             "raw_patch": json.dumps({"seo": remote.get("seo") or {}, "updatedAt": remote.get("updatedAt")}),
         },
@@ -390,6 +391,137 @@ async def update_shopify_product_seo(
     await _finish_audit(session, run_id, status="succeeded", after=after)
     await session.commit()
     return {"ok": True, "dry_run": False, "product_id": product_id, "before": before, "after": after}
+
+
+async def read_shopify_product_seo_remote(
+    session: AsyncSession,
+    *,
+    site_id: str,
+    product_id: int,
+    expected_remote_object_id: str,
+) -> dict[str, Any]:
+    """Read the exact remote Shopify product without mutating local or remote state."""
+    product = (
+        await session.execute(
+            text(
+                """
+                SELECT id, external_id, source
+                  FROM seo_agent.products
+                 WHERE id=:product_id AND site_id=CAST(:site_id AS uuid)
+                """
+            ),
+            {"product_id": product_id, "site_id": site_id},
+        )
+    ).mappings().first()
+    if (
+        not product
+        or product["source"] != "shopify_admin_graphql"
+        or str(product["external_id"]) != str(expected_remote_object_id)
+    ):
+        raise ShopifyProductError("Shopify product identity changed before readback")
+    site = await _shopify_site(session, site_id)
+    connector = await publisher_for_site_runtime(
+        session, site, dry_run=True, require_active=True
+    )
+    if not isinstance(connector, ShopifyPublisher):
+        raise ShopifyProductError("site does not use the Shopify connector")
+    remote = await connector.get_product_for_seo(str(product["external_id"]))
+    if str(remote.get("id") or "") != str(expected_remote_object_id):
+        raise ShopifyProductError("Shopify readback returned a different product")
+    return {
+        "meta_title": str((remote.get("seo") or {}).get("title") or ""),
+        "meta_description": str(
+            (remote.get("seo") or {}).get("description") or ""
+        ),
+        "source_updated_at": _iso_timestamp(remote.get("updatedAt")),
+    }
+
+
+async def reconcile_shopify_product_seo_recovery(
+    session: AsyncSession,
+    *,
+    site_id: str,
+    product_id: int,
+    expected_remote_object_id: str,
+    request_id: str,
+    readback: dict[str, Any],
+) -> dict[str, Any]:
+    """Persist an exact remote recovery without issuing another Shopify write."""
+    audit = (
+        await session.execute(
+            text(
+                """
+                SELECT id::text AS id, site_id::text AS site_id, product_id,
+                       external_id, requested_patch, status
+                  FROM seo_agent.shopify_product_seo_runs
+                 WHERE request_id=CAST(:request_id AS uuid)
+                 FOR UPDATE
+                """
+            ),
+            {"request_id": request_id},
+        )
+    ).mappings().first()
+    if (
+        not audit
+        or str(audit["site_id"]) != site_id
+        or int(audit["product_id"] or 0) != product_id
+        or str(audit["external_id"]) != expected_remote_object_id
+    ):
+        raise ShopifyProductError("Shopify recovery audit identity does not match")
+    requested = dict(audit["requested_patch"] or {})
+    after = {
+        "meta_title": str(readback.get("meta_title") or ""),
+        "meta_description": str(readback.get("meta_description") or ""),
+        "source_updated_at": _iso_timestamp(readback.get("source_updated_at")),
+    }
+    if any(
+        str(requested.get(field) or "") != after[field]
+        for field in ("meta_title", "meta_description")
+    ):
+        raise ShopifyProductError("Shopify recovery readback does not match requested patch")
+    remote_updated_at = _database_timestamp(after["source_updated_at"])
+    await session.execute(
+        text(
+            """
+            UPDATE seo_agent.products SET
+              meta_title=:meta_title, meta_description=:meta_description,
+              source_updated_at=:source_updated_at,
+              seo_audit=CAST(:seo_audit AS jsonb),
+              raw=raw || CAST(:raw_patch AS jsonb),
+              extracted_at=now()
+             WHERE id=:product_id AND site_id=CAST(:site_id AS uuid)
+               AND external_id=:external_id
+            """
+        ),
+        {
+            "product_id": product_id,
+            "site_id": site_id,
+            "external_id": expected_remote_object_id,
+            "meta_title": after["meta_title"],
+            "meta_description": after["meta_description"],
+            "source_updated_at": remote_updated_at,
+            "seo_audit": json.dumps(
+                _seo_audit(after["meta_title"], after["meta_description"])
+            ),
+            "raw_patch": json.dumps(
+                {
+                    "seo": {
+                        "title": after["meta_title"],
+                        "description": after["meta_description"],
+                    },
+                    "updatedAt": after["source_updated_at"],
+                }
+            ),
+        },
+    )
+    await _finish_audit(
+        session,
+        str(audit["id"]),
+        status="succeeded",
+        after=after,
+    )
+    await session.commit()
+    return after
 
 
 async def _shopify_site(
@@ -508,6 +640,13 @@ def _parse_timestamp(value: Any) -> datetime | None:
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
+def _database_timestamp(value: Any) -> datetime:
+    parsed = _parse_timestamp(value)
+    if parsed is None:
+        raise ShopifyProductError("Shopify returned an empty updatedAt timestamp")
+    return parsed.astimezone(timezone.utc)
+
+
 def _iso_timestamp(value: Any) -> str:
     parsed = _parse_timestamp(value)
     if not parsed:
@@ -586,6 +725,8 @@ async def _finish_audit(
 __all__ = [
     "ShopifyProductError",
     "list_shopify_product_seo",
+    "read_shopify_product_seo_remote",
+    "reconcile_shopify_product_seo_recovery",
     "sync_shopify_products",
     "update_shopify_product_seo",
 ]

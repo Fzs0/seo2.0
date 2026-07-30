@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 from typing import Any
 from datetime import date
 
@@ -9,7 +8,7 @@ import pytest
 from app.clients import ai_provider
 from app.clients.http_client import ExternalCallError
 from app.api.v1 import endpoints
-from app.services import article_generation_service, automation_service, keyword_ai_service, publish_service, strategy_execution, strategy_service
+from app.services import article_generation_service, keyword_ai_service, publish_service, strategy_service
 
 
 @pytest.mark.asyncio
@@ -106,35 +105,6 @@ async def test_task_stage_is_persisted() -> None:
 
     assert session.params == {"id": "task-id", "stage": "outline"}
     assert session.committed
-
-
-@pytest.mark.asyncio
-async def test_heartbeat_failure_cancels_owner(monkeypatch: pytest.MonkeyPatch) -> None:
-    class Session:
-        async def __aenter__(self) -> "Session":
-            return self
-
-        async def __aexit__(self, *args: Any) -> None:
-            return None
-
-        async def execute(self, *args: Any, **kwargs: Any) -> None:
-            raise RuntimeError("database unavailable")
-
-    class Owner:
-        message = ""
-
-        def cancel(self, message: str) -> None:
-            self.message = message
-
-    owner = Owner()
-    await strategy_execution._execution_heartbeat(
-        "task-id",
-        owner,  # type: ignore[arg-type]
-        interval_seconds=0,
-        session_factory=Session,
-    )
-
-    assert owner.message == "心跳异常：database unavailable"
 
 
 def test_strategy_without_gsc_reuses_keyword_priority() -> None:
@@ -312,12 +282,6 @@ async def test_publish_rejects_failed_qa() -> None:
         await publish_service.publish_article(Session(), article_id="article-id", site_id=None)  # type: ignore[arg-type]
 
 
-def test_execution_queue_has_three_global_slots() -> None:
-    assert automation_service._execution_slots(0) == 3
-    assert automation_service._execution_slots(1) == 2
-    assert automation_service._execution_slots(3) == 0
-
-
 @pytest.mark.asyncio
 async def test_keyword_analysis_noop_does_not_create_empty_task(monkeypatch: pytest.MonkeyPatch) -> None:
     class Result:
@@ -354,143 +318,22 @@ def test_failed_article_qa_does_not_mark_keyword_written() -> None:
     assert "if keyword_id and not failed_qa:" in source
 
 
-@pytest.mark.asyncio
-async def test_specific_execution_keeps_running_after_request_returns(monkeypatch: pytest.MonkeyPatch) -> None:
-    class Result:
-        def __init__(self, value: object) -> None:
-            self.value = value
-
-        def mappings(self) -> "Result":
-            return self
-
-        def first(self) -> object:
-            return self.value
-
-        def scalar_one(self) -> object:
-            return self.value
-
-    class Session:
-        calls = 0
-
-        async def execute(self, statement: Any, params: dict[str, Any] | None = None) -> Result:
-            self.calls += 1
-            if self.calls == 1:
-                assert params == {"id": "strategy-id"}
-                return Result({"execution_id": "execution-id", "status": "queued"})
-            if self.calls == 2:
-                return Result(0)
-            assert params == {"id": "execution-id"}
-            return Result(object())
-
-        async def commit(self) -> None:
-            return None
-
-    keep_running = asyncio.Event()
-
-    async def run(*args: Any) -> None:
-        await keep_running.wait()
-
-    monkeypatch.setattr(automation_service, "_run_claimed_execution", run)
-    result = await automation_service.start_execution(Session(), "strategy-id")  # type: ignore[arg-type]
-    task = automation_service._AUTOMATION_RUNS["execution-id"]
-    try:
-        assert result == {"ok": True, "status": "running", "execution_task_id": "execution-id"}
-        await asyncio.sleep(0)
-        assert not task.done()
-    finally:
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
-        automation_service._AUTOMATION_RUNS.pop("execution-id", None)
-
-
-@pytest.mark.asyncio
-async def test_user_stop_cancels_running_execution() -> None:
-    class Result:
-        def __init__(self, value: object) -> None:
-            self.value = value
-
-        def scalar_one_or_none(self) -> object:
-            return self.value
-
-        def mappings(self) -> "Result":
-            return self
-
-        def first(self) -> object:
-            return self.value
-
-    class Session:
-        statement = ""
-        params: dict[str, Any] | None = None
-        committed = False
-        calls = 0
-
-        async def execute(self, statement: Any, params: dict[str, Any]) -> Result:
-            self.calls += 1
-            if self.calls == 1:
-                assert "current_stage" in str(statement)
-                assert params == {"id": "strategy-id"}
-                return Result({"execution_id": "execution-id", "status": "running", "current_stage": "article"})
-            self.statement = str(statement)
-            self.params = params
-            return Result(object())
-
-        async def commit(self) -> None:
-            self.committed = True
-
-    async def running() -> None:
-        await asyncio.Event().wait()
-
-    execution_id = "execution-id"
-    task = asyncio.create_task(running())
-    automation_service._AUTOMATION_RUNS[execution_id] = task
-    session = Session()
-
-    result = await automation_service.stop_execution(session, "strategy-id")  # type: ignore[arg-type]
-
-    assert task.cancelled()
-    assert execution_id not in automation_service._AUTOMATION_RUNS
-    assert "status = 'canceled'" in session.statement
-    assert "status IN ('running', 'failed')" in session.statement
-    assert session.params == {"id": execution_id}
-    assert session.committed
-    assert result == {"ok": True, "status": "canceled", "execution_task_id": execution_id}
-
-
-def test_stop_execution_api_uses_strategy_task_id() -> None:
-    route = next(route for route in endpoints.router.routes if route.path == "/workflow/strategies/{strategy_task_id}/stop")
-
-    assert route.methods == {"POST"}
-
-
-def test_review_api_can_start_only_the_reviewed_strategy() -> None:
-    import inspect
-
-    source = inspect.getsource(endpoints.review_strategy_task)
-    assert "body.executeNow" in source
-    assert "start_execution(session, task_id)" in source
-    start_source = inspect.getsource(automation_service.start_execution)
-    assert "WHERE r.id = CAST(:id AS uuid)" in start_source
-    assert "_claim_execution(session, row[\"execution_id\"])" in start_source
-
-
-def test_strategy_candidate_and_plan_routes_are_registered() -> None:
+def test_legacy_strategy_write_routes_are_retired() -> None:
     routes = {(route.path, tuple(sorted(route.methods or []))) for route in endpoints.router.routes}
 
     assert ("/workflow/strategies/candidates", ("GET",)) in routes
-    assert ("/workflow/strategies/plan", ("GET",)) in routes
-    assert ("/workflow/strategies/plan", ("PUT",)) in routes
-    legacy = endpoints.StrategyGenerateBody(businessId="business-a")
-    assert legacy.limit == 4
-    assert legacy.actionBudget is None
-    assert endpoints.StrategyGenerateBody(businessId="business-a", actionBudget=0).actionBudget == 0
-
-
-def test_clear_queue_api_requires_business_scope() -> None:
-    import inspect
-
-    signature = inspect.signature(endpoints.clear_automation_queue)
-    assert signature.parameters["business_id"].default is inspect.Parameter.empty
+    retired = {
+        "/workflow/strategies/generate",
+        "/workflow/strategies/plan",
+        "/workflow/strategies/{task_id}/review",
+        "/workflow/strategies/{task_id}/execute",
+        "/workflow/strategies/{task_id}/cancel",
+        "/workflow/strategies/{strategy_task_id}/stop",
+        "/workflow/automation/run-once",
+        "/workflow/automation/clear-queue",
+        "/workflow/automation/settings",
+    }
+    assert not retired.intersection(path for path, _methods in routes)
 
 
 def test_keyword_ai_only_loads_enabled_sites_for_the_requested_businesses():

@@ -35,12 +35,17 @@ export async function getJson<T>(path: string, signal: AbortSignal): Promise<T> 
   return readJsonResponse<T>(response, path)
 }
 
-export async function postJson<T>(path: string, body: unknown, method: 'POST' | 'PUT' = 'POST'): Promise<T> {
+export async function postJson<T>(
+  path: string,
+  body: unknown,
+  method: 'POST' | 'PUT' = 'POST',
+  headers: Record<string, string> = {},
+): Promise<T> {
   for (let attempt = 0; attempt < 2; attempt += 1) {
     try {
       const response = await fetch(`${API_BASE}${path}`, {
         method,
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...headers },
         body: JSON.stringify(body),
       })
       if (!response.ok) {

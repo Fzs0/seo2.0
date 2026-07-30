@@ -27,7 +27,6 @@ if (-not (Test-Path $python)) {
     tests/test_pg17_release_gate.py `
     tests/test_strategy_effect_migrations_postgres.py `
     tests/test_strategy_hold_concurrency_postgres.py `
-    tests/test_strategy_audit_batch_gate_postgres.py `
     -q
 
 if ($LASTEXITCODE -ne 0) {

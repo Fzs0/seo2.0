@@ -1,10 +1,10 @@
 import { useEffect, useState } from 'react'
 import type { AsyncState } from '@/data/internal/asyncState'
-import { getJson, postJson } from '@/data/internal/http'
+import { getJson } from '@/data/internal/http'
 
 export interface AutomationStatus {
   business_id?: string
-  parallel_limit: number
+  executor?: string
   queued: number
   running: number
   done: number
@@ -28,8 +28,4 @@ export function useAutomationStatus(refreshKey = 0, businessId?: string): AsyncS
     return () => controller.abort()
   }, [refreshKey, businessId])
   return state
-}
-
-export function clearStrategyQueue(businessId: string) {
-  return postJson<{ executions_canceled: number; strategies_canceled: number; plans_cleared: number; candidates_cleared: number; analysis_batches_cleared: number }>(`/api/v1/workflow/automation/clear-queue?business_id=${encodeURIComponent(businessId)}`, {})
 }
