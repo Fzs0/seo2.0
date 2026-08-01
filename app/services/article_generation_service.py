@@ -767,7 +767,9 @@ def _contains_keyword(text: str, keyword: str) -> bool:
     tokens = re.findall(r"\w+", keyword.casefold(), re.UNICODE)
     if not tokens:
         return False
-    pattern = r"(?<!\w)" + r"[\W_]+".join(re.escape(token) for token in tokens) + r"(?!\w)"
+    # Keep token order exact while allowing languages such as German to join
+    # adjacent search terms into a grammatically correct compound word.
+    pattern = r"(?<!\w)" + r"[\W_]*".join(re.escape(token) for token in tokens) + r"(?!\w)"
     return bool(re.search(pattern, text.casefold(), re.UNICODE))
 
 

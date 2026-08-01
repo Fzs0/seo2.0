@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from app.services import strategy_article_action_adapter as service
@@ -67,6 +69,362 @@ def test_article_patch_keeps_uploaded_cover_media_identity() -> None:
         "src": cover_url,
         "alt": "Replacement pod beside its charging dock",
     }
+
+
+@pytest.mark.asyncio
+async def test_content_openapi_preview_blocks_mixed_markdown_and_html(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The self-hosted renderer must never receive a mixed-format article."""
+
+    async def load_context(*_args, **_kwargs):
+        return {
+            "strategy_decision": {"query": "titanium cutting board"},
+            "post_id": "post-1",
+            "post_title": "Old title",
+            "post_content_md": "# Old title\n\nOld body",
+            "post_meta_title": "Old title",
+            "post_meta_description": "Old description",
+            "site": {
+                "id": "site-1",
+                "business_id": "exdivo",
+                "site_type": "blog",
+                "base_url": "https://vapestest.de",
+                "api_base_url": "https://vapestest.de/api/open/v1",
+                "api_config": {"connector_type": "custom_openapi"},
+            },
+        }
+
+    monkeypatch.setattr(service, "_load_action_context", load_context)
+    mixed = _body().replace(
+        "Titanium cutting board material, care, and buying guidance for home cooks. "
+        * 24,
+        "<p>"
+        + (
+            "Titanium cutting board material, care, and buying guidance for home cooks. "
+            * 24
+        )
+        + "</p>",
+    )
+    adapter = service.StrategyArticleActionAdapter(object())  # type: ignore[arg-type]
+    result = await adapter.preview(
+        {
+            "action_type": "update_article",
+            "site_id": "site-1",
+            "business_id": "exdivo",
+            "source_strategy_task_id": "strategy-1",
+        },
+        {**_patch(), "body": mixed},
+    )
+
+    assert result == {
+        "result": "blocked",
+        "block_reason": "content_openapi article body must be pure Markdown; HTML tags are not allowed",
+    }
+
+
+@pytest.mark.asyncio
+async def test_content_openapi_preview_accepts_pure_markdown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def load_context(*_args, **_kwargs):
+        return {
+            "strategy_decision": {"query": "titanium cutting board"},
+            "post_id": "post-1",
+            "post_title": "Old title",
+            "post_content_md": "# Old title\n\nOld body",
+            "post_meta_title": "Old title",
+            "post_meta_description": "Old description",
+            "site": {
+                "id": "site-1",
+                "business_id": "exdivo",
+                "site_type": "blog",
+                "base_url": "https://vapestest.de",
+                "api_base_url": "https://vapestest.de/api/open/v1",
+                "api_config": {"connector_type": "custom_openapi"},
+            },
+        }
+
+    monkeypatch.setattr(service, "_load_action_context", load_context)
+    adapter = service.StrategyArticleActionAdapter(object())  # type: ignore[arg-type]
+    result = await adapter.preview(
+        {
+            "action_type": "update_article",
+            "site_id": "site-1",
+            "business_id": "exdivo",
+            "source_strategy_task_id": "strategy-1",
+        },
+        _patch(),
+    )
+
+    assert result["result"] == "updated"
+
+
+def test_custom_blog_article_ingest_accepts_cover_without_fabricated_media_id() -> None:
+    cover_url = "https://media-source.example.com/generated-cover.png"
+    action = {
+        "capability_snapshot": {
+            "supported_fields": {
+                "articles": [
+                    "title",
+                    "body",
+                    "meta_title",
+                    "meta_description",
+                    "images",
+                    "image_alts",
+                    "cover_image",
+                ]
+            },
+            "connectors": {
+                "images": {
+                    "status": "available",
+                    "write": True,
+                    "upload": True,
+                    "ingest": True,
+                    "transport": (
+                        "business_oemapps_upload_then_article_publish"
+                    ),
+                }
+            },
+        }
+    }
+
+    assert service._image_patch_supported(action) is True
+    assert service._cover_patch_supported(action) is True
+    assert service._cover_image_id_required(action) is False
+
+    patch = service.canonical_article_patch(
+        {
+            **_patch(),
+            "cover_image": {
+                "src": cover_url,
+                "alt": "Generated editorial comparison cover",
+            },
+        },
+        cover_image_id_required=False,
+    )
+
+    assert patch["cover_image"] == {
+        "src": cover_url,
+        "alt": "Generated editorial comparison cover",
+    }
+
+
+def test_article_ingest_readback_accepts_same_site_localized_media_urls() -> None:
+    source = "https://media-source.example.com/generated-inline.png"
+    approved = {
+        "images": [source],
+        "image_alts": {source: "Generated inline comparison"},
+        "cover_image": {
+            "src": source,
+            "alt": "Generated comparison cover",
+        },
+    }
+    readback = {
+        "images": ["/assets/media/images/2026/07/generated-inline.webp"],
+        "image_alts": {
+            "/assets/media/images/2026/07/generated-inline.webp": (
+                "Generated inline comparison"
+            )
+        },
+        "cover_image": {
+            "src": "/assets/media/images/2026/07/generated-cover.webp",
+            "image_id": "",
+            "alt": "",
+        },
+    }
+
+    differences = compare_readback_fields(
+        approved,
+        approved,
+        readback,
+        media_transport="business_oemapps_upload_then_article_publish",
+        canonical_hosts={"topvapes.de"},
+    )
+
+    assert all(item["match"] for item in differences)
+
+
+def test_article_ingest_readback_accepts_unchanged_source_media_urls() -> None:
+    source = "https://cdn.example.com/generated-inline.png"
+    approved = {
+        "images": [source],
+        "image_alts": {source: "Generated inline comparison"},
+        "cover_image": {
+            "src": source,
+            "alt": "Generated comparison cover",
+        },
+    }
+    readback = {
+        "images": [source],
+        "image_alts": {source: "Generated inline comparison"},
+        "cover_image": {"src": source, "alt": ""},
+    }
+
+    differences = compare_readback_fields(
+        approved,
+        approved,
+        readback,
+        media_transport="business_oemapps_upload_then_article_publish",
+        canonical_hosts={"topvapes.de"},
+    )
+
+    assert all(item["match"] for item in differences)
+
+
+def test_content_openapi_readback_uses_article_title_as_meta_title() -> None:
+    readback = service.normalize_article_readback(
+        {
+            "title": "Welches Liquid schmeckt am besten?",
+            "content": "<p>Body</p>",
+            "excerpt": "Description",
+        },
+        site={
+            "site_type": "blog",
+            "api_base_url": "https://vape2026.de/api/open/v1",
+            "api_config": {"connector_type": "custom_openapi"},
+        },
+    )
+
+    assert readback["meta_title"] == "Welches Liquid schmeckt am besten?"
+    assert service._article_read_only_fields(
+        {
+            "site_type": "blog",
+            "api_base_url": "https://vape2026.de/api/open/v1",
+            "api_config": {"connector_type": "custom_openapi"},
+        }
+    ) == ["meta_title"]
+
+
+@pytest.mark.asyncio
+async def test_custom_blog_media_endpoint_uploads_to_same_business_oemapps_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    action = {
+        "action_id": "action-1",
+        "site_id": "site-1",
+        "run_mode": "approval_execution",
+        "plan_id": "plan-1",
+        "source_strategy_task_id": "strategy-1",
+        "preflight_token": "preflight-1",
+        "preflight_expires_at": "2099-01-01T00:00:00+00:00",
+        "preflight_plan_id": "plan-1",
+        "preflight_strategy_task_id": "strategy-1",
+        "preflight_capability_snapshot_hash": "snapshot-1",
+        "capability_snapshot": {
+            "supported_fields": {
+                "articles": [
+                    "title",
+                    "body",
+                    "meta_title",
+                    "meta_description",
+                    "images",
+                    "image_alts",
+                    "cover_image",
+                ]
+            },
+            "connectors": {
+                "images": {
+                    "status": "available",
+                    "write": True,
+                    "upload": True,
+                    "ingest": True,
+                    "transport": (
+                        "business_oemapps_upload_then_article_publish"
+                    ),
+                    "media_host_site_id": "exdivo-main",
+                    "media_host_business_id": "exdivo",
+                }
+            },
+        },
+    }
+
+    class Store:
+        async def get(self, _action_id, lock=False):
+            return action
+
+        async def validate_lineage(self, _action):
+            return None
+
+        async def save(self, _action):
+            return None
+
+    async def valid_capability(*_args, **_kwargs):
+        return None
+
+    class Rows:
+        def mappings(self):
+            return self
+
+        def first(self):
+            return {
+                "id": "site-1",
+                "business_id": "exdivo",
+                "site_key": "topvapes.de",
+                "name": "topvapes.de",
+                "site_type": "blog",
+                "domain": "topvapes.de",
+                "base_url": "https://topvapes.de",
+                "api_base_url": "https://topvapes.de/api/open/v1",
+                "status": "active",
+                "api_config": {"openApiKey": "configured"},
+            }
+
+    class Session:
+        async def execute(self, _statement, _params):
+            return Rows()
+
+    uploaded: dict = {}
+
+    class Publisher:
+        async def upload_image(self, request):
+            uploaded["request"] = request
+            return SimpleNamespace(
+                ok=True,
+                dry_run=False,
+                image_id="16756439",
+                src="https://imgcdn.example.com/generated.png",
+                raw={"code": 0},
+            )
+
+    async def media_uploader(*_args, **_kwargs):
+        return SimpleNamespace(
+            publisher=Publisher(),
+            media_host_site={"id": "exdivo-main", "site_key": "exdivo"},
+            transport="business_oemapps_upload_then_article_publish",
+        )
+
+    monkeypatch.setattr(service, "SQLActionStore", lambda _session: Store())
+    monkeypatch.setattr(
+        service,
+        "_validate_current_preflight_capability",
+        valid_capability,
+    )
+    monkeypatch.setattr(
+        service,
+        "resolve_site_media_uploader",
+        media_uploader,
+    )
+
+    response = await service.upload_strategy_article_image(
+        Session(),  # type: ignore[arg-type]
+        action_id="action-1",
+        preflight_token="preflight-1",
+        idempotency_key="media-1",
+        request=service.ImageUploadRequest(
+            type="base64",
+            base64="data:image/png;base64,AAAA",
+        ),
+        dry_run=False,
+    )
+
+    assert response["media_host_site_id"] == "exdivo-main"
+    assert response["media_host_site_key"] == "exdivo"
+    assert response["image_id"] == "16756439"
+    assert response["src"] == "https://imgcdn.example.com/generated.png"
+    assert response["raw"] == {"code": 0}
+    assert uploaded["request"].type == "base64"
+    assert action["media_upload_receipts"]["media-1"]["status"] == "completed"
 
 
 def test_article_readback_compares_markdown_with_remote_html_semantically() -> None:
@@ -147,6 +505,31 @@ def test_article_readback_accepts_wordpress_body_without_title_h1_and_with_table
     assert service._semantic_value("body", markdown) == service._semantic_value(
         "body", wordpress
     )
+
+
+def test_article_readback_ignores_markdown_table_alignment_markers() -> None:
+    markdown = (
+        "# Mixing Guide\n\n"
+        "## Example\n\n"
+        "| Goal | Shot | Aroma | Base |\n"
+        "|---|---:|---:|---:|\n"
+        "| 3 mg/ml | 15 ml | 8 ml | 77 ml |"
+    )
+    html = (
+        "<h2>Example</h2><table><thead><tr>"
+        "<th>Goal</th><th>Shot</th><th>Aroma</th><th>Base</th>"
+        "</tr></thead><tbody><tr>"
+        "<td>3 mg/ml</td><td>15 ml</td><td>8 ml</td><td>77 ml</td>"
+        "</tr></tbody></table>"
+    )
+
+    differences = compare_readback_fields(
+        {"body": markdown},
+        {"body": markdown},
+        {"body": html},
+    )
+
+    assert differences[0]["match"] is True
 
 
 def test_oemapps_meta_description_alias_is_normalized() -> None:
@@ -258,6 +641,76 @@ async def test_article_adapter_preview_reads_the_bound_update_target() -> None:
     assert result["result"] == "updated"
     assert result["before_snapshot"]["title"] == "Old title"
     assert result["proposed_patch"]["title"] == "Titanium Cutting Board Buying Guide"
+
+
+@pytest.mark.asyncio
+async def test_article_context_uses_action_target_asset_when_strategy_post_id_is_empty() -> None:
+    """Formal AI plans keep the local post identity on the Action itself."""
+
+    target_post_id = "2280f3f6-a31c-486e-bb57-fbe235301f70"
+
+    class Rows:
+        def mappings(self):
+            return self
+
+        def first(self):
+            return {
+                "strategy_task_id": "11111111-1111-1111-1111-111111111111",
+                "strategy_status": "queued",
+                "strategy_decision": {"query": "bestes tabak aroma"},
+                "keyword_id": None,
+                "post_id": target_post_id,
+                "source_article_id": None,
+                "site_id": "560f0dd6-73e9-482a-85ba-ae926bbd4eeb",
+                "business_id": "exdivo",
+                "site_key": "topvapes.de",
+                "name": "topvapes.de",
+                "site_type": "blog",
+                "domain": "topvapes.de",
+                "base_url": "https://topvapes.de",
+                "api_base_url": "https://topvapes.de/api/open/v1",
+                "api_config": {},
+                "site_status": "active",
+                "strategy_enabled": True,
+                "market": "DE",
+                "language_code": "de",
+                "content_role": "brand_blog",
+                "post_external_id": "9",
+                "post_title": "Bestes Tabak Aroma",
+                "post_slug": "bestes-tabak-aroma",
+                "post_url": "https://topvapes.de/blog/bestes-tabak-aroma",
+                "post_content_md": "## Auswahl\n\nBestehender Inhalt.",
+                "post_content_html": None,
+                "post_meta_title": "Bestes Tabak Aroma",
+                "post_meta_description": "Bestehende Beschreibung.",
+                "post_cover_url": None,
+                "post_raw": {},
+            }
+
+    class Session:
+        async def execute(self, statement, params):
+            assert "post.id::text AS post_id" in str(statement)
+            assert params["strategy_task_id"] == (
+                "11111111-1111-1111-1111-111111111111"
+            )
+            assert params["target_post_id"] == target_post_id
+            return Rows()
+
+    context = await service._load_action_context(
+        Session(),  # type: ignore[arg-type]
+        {
+            "source_strategy_task_id": (
+                "11111111-1111-1111-1111-111111111111"
+            ),
+            "target_asset_id": target_post_id,
+            "site_id": "560f0dd6-73e9-482a-85ba-ae926bbd4eeb",
+            "business_id": "exdivo",
+        },
+    )
+
+    assert context["post_id"] == target_post_id
+    assert context["post_external_id"] == "9"
+    assert context["post_slug"] == "bestes-tabak-aroma"
 
 
 @pytest.mark.asyncio
@@ -528,3 +981,174 @@ async def test_article_adapter_recovery_reconciles_local_lineage_after_exact_rea
     assert reconciled["remote_id"] == "2588676"
     assert reconciled["readback"] == patch
     assert calls == ["load", "readback", "reconcile"]
+
+
+@pytest.mark.asyncio
+async def test_article_adapter_recovery_classifies_exact_old_snapshot_as_not_applied(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    old_patch = service.canonical_article_patch(_patch())
+    new_patch = service.canonical_article_patch(
+        {
+            **_patch(),
+            "title": "Updated Titanium Cutting Board Buying Guide",
+            "meta_title": "Updated Titanium Cutting Board Buying Guide",
+        }
+    )
+    context = {
+        "post_external_id": "2588676",
+        "site": {"id": "site-1", "business_id": "avinoti"},
+    }
+
+    async def load(*_args, **_kwargs):
+        return context
+
+    async def read(*_args, **_kwargs):
+        return {
+            "id": "2588676",
+            "title": old_patch["title"],
+            "content": old_patch["body"],
+            "meta_title": old_patch["meta_title"],
+            "meta_description": old_patch["meta_description"],
+        }
+
+    monkeypatch.setattr(service, "_load_action_context", load)
+    monkeypatch.setattr(service, "_read_remote_article", read)
+
+    adapter = service.StrategyArticleActionAdapter(object())  # type: ignore[arg-type]
+    result = await adapter.recover(
+        {
+            "action_id": "action-1",
+            "run_id": "run-1",
+            "business_id": "avinoti",
+            "site_id": "site-1",
+            "source_strategy_task_id": "strategy-1",
+            "action_type": "update_article",
+            "before_snapshot": old_patch,
+            "approved_patch": new_patch,
+        }
+    )
+
+    assert result["recovery_status"] == "confirmed_not_applied"
+    assert result["remote_response"]["remote_outcome"] == "confirmed_not_applied"
+
+
+@pytest.mark.asyncio
+async def test_approved_update_execution_persists_action_target_post_id() -> None:
+    captured: dict = {}
+
+    class Rows:
+        def __init__(self, rows):
+            self.rows = rows
+
+        def first(self):
+            return self.rows[0] if self.rows else None
+
+        def mappings(self):
+            return self
+
+    class Session:
+        async def execute(self, statement, params=None):
+            sql = str(statement)
+            if "pg_advisory_xact_lock" in sql:
+                return Rows([])
+            if "payload->>'strategy_action_id'=:action_id" in sql:
+                return Rows([])
+            if "payload->>'kind'='seo_strategy'" in sql:
+                return Rows(
+                    [
+                        {
+                            "id": "strategy-1",
+                            "status": "queued",
+                            "priority": "P1",
+                            "score": 80,
+                            "site_id": "site-1",
+                            "keyword_id": None,
+                            "post_id": None,
+                            "article_id": None,
+                            "title": "Update approved article",
+                            "decision": {},
+                            "business_id": "exdivo",
+                            "plan_id": "plan-1",
+                            "strategy_run_id": "run-1",
+                            "schedule_class": "execute_now",
+                        }
+                    ]
+                )
+            if "INSERT INTO seo_agent.tasks" in sql:
+                captured.update(params or {})
+                return Rows([])
+            if "UPDATE seo_agent.tasks" in sql:
+                return Rows([])
+            raise AssertionError(f"unexpected SQL: {sql}")
+
+        async def commit(self):
+            return None
+
+    post_id = "2280f3f6-a31c-486e-bb57-fbe235301f70"
+    await service._ensure_approved_execution(
+        Session(),  # type: ignore[arg-type]
+        action={
+            "action_id": "action-1",
+            "run_id": "run-1",
+            "run_mode": "approval_execution",
+            "business_id": "exdivo",
+            "site_id": "site-1",
+            "plan_id": "plan-1",
+            "source_strategy_task_id": "strategy-1",
+            "action_type": "update_article",
+            "target_url": "https://topvapes.de/blog/bestes-tabak-aroma",
+        },
+        context={"post_id": post_id},
+    )
+
+    assert captured["post_id"] == post_id
+
+
+@pytest.mark.asyncio
+async def test_existing_update_execution_repairs_missing_target_post_id() -> None:
+    repaired: dict = {}
+
+    class Rows:
+        def __init__(self, rows):
+            self.rows = rows
+
+        def first(self):
+            return self.rows[0] if self.rows else None
+
+        def mappings(self):
+            return self
+
+    class Session:
+        async def execute(self, statement, params=None):
+            sql = str(statement)
+            if "pg_advisory_xact_lock" in sql:
+                return Rows([])
+            if "payload->>'strategy_action_id'=:action_id" in sql:
+                return Rows([{"id": "execution-1"}])
+            if "SET post_id=COALESCE" in sql:
+                repaired.update(params or {})
+                return Rows([])
+            raise AssertionError(f"unexpected SQL: {sql}")
+
+        async def commit(self):
+            return None
+
+    post_id = "2280f3f6-a31c-486e-bb57-fbe235301f70"
+    execution_id = await service._ensure_approved_execution(
+        Session(),  # type: ignore[arg-type]
+        action={
+            "action_id": "action-1",
+            "run_id": "run-1",
+            "run_mode": "approval_execution",
+            "business_id": "exdivo",
+            "site_id": "site-1",
+            "plan_id": "plan-1",
+            "source_strategy_task_id": "strategy-1",
+            "action_type": "update_article",
+        },
+        context={"post_id": post_id},
+    )
+
+    assert execution_id == "execution-1"
+    assert repaired == {"id": "execution-1", "post_id": post_id}

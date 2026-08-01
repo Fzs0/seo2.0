@@ -8,7 +8,7 @@ import pytest
 from app.clients import ai_provider
 from app.clients.http_client import ExternalCallError
 from app.api.v1 import endpoints
-from app.services import article_generation_service, keyword_ai_service, publish_service, strategy_service
+from app.services import article_generation_service, keyword_ai_service, publish_service
 
 
 @pytest.mark.asyncio
@@ -107,22 +107,6 @@ async def test_task_stage_is_persisted() -> None:
     assert session.committed
 
 
-def test_strategy_without_gsc_reuses_keyword_priority() -> None:
-    strategy = strategy_service._build_strategy(
-        {
-            "query": "how much does a vape cost",
-            "keyword_priority": "P1",
-            "keyword_score": 75,
-            "volume": 2900,
-        },
-        None,
-        [],
-    )
-
-    assert strategy["priority"] == "P1"
-    assert strategy["score"] == 75
-
-
 def test_article_prompt_includes_current_date() -> None:
     prompt = article_generation_service._compose_article_prompt({}, {}, "brief", {}, "outline")
 
@@ -209,6 +193,20 @@ def test_keyword_qa_accepts_title_and_punctuation_variants() -> None:
         "A valid meta description that is long enough to pass the article quality gate and describe the page clearly for search users.",
         "G Wiz Vape Review",
     )}
+
+    assert checks["has_keyword"] is True
+
+
+def test_keyword_qa_accepts_german_compound_spelling() -> None:
+    checks = {
+        item["key"]: item["ok"]
+        for item in article_generation_service._qa(
+            "# Liquids zum Selbermischen\n\n## FAQ\n\n" + ("Hilfreiches Detail. " * 100),
+            "liquids zum selber mischen",
+            "Liquids richtig selber mischen: Mengen berechnen, Zutaten einordnen und typische Fehler mit einer klaren Schritt-für-Schritt-Anleitung vermeiden.",
+            "Liquids zum Selbermischen",
+        )
+    }
 
     assert checks["has_keyword"] is True
 

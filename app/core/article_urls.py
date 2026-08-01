@@ -15,6 +15,32 @@ def is_oemapps_site(site: dict[str, Any]) -> bool:
     )
 
 
+def is_content_openapi_site(site: dict[str, Any]) -> bool:
+    """Return whether a self-hosted blog uses the article-ingestion OpenAPI.
+
+    This protocol is intentionally distinct from the shared OEMApps main-site
+    backend.  It accepts ``cover_url`` and image URLs inside ``content_md`` and
+    localizes those assets while publishing the article; it does not expose the
+    OEMApps ``/file/upload`` endpoint or require an OEMApps media ID.
+    """
+    site_type = str(site.get("site_type") or "").strip().casefold()
+    config = site.get("api_config") or {}
+    connector_type = str(
+        site.get("connector_type") or config.get("connector_type") or ""
+    ).strip().casefold()
+    if site_type != "blog" or connector_type not in {
+        "",
+        "blog",
+        "openapi",
+        "custom_blog",
+        "custom_openapi",
+    }:
+        return False
+    raw = str(site.get("api_base_url") or "").strip()
+    parsed = urlsplit(raw if "://" in raw else f"//{raw}")
+    return parsed.path.rstrip("/").casefold() == "/api/open/v1"
+
+
 def resolve_article_public_url(
     site: dict[str, Any],
     *,
@@ -88,11 +114,7 @@ def _public_base(site: dict[str, Any]) -> str:
 
 
 def _is_known_content_openapi(site: dict[str, Any]) -> bool:
-    if str(site.get("site_type") or "").strip().casefold() != "blog":
-        return False
-    raw = str(site.get("api_base_url") or "").strip()
-    parsed = urlsplit(raw if "://" in raw else f"//{raw}")
-    return parsed.path.rstrip("/").casefold() == "/api/open/v1"
+    return is_content_openapi_site(site)
 
 
 def _is_shopify_site(site: dict[str, Any]) -> bool:
@@ -136,4 +158,8 @@ def _absolute_public_url(base: str, path: str) -> str | None:
     return urljoin(f"{base.rstrip('/')}/", path.lstrip("/"))
 
 
-__all__ = ["is_oemapps_site", "resolve_article_public_url"]
+__all__ = [
+    "is_content_openapi_site",
+    "is_oemapps_site",
+    "resolve_article_public_url",
+]

@@ -10,11 +10,12 @@ import hashlib
 import json
 from datetime import datetime
 from typing import Any, Awaitable, Callable
-from urllib.parse import urlparse
 from uuid import uuid4
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.services.autonomous_strategy_orchestrator import StrategyContractError
 
 StrategyPlanner = Callable[..., Awaitable[dict[str, Any]]]
 SiteDiscoverer = Callable[..., Awaitable[list[dict[str, Any]]]]
@@ -27,38 +28,18 @@ EvidenceRefresher = Callable[..., Awaitable[list[dict[str, Any]]]]
 
 RUN_KIND = "strategy_run"
 EVENT_KIND = "strategy_run_event"
-UNIFIED_ACTION_TYPES = frozenset(
-    {
-        "new_article",
-        "update_article",
-        "homepage_seo",
-        "product_seo",
-        "category_seo",
-        "product_image_alt",
-    }
-)
-ON_PAGE_UNIFIED_ACTION_TYPES = frozenset(
-    {"homepage_seo", "product_seo", "category_seo", "product_image_alt"}
-)
-RUN_LOCAL_ACTION_TYPES = frozenset(
-    {
-        "new_article",
-        "update_article",
-        "on_page_fix",
-        "hold",
-        "configuration_repair",
-    }
-)
-RUN_LOCAL_SCHEDULE_CLASSES = frozenset(
-    {"execute_now", "deferred", "hold", "configuration_repair"}
-)
 RUN_STATUSES = frozenset(
     {
         "queued",
         "discovering_sites",
         "checking_capabilities",
         "gathering_evidence",
+        "ai_researching",
+        "proposed_actions_submitted",
+        "safety_reviewing",
         "planning",
+        "zero_action_reviewing",
+        "research_revision_required",
         "refreshing_evidence",
         "replanning",
         "awaiting_approval",
@@ -78,7 +59,12 @@ _DB_STATUS = {
     "discovering_sites": "running",
     "checking_capabilities": "running",
     "gathering_evidence": "running",
+    "ai_researching": "blocked",
+    "proposed_actions_submitted": "queued",
+    "safety_reviewing": "running",
     "planning": "running",
+    "zero_action_reviewing": "running",
+    "research_revision_required": "blocked",
     "refreshing_evidence": "running",
     "replanning": "running",
     "awaiting_approval": "blocked",
@@ -95,12 +81,31 @@ _TRANSITIONS = {
     "queued": {"discovering_sites", "canceled", "failed"},
     "discovering_sites": {"checking_capabilities", "blocked", "failed", "canceled"},
     "checking_capabilities": {"gathering_evidence", "blocked", "failed", "canceled"},
-    "gathering_evidence": {"planning", "blocked", "failed", "canceled"},
+    "gathering_evidence": {
+        "ai_researching",
+        "blocked",
+        "failed",
+        "canceled",
+    },
+    "ai_researching": {
+        "proposed_actions_submitted",
+        "blocked",
+        "failed",
+        "canceled",
+    },
+    "proposed_actions_submitted": {
+        "safety_reviewing",
+        "failed",
+        "canceled",
+    },
+    "safety_reviewing": {"planning", "blocked", "failed", "canceled"},
     "planning": {
         "refreshing_evidence",
+        "zero_action_reviewing",
         "awaiting_approval",
         "executing",
         "observing",
+        "completed",
         "partial",
         "blocked",
         "failed",
@@ -108,10 +113,25 @@ _TRANSITIONS = {
     },
     "refreshing_evidence": {"replanning", "blocked", "failed", "canceled"},
     "replanning": {
+        "zero_action_reviewing",
         "awaiting_approval",
         "executing",
         "observing",
+        "completed",
         "partial",
+        "blocked",
+        "failed",
+        "canceled",
+    },
+    "zero_action_reviewing": {
+        "research_revision_required",
+        "completed",
+        "blocked",
+        "failed",
+        "canceled",
+    },
+    "research_revision_required": {
+        "ai_researching",
         "blocked",
         "failed",
         "canceled",
@@ -158,6 +178,32 @@ async def create_strategy_run(
 ) -> dict[str, Any]:
     if mode not in {"dry_run", "approval_execution"}:
         raise ValueError("mode must be dry_run or approval_execution")
+    if scope not in {"all_sites", "selected_sites"}:
+        raise ValueError("scope must be all_sites or selected_sites")
+    normalized_site_ids = sorted(
+        {str(site_id).strip() for site_id in site_ids or [] if str(site_id).strip()}
+    )
+    if scope == "selected_sites" and not normalized_site_ids:
+        raise ValueError("selected_sites scope requires site_ids")
+    if not 0 <= int(action_budget) <= 200:
+        raise ValueError("action_budget must be between 0 and 200")
+    normalized_quotas = {
+        str(site_id): max(0, min(int(value), 200))
+        for site_id, value in site_quotas.items()
+    }
+    request_contract = {
+        "business_id": business_id,
+        "site_ids": normalized_site_ids or None,
+        "scope": scope,
+        "mode": mode,
+        "requested_by": requested_by,
+        "action_budget": int(action_budget),
+        "site_quotas": normalized_quotas,
+        "approval_policy": approval_policy,
+        "root_run_id": root_run_id,
+        "attempt": attempt,
+    }
+    request_hash = _stable_json_hash(request_contract)
     lock_key = f"strategy-run:{business_id}:{idempotency_key}"
     await session.execute(
         text("SELECT pg_advisory_xact_lock(hashtext(:lock_key))"),
@@ -186,6 +232,37 @@ async def create_strategy_run(
         )
     ).mappings().first()
     if existing:
+        existing_payload = dict(existing.get("payload") or {})
+        existing_hash = existing_payload.get("request_hash")
+        if not existing_hash:
+            existing_hash = _stable_json_hash(
+                {
+                    "business_id": existing_payload.get("business_id"),
+                    "site_ids": sorted(existing_payload.get("site_ids") or [])
+                    or None,
+                    "scope": existing_payload.get("scope"),
+                    "mode": existing_payload.get("mode"),
+                    "requested_by": existing_payload.get("requested_by"),
+                    "action_budget": int(
+                        existing_payload.get("action_budget") or 0
+                    ),
+                    "site_quotas": existing_payload.get("site_quotas") or {},
+                    "approval_policy": existing_payload.get(
+                        "approval_policy"
+                    ),
+                    "root_run_id": existing_payload.get("root_run_id"),
+                    "attempt": int(existing_payload.get("attempt") or 1),
+                }
+            )
+        if existing_hash != request_hash:
+            from app.services.autonomous_strategy_orchestrator import (
+                StrategyContractError,
+            )
+
+            raise StrategyContractError(
+                "DECISION_INPUT_CHANGED",
+                "idempotency key is already bound to a different Run request",
+            )
         await session.commit()
         result = _serialize_run(dict(existing))
         result["idempotency_replayed"] = True
@@ -195,16 +272,17 @@ async def create_strategy_run(
     payload = {
         "kind": RUN_KIND,
         "business_id": business_id,
-        "site_ids": site_ids,
+        "site_ids": normalized_site_ids or None,
         "scope": scope,
         "mode": mode,
         "requested_by": requested_by,
         "idempotency_key": idempotency_key,
-        "action_budget": action_budget,
-        "site_quotas": site_quotas,
+        "action_budget": int(action_budget),
+        "site_quotas": normalized_quotas,
         "approval_policy": approval_policy,
         "root_run_id": root_run_id or run_id,
         "attempt": attempt,
+        "request_hash": request_hash,
     }
     decision = {
         "status": "queued",
@@ -249,575 +327,6 @@ async def create_strategy_run(
     result = _serialize_run(dict(inserted))
     result["idempotency_replayed"] = False
     return result
-
-
-async def submit_strategy_run_local_options(
-    session: AsyncSession,
-    *,
-    run_id: str,
-    requested_by: str,
-    idempotency_key: str,
-    options: list[dict[str, Any]],
-) -> dict[str, Any]:
-    """Attach Codex-researched options to a queued Run without a candidate gate."""
-    requested_by = requested_by.strip()
-    idempotency_key = idempotency_key.strip()
-    if not requested_by:
-        raise ValueError("requested_by is required")
-    if len(idempotency_key) < 8:
-        raise ValueError("idempotency key is too short")
-    if not options:
-        raise ValueError("at least one run-local option is required")
-    if len(options) > 200:
-        raise ValueError("run-local option count exceeds the safety ceiling")
-    request_hash = _stable_json_hash(
-        {"requested_by": requested_by, "options": options}
-    )
-    await session.execute(
-        text("SELECT pg_advisory_xact_lock(hashtext(:key))"),
-        {"key": f"strategy-run-options:{run_id}"},
-    )
-    row = (
-        await session.execute(
-            text(
-                """
-                SELECT id::text AS id, payload, decision, created_at, updated_at,
-                       started_at, finished_at, error_message
-                  FROM seo_agent.tasks
-                 WHERE id=CAST(:run_id AS uuid)
-                   AND task_type='review'
-                   AND payload->>'kind'=:kind
-                 FOR UPDATE
-                """
-            ),
-            {"run_id": run_id, "kind": RUN_KIND},
-        )
-    ).mappings().first()
-    if not row:
-        raise ValueError("strategy run not found")
-    payload = dict(row.get("payload") or {})
-    decision = dict(row.get("decision") or {})
-    if decision.get("status", "queued") != "queued":
-        raise ValueError(
-            "run-local options can only be submitted before the Run starts"
-        )
-    receipt = dict(decision.get("run_local_option_submission") or {})
-    if receipt:
-        if (
-            receipt.get("idempotency_key") == idempotency_key
-            and receipt.get("request_hash") == request_hash
-        ):
-            result = _serialize_run(dict(row))
-            result["idempotency_replayed"] = True
-            return result
-        if receipt.get("idempotency_key") == idempotency_key:
-            raise ValueError(
-                "idempotency key is already bound to different run-local options"
-            )
-        raise ValueError(
-            "run-local options were already submitted; create a new Run to replace them"
-        )
-
-    site_ids = sorted({str(option.get("site_id") or "") for option in options})
-    if "" in site_ids:
-        raise ValueError("every run-local option requires site_id")
-    site_rows = (
-        await session.execute(
-            text(
-                """
-                SELECT id::text AS id, name, site_type, strategy_enabled, market,
-                       language_code, domain, base_url, api_base_url
-                  FROM seo_agent.sites
-                 WHERE business_id=:business_id
-                   AND status='active'
-                   AND strategy_enabled=TRUE
-                   AND id=ANY(CAST(:site_ids AS uuid[]))
-                """
-            ),
-            {
-                "business_id": payload.get("business_id"),
-                "site_ids": site_ids,
-            },
-        )
-    ).mappings().all()
-    sites = [dict(site) for site in site_rows]
-    found_site_ids = {str(site["id"]) for site in sites}
-    missing_site_ids = sorted(set(site_ids) - found_site_ids)
-    if missing_site_ids:
-        raise ValueError(
-            "run-local option sites are missing, disabled, or outside the business: "
-            + ", ".join(missing_site_ids)
-        )
-    if payload.get("scope") == "selected_sites":
-        selected_site_ids = {
-            str(site_id) for site_id in (payload.get("site_ids") or [])
-        }
-        outside_scope = sorted(set(site_ids) - selected_site_ids)
-        if outside_scope:
-            raise ValueError(
-                "run-local option sites are outside the selected Run scope: "
-                + ", ".join(outside_scope)
-            )
-    await _validate_submitted_option_references(
-        session,
-        business_id=str(payload.get("business_id") or ""),
-        options=options,
-    )
-    normalized = _normalize_submitted_run_local_options(
-        business_id=str(payload.get("business_id") or ""),
-        sites=sites,
-        options=options,
-    )
-    submitted_at = datetime.now().astimezone().isoformat()
-    patch = {
-        "run_local_options": normalized,
-        "run_local_option_count": len(normalized),
-        "run_local_option_submission": {
-            "requested_by": requested_by,
-            "idempotency_key": idempotency_key,
-            "request_hash": request_hash,
-            "submitted_at": submitted_at,
-            "source": "codex_current_research",
-        },
-        "next_action": "start",
-    }
-    updated = (
-        await session.execute(
-            text(
-                """
-                UPDATE seo_agent.tasks
-                   SET decision=decision || CAST(:patch AS jsonb),
-                       updated_at=now()
-                 WHERE id=CAST(:run_id AS uuid)
-                   AND task_type='review'
-                   AND payload->>'kind'=:kind
-                   AND COALESCE(decision->>'status','queued')='queued'
-                 RETURNING id::text AS id, payload, decision, created_at, updated_at,
-                           started_at, finished_at, error_message
-                """
-            ),
-            {
-                "run_id": run_id,
-                "kind": RUN_KIND,
-                "patch": json.dumps(patch, ensure_ascii=False, default=str),
-            },
-        )
-    ).mappings().first()
-    if not updated:
-        raise ValueError("strategy run changed concurrently before option submission")
-    await session.commit()
-    result = _serialize_run(dict(updated))
-    result["idempotency_replayed"] = False
-    return result
-
-
-def _normalize_submitted_run_local_options(
-    *,
-    business_id: str,
-    sites: list[dict[str, Any]],
-    options: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    """Validate editorial decisions and convert them to formal-plan inputs."""
-    from app.services.strategy_effect_service import strategy_identity
-
-    sites_by_id = {str(site["id"]): site for site in sites}
-    normalized: list[dict[str, Any]] = []
-    seen_option_ids: set[str] = set()
-    for raw in options:
-        option = {
-            key: (str(value) if key.endswith("_id") and value is not None else value)
-            for key, value in dict(raw).items()
-        }
-        site_id = str(option.get("site_id") or "")
-        site = sites_by_id.get(site_id)
-        if not site:
-            raise ValueError(f"run-local option site is outside the Run: {site_id}")
-        action = str(option.get("action") or option.get("strategy_type") or "")
-        concrete_action = (
-            str(option.get("action_type") or "") if action == "on_page_fix" else action
-        )
-        schedule_class = str(option.get("schedule_class") or "")
-        if action not in RUN_LOCAL_ACTION_TYPES:
-            raise ValueError(f"unsupported run-local action: {action}")
-        if schedule_class not in RUN_LOCAL_SCHEDULE_CLASSES:
-            raise ValueError(
-                f"unsupported run-local schedule class: {schedule_class}"
-            )
-        expected_schedule = {
-            "hold": "hold",
-            "configuration_repair": "configuration_repair",
-        }.get(action)
-        if expected_schedule and schedule_class != expected_schedule:
-            raise ValueError(
-                f"{action} requires schedule_class={expected_schedule}"
-            )
-        if schedule_class in {"hold", "configuration_repair"} and (
-            action != schedule_class
-        ):
-            raise ValueError(
-                "hold/configuration_repair schedule must match the action"
-            )
-        topic = str(option.get("topic") or option.get("query") or "").strip()
-        if action in {"new_article", "update_article"} and not topic:
-            raise ValueError("article run-local options require topic")
-        target_url = str(option.get("target_url") or "").strip() or None
-        if (
-            action == "update_article"
-            and not option.get("post_id")
-            and not option.get("article_id")
-            and not target_url
-        ):
-            raise ValueError(
-                "update_article run-local options require a target identity"
-            )
-        page_type_by_action = {
-            "homepage_seo": "homepage",
-            "product_seo": "product",
-            "category_seo": "category",
-            "product_image_alt": "product",
-        }
-        if action == "on_page_fix":
-            expected_page_type = page_type_by_action.get(concrete_action)
-            if not expected_page_type:
-                raise ValueError(
-                    "on_page_fix run-local options require a supported concrete action_type"
-                )
-            if option.get("page_type") != expected_page_type:
-                raise ValueError(
-                    f"{concrete_action} requires page_type={expected_page_type}"
-                )
-            if (
-                option.get("page_type") != "homepage"
-                and not option.get("target_asset_id")
-                and not option.get("remote_object_id")
-            ):
-                raise ValueError(
-                    "product/category on_page_fix options require target_asset_id "
-                    "or remote_object_id"
-                )
-            if not option.get("target_url"):
-                raise ValueError(
-                    "on_page_fix run-local options require target_url"
-                )
-            if not option.get("expected_fields"):
-                raise ValueError(
-                    "on_page_fix run-local options require expected_fields"
-                )
-        if target_url and not _url_belongs_to_site(target_url, site):
-            raise ValueError(
-                f"run-local option target URL does not belong to site {site_id}"
-            )
-        reason = str(option.get("reason") or "").strip()
-        user_intent = str(option.get("user_intent") or "").strip()
-        evidence = option.get("evidence")
-        if not reason or not user_intent or not isinstance(evidence, dict) or not evidence:
-            raise ValueError(
-                "run-local options require reason, user_intent, and current evidence"
-            )
-        title = str(option.get("title") or topic or action).strip()
-        identity = strategy_identity(
-            business_id,
-            site_id=site_id,
-            market=site.get("market"),
-            language_code=site.get("language_code"),
-            topic_cluster_id=None,
-            post_id=option.get("post_id"),
-            article_id=option.get("article_id"),
-            query=topic,
-            action=concrete_action,
-            objective=reason,
-            evidence=evidence,
-            target_url=target_url,
-            site_url=site.get("base_url"),
-            site_domain=site.get("domain"),
-        )
-        option_id = "research-" + _stable_json_hash(
-            {
-                "site_id": site_id,
-                "action": action,
-                "action_type": concrete_action,
-                "topic": topic,
-                "target_url": target_url,
-                "target_asset_id": option.get("target_asset_id"),
-                "remote_object_id": option.get("remote_object_id"),
-                "post_id": option.get("post_id"),
-                "article_id": option.get("article_id"),
-            }
-        )[:32]
-        if option_id in seen_option_ids:
-            raise ValueError("duplicate run-local option")
-        seen_option_ids.add(option_id)
-        risk_level = str(option.get("risk_level") or "medium")
-        normalized.append(
-            {
-                "option_id": option_id,
-                "option_origin": "codex_research",
-                "candidate_id": option.get("candidate_id"),
-                "research_candidate_id": None,
-                "candidate_influence": option.get("candidate_influence")
-                or "not_consulted_or_optional_reference",
-                "keyword_id": option.get("keyword_id"),
-                "site_id": site_id,
-                "site_name": site.get("name"),
-                "post_id": option.get("post_id"),
-                "article_id": option.get("article_id"),
-                "target_url": target_url,
-                "target_asset_id": option.get("target_asset_id"),
-                "remote_object_id": option.get("remote_object_id"),
-                "connector_id": option.get("connector_id"),
-                "connector_type": option.get("connector_type"),
-                "page_type": option.get("page_type"),
-                "expected_fields": list(option.get("expected_fields") or []),
-                "editorial_action": (
-                    "on_page_fix" if action == "on_page_fix" else action
-                ),
-                "strategy_type": concrete_action,
-                "action_type": concrete_action,
-                "query": topic,
-                "title": title,
-                "reason": reason,
-                "recommended_action": reason,
-                "user_intent": user_intent,
-                "evidence": evidence,
-                "execution_evidence": evidence,
-                "hypothesis": option.get("hypothesis"),
-                "success_metrics": list(option.get("success_metrics") or []),
-                "rejected_alternatives": list(
-                    option.get("rejected_alternatives") or []
-                ),
-                "priority": option.get("priority") or "P2",
-                "score": float(option.get("opportunity_score") or 0),
-                "opportunity_score": float(
-                    option.get("opportunity_score") or 0
-                ),
-                "readiness_score": float(option.get("readiness_score") or 0.5),
-                "confidence": float(option.get("readiness_score") or 0.5),
-                "risk_score": float(option.get("risk_score") or 0.5),
-                "risk_level": risk_level,
-                "risk_gate_passed": risk_level != "high",
-                "site_configuration_ready": bool(
-                    site.get("strategy_enabled")
-                    and (site.get("base_url") or site.get("domain"))
-                    and site.get("market")
-                    and site.get("language_code")
-                ),
-                "requested_schedule_class": schedule_class,
-                "schedule_class": schedule_class,
-                "schedule_reason": reason,
-                "reevaluate_at": option.get("reevaluate_at"),
-                "reevaluation_condition": option.get(
-                    "reevaluation_condition"
-                ),
-                "evidence_level": "current_research",
-                **identity,
-            }
-        )
-    return normalized
-
-
-async def _validate_submitted_option_references(
-    session: AsyncSession,
-    *,
-    business_id: str,
-    options: list[dict[str, Any]],
-) -> None:
-    expected_sites = {
-        str(option.get("keyword_id")): str(option.get("site_id"))
-        for option in options
-        if option.get("keyword_id")
-    }
-    if expected_sites:
-        rows = (
-            await session.execute(
-                text(
-                    """
-                    SELECT id::text AS id, assigned_site_id::text AS site_id
-                      FROM seo_agent.keywords
-                     WHERE business_id=:business_id
-                       AND id=ANY(CAST(:ids AS uuid[]))
-                    """
-                ),
-                {"business_id": business_id, "ids": list(expected_sites)},
-            )
-        ).mappings().all()
-        found = {str(row["id"]): row.get("site_id") for row in rows}
-        for reference_id, site_id in expected_sites.items():
-            if reference_id not in found or (
-                found[reference_id] and str(found[reference_id]) != site_id
-            ):
-                raise ValueError(
-                    "keyword reference is missing or belongs to another scope"
-                )
-
-    expected_candidates = {
-        str(option.get("candidate_id")): str(option.get("site_id"))
-        for option in options
-        if option.get("candidate_id")
-    }
-    if expected_candidates:
-        rows = (
-            await session.execute(
-                text(
-                    """
-                    SELECT id::text AS id, site_id::text AS site_id
-                      FROM seo_agent.tasks
-                     WHERE id=ANY(CAST(:ids AS uuid[]))
-                       AND task_type='review'
-                       AND payload->>'kind'='strategy_candidate'
-                       AND payload->>'business_id'=:business_id
-                    """
-                ),
-                {"business_id": business_id, "ids": list(expected_candidates)},
-            )
-        ).mappings().all()
-        found = {str(row["id"]): str(row.get("site_id") or "") for row in rows}
-        if any(
-            found.get(reference_id) != site_id
-            for reference_id, site_id in expected_candidates.items()
-        ):
-            raise ValueError(
-                "candidate reference is missing or belongs to another scope"
-            )
-
-    for table, field in (("posts", "post_id"), ("articles", "article_id")):
-        expected = {
-            str(option.get(field)): str(option.get("site_id"))
-            for option in options
-            if option.get(field)
-        }
-        if not expected:
-            continue
-        rows = (
-            await session.execute(
-                text(
-                    f"""
-                    SELECT id::text AS id, site_id::text AS site_id
-                      FROM seo_agent.{table}
-                     WHERE id=ANY(CAST(:ids AS uuid[]))
-                    """
-                ),
-                {"ids": list(expected)},
-            )
-        ).mappings().all()
-        found = {str(row["id"]): str(row.get("site_id") or "") for row in rows}
-        if any(
-            found.get(reference_id) != site_id
-            for reference_id, site_id in expected.items()
-        ):
-            raise ValueError(
-                f"{field} is missing or belongs to another site"
-            )
-
-    for option in options:
-        if option.get("action") != "on_page_fix":
-            continue
-        action_type = str(option.get("action_type") or "")
-        page_type = str(option.get("page_type") or "")
-        target_asset_id = str(option.get("target_asset_id") or "")
-        if target_asset_id and not target_asset_id.isdigit():
-            raise ValueError("on-page target_asset_id must be a persisted numeric ID")
-        remote_object_id = str(option.get("remote_object_id") or "")
-        params: dict[str, Any] = {
-            "site_id": str(option.get("site_id") or ""),
-        }
-        if target_asset_id:
-            identity_clause = "id=:target_asset_id"
-            params["target_asset_id"] = int(target_asset_id)
-        elif action_type == "homepage_seo":
-            identity_clause = "site_id=CAST(:site_id AS uuid)"
-        elif remote_object_id:
-            identity_clause = (
-                "site_id=CAST(:site_id AS uuid) "
-                "AND external_id=:remote_object_id"
-            )
-            params["remote_object_id"] = remote_object_id
-        else:
-            raise ValueError("on-page target identity is incomplete")
-        if action_type in {"product_seo", "product_image_alt"}:
-            query = """
-                SELECT p.id::text AS target_asset_id, p.site_id::text AS site_id,
-                       p.external_id AS remote_object_id,
-                       p.source_connector_id::text AS connector_id, p.url AS target_url,
-                       CASE
-                         WHEN p.source='shopify_admin_graphql' THEN 'shopify'
-                         ELSE lower(COALESCE(v.config->>'adapter', ''))
-                       END AS connector_type
-                  FROM seo_agent.products p
-             LEFT JOIN seo_agent.custom_connectors c
-                    ON c.id=p.source_connector_id
-             LEFT JOIN seo_agent.custom_connector_versions v
-                    ON v.connector_id=c.id AND v.version=c.current_version
-                 WHERE p.{identity_clause}
-            """
-        elif action_type == "category_seo" and page_type == "category":
-            query = """
-                SELECT p.id::text AS target_asset_id, p.site_id::text AS site_id,
-                       p.external_id AS remote_object_id,
-                       p.source_connector_id::text AS connector_id, p.url AS target_url,
-                       lower(COALESCE(v.config->>'adapter', '')) AS connector_type
-                  FROM seo_agent.product_collections p
-                  JOIN seo_agent.custom_connectors c
-                    ON c.id=p.source_connector_id
-                  JOIN seo_agent.custom_connector_versions v
-                    ON v.connector_id=c.id AND v.version=c.current_version
-                 WHERE p.{identity_clause}
-            """
-        elif action_type == "homepage_seo" and page_type == "homepage":
-            query = """
-                SELECT h.id::text AS target_asset_id, h.site_id::text AS site_id,
-                       h.site_id::text AS remote_object_id,
-                       h.source_connector_id::text AS connector_id,
-                       COALESCE(s.base_url, s.domain) AS target_url,
-                       lower(COALESCE(v.config->>'adapter', '')) AS connector_type
-                  FROM seo_agent.site_home_seo h
-                  JOIN seo_agent.sites s ON s.id=h.site_id
-                  JOIN seo_agent.custom_connectors c
-                    ON c.id=h.source_connector_id
-                  JOIN seo_agent.custom_connector_versions v
-                    ON v.connector_id=c.id AND v.version=c.current_version
-                 WHERE h.{identity_clause}
-            """
-        else:
-            raise ValueError("on-page action_type and page_type do not match")
-        row = (
-            await session.execute(
-                text(query.format(identity_clause=identity_clause)), params
-            )
-        ).mappings().first()
-        if not row or str(row.get("site_id") or "") != str(option.get("site_id")):
-            raise ValueError(
-                "on-page target is missing or belongs to another site"
-            )
-        actual = dict(row)
-        option["target_asset_id"] = actual.get("target_asset_id")
-        for field in ("remote_object_id", "connector_id", "connector_type"):
-            supplied = option.get(field)
-            if supplied and str(supplied).casefold() != str(
-                actual.get(field) or ""
-            ).casefold():
-                raise ValueError(
-                    f"on-page target {field} does not match current data"
-                )
-            option[field] = actual.get(field)
-        supplied_url = str(option.get("target_url") or "").rstrip("/")
-        actual_url = str(actual.get("target_url") or "").rstrip("/")
-        if supplied_url and supplied_url != actual_url:
-            raise ValueError(
-                "on-page target target_url does not match current data"
-            )
-        option["target_url"] = actual.get("target_url")
-
-
-def _url_belongs_to_site(url: str, site: dict[str, Any]) -> bool:
-    target_host = (urlparse(url).hostname or "").lower()
-    if not target_host:
-        return False
-    allowed_hosts = {
-        host
-        for value in (site.get("domain"), site.get("base_url"))
-        if (host := (urlparse(str(value)).hostname or str(value).split("/")[0]).lower())
-    }
-    return target_host in allowed_hosts
 
 
 def _stable_json_hash(value: Any) -> str:
@@ -1060,16 +569,63 @@ async def cancel_strategy_run(
     if not run:
         raise ValueError("strategy run not found")
     if run["status"] in TERMINAL_RUN_STATUSES:
+        if run["status"] == "canceled":
+            await _cancel_unexecuted_run_items(session, run_id=run_id)
+            refreshed = await get_strategy_run(session, run_id=run_id)
+            return refreshed or run
         return run
     # Cancellation is cooperative: running actions are not rolled back or
     # misrepresented. The orchestrator must check this flag before each stage.
-    return await transition_strategy_run(
+    canceled = await transition_strategy_run(
         session,
         run_id=run_id,
         current_status=run["status"],
         next_status="canceled",
         updates={"cancel_requested": True, "cancel_requested_by": requested_by},
     )
+    await _cancel_unexecuted_run_items(session, run_id=run_id)
+    return (await get_strategy_run(session, run_id=run_id)) or canceled
+
+
+async def _cancel_unexecuted_run_items(
+    session: AsyncSession, *, run_id: str
+) -> None:
+    """Retire only work that never entered a remote-write attempt."""
+    await session.execute(
+        text(
+            """
+            UPDATE seo_agent.tasks
+               SET status='canceled',
+                   payload=payload || jsonb_build_object(
+                     'status','canceled',
+                     'result','canceled',
+                     'canceled_at',now()::text
+                   ),
+                   finished_at=COALESCE(finished_at, now()),
+                   updated_at=now()
+             WHERE task_type='review'
+               AND payload->>'kind'='strategy_action'
+               AND payload->>'run_id'=CAST(:run_id AS text)
+               AND payload->>'status' IN ('planned','previewed','approved')
+            """
+        ),
+        {"run_id": run_id},
+    )
+    await session.execute(
+        text(
+            """
+            UPDATE seo_agent.tasks
+               SET status='canceled', finished_at=COALESCE(finished_at, now()),
+                   updated_at=now()
+             WHERE task_type='review'
+               AND payload->>'kind' IN ('seo_strategy','strategy_plan')
+               AND payload->>'strategy_run_id'=CAST(:run_id AS text)
+               AND status IN ('queued','running')
+            """
+        ),
+        {"run_id": run_id},
+    )
+    await session.commit()
 
 
 async def retry_strategy_run(
@@ -1172,7 +728,12 @@ async def run_strategy_run(
     if run["status"] in TERMINAL_RUN_STATUSES:
         return {**run, "start_replayed": True}
     try:
-        if run["status"] in {"awaiting_approval", "executing", "verifying", "observing"}:
+        if run["status"] in {
+            "awaiting_approval",
+            "executing",
+            "verifying",
+            "observing",
+        }:
             return await reconcile_strategy_run(
                 session,
                 run_id=run_id,
@@ -1200,11 +761,6 @@ async def run_strategy_run(
         evidence_gatherer = evidence_gatherer or _gather_run_evidence
         evidence_refresher = evidence_refresher or _refresh_run_evidence
         action_factory = action_factory or _create_unified_action
-        if planner is None:
-            from app.services.strategy_service import generate_strategies
-
-            planner = generate_strategies
-
         if run["status"] == "discovering_sites":
             await _stage_started(session, run_id, "discovering_sites")
             sites = await site_discoverer(
@@ -1259,7 +815,7 @@ async def run_strategy_run(
             )
             run = await _complete_stage(
                 session, run_id=run_id, current="gathering_evidence",
-                next_status="planning",
+                next_status="ai_researching",
                 updates={
                     "evidence_snapshot": evidence_snapshot,
                     "evidence_snapshot_id": evidence_snapshot.get("snapshot_id"),
@@ -1267,9 +823,77 @@ async def run_strategy_run(
                         run, "gathering_evidence",
                         {"capability_snapshot_generated_at":
                          (run.get("capability_snapshot") or {}).get("generated_at"),
-                         "site_ids": [str(s["id"]) for s in run.get("discovered_sites") or []],
-                         "snapshot_id": evidence_snapshot.get("snapshot_id")},
+                          "site_ids": [str(s["id"]) for s in run.get("discovered_sites") or []],
+                          "snapshot_id": evidence_snapshot.get("snapshot_id")},
                     ),
+                    "next_action": "capture_research",
+                },
+            )
+
+        if run["status"] in {"ai_researching", "research_revision_required"}:
+            return {
+                **run,
+                "start_replayed": True,
+                "next_action": (
+                    "capture_research"
+                    if not run.get("research_portfolio")
+                    or run["status"] == "research_revision_required"
+                    else "submit_proposed_actions"
+                ),
+            }
+
+        if run["status"] == "proposed_actions_submitted":
+            await _stage_started(session, run_id, "proposed_actions_submitted")
+            if not run.get("research_portfolio") or not run.get("proposed_actions"):
+                raise RuntimeError(
+                    "formal safety review requires Research Portfolio and Proposed Actions"
+                )
+            run = await _complete_stage(
+                session,
+                run_id=run_id,
+                current="proposed_actions_submitted",
+                next_status="safety_reviewing",
+                updates={
+                    "stage_outputs": _merge_stage_output(
+                        run,
+                        "proposed_actions_submitted",
+                        {
+                            "research_portfolio_hash": run.get(
+                                "research_portfolio_hash"
+                            ),
+                            "proposed_action_hash": run.get(
+                                "proposed_action_hash"
+                            ),
+                            "proposed_action_count": len(
+                                run.get("proposed_actions") or []
+                            ),
+                        },
+                    ),
+                    "next_action": "safety_review",
+                },
+            )
+
+        if run["status"] == "safety_reviewing":
+            await _stage_started(session, run_id, "safety_reviewing")
+            run = await _complete_stage(
+                session,
+                run_id=run_id,
+                current="safety_reviewing",
+                next_status="planning",
+                updates={
+                    "stage_outputs": _merge_stage_output(
+                        run,
+                        "safety_reviewing",
+                        {
+                            "capability_snapshot_generated_at": (
+                                run.get("capability_snapshot") or {}
+                            ).get("generated_at"),
+                            "proposed_action_hash": run.get(
+                                "proposed_action_hash"
+                            ),
+                        },
+                    ),
+                    "next_action": "build_formal_plan",
                 },
             )
 
@@ -1279,9 +903,6 @@ async def run_strategy_run(
         await _stage_started(session, run_id, stage)
         planned = await _plan_all_sites(session, run=run, planner=planner)
         planned = _bind_planned_actions(planned)
-        planned = _apply_capability_gate(
-            planned, run.get("capability_snapshot") or {}
-        )
         planned = _restrict_plan_to_discovered_sites(
             planned,
             run.get("discovered_sites") or [],
@@ -1321,9 +942,6 @@ async def run_strategy_run(
             stage = "replanning"
             planned = await _plan_all_sites(session, run=run, planner=planner)
             planned = _bind_planned_actions(planned)
-            planned = _apply_capability_gate(
-                planned, run.get("capability_snapshot") or {}
-            )
             planned = _restrict_plan_to_discovered_sites(
                 planned,
                 run.get("discovered_sites") or [],
@@ -1339,6 +957,108 @@ async def run_strategy_run(
             raise RuntimeError(
                 "strategy coverage incomplete: every discovered site must have exactly one decision"
             )
+        reviewed_actions = list(
+            planned.get("reviewed_actions")
+            or (planned.get("coverage_matrix") or {}).get("options")
+            or []
+        )
+        from app.services.autonomous_strategy_orchestrator import (
+            evaluate_zero_action_review,
+        )
+
+        zero_action_review = await evaluate_zero_action_review(
+            session,
+            run=run,
+            reviewed_actions=reviewed_actions,
+        )
+        if zero_action_review["required"]:
+            run = await _complete_stage(
+                session,
+                run_id=run_id,
+                current=stage,
+                next_status="zero_action_reviewing",
+                updates={
+                    **summary,
+                    "reviewed_actions": reviewed_actions,
+                    "zero_action_review": zero_action_review,
+                    "stage_outputs": _merge_stage_output(
+                        run,
+                        stage,
+                        {
+                            "discovered_site_count": summary[
+                                "discovered_site_count"
+                            ],
+                            "decided_site_count": summary["decided_site_count"],
+                            "zero_action_review_required": True,
+                        },
+                    ),
+                    "next_action": "zero_action_review",
+                },
+            )
+            zero_result = str(zero_action_review["result"])
+            if zero_result == "research_revision_required":
+                return await _complete_stage(
+                    session,
+                    run_id=run_id,
+                    current="zero_action_reviewing",
+                    next_status="research_revision_required",
+                    updates={
+                        "zero_action_review": zero_action_review,
+                        "next_action": "capture_research",
+                    },
+                )
+            if zero_result == "hard_blocked":
+                return await _complete_stage(
+                    session,
+                    run_id=run_id,
+                    current="zero_action_reviewing",
+                    next_status="blocked",
+                    updates={
+                        "zero_action_review": zero_action_review,
+                        "next_action": "resolve_hard_blocks",
+                    },
+                )
+            return await _complete_stage(
+                session,
+                run_id=run_id,
+                current="zero_action_reviewing",
+                next_status="completed",
+                updates={
+                    "zero_action_review": zero_action_review,
+                    "next_action": "none",
+                },
+            )
+
+        if summary["counts"]["execute_now"] == 0:
+            return await _complete_stage(
+                session,
+                run_id=run_id,
+                current=stage,
+                next_status="completed",
+                updates={
+                    **summary,
+                    "reviewed_actions": reviewed_actions,
+                    "zero_action_review": zero_action_review,
+                    "next_action": "wait_for_deferred_reevaluation",
+                },
+            )
+
+        if run.get("mode") == "dry_run":
+            return await _complete_stage(
+                session,
+                run_id=run_id,
+                current=stage,
+                next_status="completed",
+                updates={
+                    **summary,
+                    "reviewed_actions": reviewed_actions,
+                    "zero_action_review": zero_action_review,
+                    "shadow_run": True,
+                    "action_ids": [],
+                    "next_action": "none",
+                },
+            )
+
         next_status = (
             "awaiting_approval"
             if summary["counts"]["awaiting_approval"] > 0
@@ -1378,6 +1098,8 @@ async def run_strategy_run(
             session, run_id=run_id, current=stage, next_status=next_status,
             updates={
                 **summary,
+                "reviewed_actions": reviewed_actions,
+                "zero_action_review": zero_action_review,
                 "action_ids": [item.get("action_id") for item in created_actions],
                 "stage_outputs": _merge_stage_output(
                     run, stage,
@@ -1390,6 +1112,7 @@ async def run_strategy_run(
             },
         )
     except Exception as error:
+        error_code = str(getattr(error, "code", "") or "STRATEGY_RUN_FAILED")
         if hasattr(session, "rollback"):
             await session.rollback()
         if idempotency_key:
@@ -1407,7 +1130,10 @@ async def run_strategy_run(
                 stage=current["current_stage"],
                 event_type="error",
                 message="Strategy run failed",
-                data={"error": str(error)[:1000]},
+                data={
+                    "error_code": error_code,
+                    "error": str(error)[:1000],
+                },
             )
             return await transition_strategy_run(
                 session,
@@ -1415,7 +1141,13 @@ async def run_strategy_run(
                 current_status=current["status"],
                 next_status="failed",
                 updates={
-                    "exceptions": [{"type": type(error).__name__, "message": str(error)[:1000]}],
+                    "exceptions": [
+                        {
+                            "type": type(error).__name__,
+                            "error_code": error_code,
+                            "message": str(error)[:1000],
+                        }
+                    ],
                     "next_action": "retry",
                 },
             )
@@ -1432,11 +1164,13 @@ async def _discover_run_sites(
         await session.execute(
             text(
                 """
-                SELECT id::text AS id, name, site_type, is_main
+                SELECT id::text AS id, name, site_type, is_main,
+                       strategy_enabled, market, language_code, content_role,
+                       content_scope, domain, base_url, api_base_url
                   FROM seo_agent.sites
                  WHERE business_id = :business_id
-                   AND status = 'active' AND strategy_enabled = TRUE
-                   AND (:all_sites OR id = ANY(CAST(:site_ids AS uuid[])))
+                    AND status = 'active'
+                    AND (:all_sites OR id = ANY(CAST(:site_ids AS uuid[])))
                  ORDER BY is_main DESC, name ASC
                 """
             ),
@@ -1452,13 +1186,22 @@ async def _discover_run_sites(
         found = {str(site["id"]) for site in sites}
         missing = [item for item in site_ids or [] if str(item) not in found]
         if missing:
-            raise ValueError("selected sites are missing, disabled, or outside the business")
+            raise ValueError("selected sites are missing, inactive, or outside the business")
     return sites
 
 
 async def _plan_all_sites(
-    session: AsyncSession, *, run: dict[str, Any], planner: StrategyPlanner
+    session: AsyncSession,
+    *,
+    run: dict[str, Any],
+    planner: StrategyPlanner | None,
 ) -> dict[str, Any]:
+    if planner is None:
+        from app.services.autonomous_strategy_orchestrator import (
+            build_reviewed_plan,
+        )
+
+        return await build_reviewed_plan(session, run=run)
     sites = list(run.get("discovered_sites") or [])
     values = {
         "business_id": run["business_id"],
@@ -1471,8 +1214,10 @@ async def _plan_all_sites(
         "site_quotas": run["site_quotas"],
         "_strategy_run_id": run.get("run_id"),
     }
-    if run.get("run_local_options"):
-        values["run_local_options"] = list(run["run_local_options"])
+    if run.get("proposed_actions"):
+        values["proposed_actions"] = list(run["proposed_actions"])
+    if run.get("research_portfolio"):
+        values["research_portfolio"] = list(run["research_portfolio"])
     return await planner(session, **values)
 
 
@@ -1507,92 +1252,6 @@ def _merge_stage_output(
     return {**(run.get("stage_outputs") or {}), stage: output}
 
 
-def _apply_capability_gate(
-    planned: dict[str, Any], snapshot: dict[str, Any]
-) -> dict[str, Any]:
-    """Convert undeclared/forbidden actions into explicit safe site outcomes."""
-    coverage = dict(planned.get("coverage_matrix") or {})
-    decisions = list(coverage.get("decisions") or planned.get("decisions") or [])
-    capabilities = {
-        str(site.get("site_id")): site for site in snapshot.get("sites") or []
-    }
-    gated = []
-    for decision in decisions:
-        item = dict(decision)
-        action = str(item.get("action") or item.get("strategy_type") or "")
-        if action in {"hold", "configuration_repair", "failed"}:
-            gated.append(item)
-            continue
-        site_capability = capabilities.get(str(item.get("site_id"))) or {}
-        permission = (site_capability.get("supported_actions") or {}).get(action)
-        adapter_identity = (
-            site_capability.get("action_adapters") or {}
-        ).get(action)
-        adapter_unavailable = action not in UNIFIED_ACTION_TYPES or (
-            action in ON_PAGE_UNIFIED_ACTION_TYPES
-            and (
-                not isinstance(adapter_identity, dict)
-                or str(adapter_identity.get("connector_type") or "").casefold()
-                != str(item.get("connector_type") or "").casefold()
-                or adapter_identity.get("readback") is not True
-            )
-        )
-        if (
-            adapter_unavailable
-            or permission not in {"approval_required", "allowed", "execute"}
-        ):
-            issues = site_capability.get("configuration_issues") or []
-            item.update(
-                {
-                    "action": "configuration_repair" if issues else "hold",
-                    "schedule_class": (
-                        "configuration_repair" if issues else "hold"
-                    ),
-                    "original_action": action,
-                    "block_reason": (
-                        "unified_action_adapter_unavailable"
-                        if adapter_unavailable
-                        else "action_capability_not_declared"
-                        if permission is None
-                        else "action_capability_forbidden"
-                    ),
-                    "unlock_condition": "Refresh site capabilities after connector configuration is repaired.",
-                    "capability_issues": issues,
-                }
-            )
-        gated.append(item)
-    executable = []
-    for decision in planned.get("executable_decisions") or []:
-        action = str(decision.get("action") or decision.get("strategy_type") or "")
-        site_capability = capabilities.get(str(decision.get("site_id"))) or {}
-        permission = (site_capability.get("supported_actions") or {}).get(action)
-        adapter_identity = (
-            site_capability.get("action_adapters") or {}
-        ).get(action)
-        adapter_ready = action not in ON_PAGE_UNIFIED_ACTION_TYPES or (
-            isinstance(adapter_identity, dict)
-            and str(adapter_identity.get("connector_type") or "").casefold()
-            == str(decision.get("connector_type") or "").casefold()
-            and adapter_identity.get("readback") is True
-        )
-        if (
-            action in UNIFIED_ACTION_TYPES
-            and permission in {"approval_required", "allowed", "execute"}
-            and adapter_ready
-        ):
-            executable.append(decision)
-    return {
-        **planned,
-        "decisions": gated,
-        "executable_decisions": executable,
-        "coverage_matrix": {
-            **coverage,
-            "decisions": gated,
-            "decided_site_count": len(gated),
-        },
-    }
-
-
 async def _gather_run_evidence(
     session: AsyncSession,
     *,
@@ -1616,28 +1275,39 @@ async def _gather_run_evidence(
         )
     ).mappings().first()
     if not row:
-        submitted_options = list((run or {}).get("run_local_options") or [])
-        if submitted_options:
-            return {
-                "snapshot_id": None,
+        captured_at = datetime.now().astimezone().isoformat()
+        snapshot_id = "run-evidence-" + _stable_json_hash(
+            {
+                "run_id": (run or {}).get("run_id"),
                 "business_id": business_id,
                 "site_ids": [str(site["id"]) for site in sites],
-                "source": "codex_current_research",
-                "run_local_option_count": len(submitted_options),
-                "evidence_hash": _stable_json_hash(
-                    [
-                        {
-                            "option_id": option.get("option_id"),
-                            "site_id": option.get("site_id"),
-                            "evidence": option.get("evidence") or {},
-                        }
-                        for option in submitted_options
-                    ]
-                ),
+                "captured_at": captured_at,
             }
-        raise RuntimeError("current business has no content audit evidence snapshot")
+        )[:32]
+        return {
+            "snapshot_id": snapshot_id,
+            "captured_at": captured_at,
+            "business_id": business_id,
+            "site_ids": [str(site["id"]) for site in sites],
+            "source": "run_evidence_manifest",
+            "sources": [
+                {
+                    "source_type": "content_audit",
+                    "collection_status": "empty",
+                    "captured_at": captured_at,
+                    "limitations": [
+                        "No current content audit batch was available."
+                    ],
+                    "decision_use": (
+                        "AI must use current site/API/analytics/SERP evidence "
+                        "before submitting Proposed Actions."
+                    ),
+                }
+            ],
+        }
     return {
         **dict(row),
+        "captured_at": row.get("scanned_at"),
         "business_id": business_id,
         "site_ids": [str(site["id"]) for site in sites],
         "source": "content_audit_batch",
@@ -1678,6 +1348,9 @@ async def _create_unified_action(
         target_url=decision.get("target_url") or decision.get("canonical_url"),
         target_asset_id=decision.get("target_asset_id"),
         remote_object_id=decision.get("remote_object_id"),
+        corrective_of_action_id=decision.get("corrective_of_action_id"),
+        corrective_action_validated=decision.get("corrective_action_validated") is True,
+        corrective_reason=decision.get("corrective_reason"),
         connector_id=decision.get("connector_id"),
         connector_type=decision.get("connector_type"),
         expected_fields=list(decision.get("expected_fields") or []),
@@ -1686,6 +1359,9 @@ async def _create_unified_action(
         ),
         source_strategy_task_id=decision.get("source_strategy_task_id"),
         evidence_snapshot_id=run.get("evidence_snapshot_id"),
+        scope_key=decision.get("scope_key"),
+        lock_scope=decision.get("lock_scope"),
+        lock_key=decision.get("lock_key"),
         strategy_fingerprint=decision.get("strategy_fingerprint"),
         evidence_fingerprint=decision.get("evidence_fingerprint"),
         topic=decision.get("query"),
@@ -1827,13 +1503,12 @@ async def _reconcile_terminal_run(
 ) -> dict[str, Any]:
     """Close a recoverable terminal Run after its persisted Actions converge.
 
-    A Run can become ``partial`` while its last Action is in the deliberately
-    blocked ``unknown_remote_state`` state. A later read-only recovery may
-    prove that Action was applied. This narrow compare-and-set permits only the
-    resulting ``partial`` -> ``completed`` correction; normal terminal-state
-    transitions remain forbidden.
+    A Run can become ``partial`` or ``failed`` before a later read-only recovery
+    proves every persisted Action was applied. This narrow compare-and-set
+    permits only that recovered terminal state to become ``completed``; normal
+    terminal-state transitions remain forbidden.
     """
-    if current_status != "partial" or next_status != "completed":
+    if current_status not in {"partial", "failed"} or next_status != "completed":
         raise ValueError("unsupported terminal strategy run reconciliation")
     patch = {
         "status": next_status,
@@ -1903,7 +1578,7 @@ async def reconcile_strategy_run(
             run = await get_strategy_run(session, run_id=run_id)
             if not run:
                 raise ValueError("strategy run not found")
-            if run["status"] == "partial":
+            if run["status"] in {"partial", "failed"}:
                 actions = await loader(session, run_id=run_id)
                 if actions and all(
                     action.get("status") == "completed" for action in actions
@@ -1916,7 +1591,7 @@ async def reconcile_strategy_run(
                     return await _reconcile_terminal_run(
                         session,
                         run_id=run_id,
-                        current_status="partial",
+                        current_status=str(run["status"]),
                         next_status="completed",
                         updates={
                             "action_outcome_counts": {
@@ -1929,6 +1604,11 @@ async def reconcile_strategy_run(
                         },
                     )
             if run["status"] in TERMINAL_RUN_STATUSES:
+                actions = await loader(session, run_id=run_id)
+                if actions:
+                    return await _refresh_terminal_run_summary(
+                        session, run=run, actions=actions
+                    )
                 return {**run, "reconcile_replayed": True}
             if run["status"] not in {
                 "awaiting_approval",
@@ -1970,21 +1650,42 @@ async def _reconcile_run_actions(
         return {**run, "start_replayed": True, "next_action": "approve_actions"}
     statuses = {str(action.get("status") or "") for action in actions}
     terminal = {"completed", "blocked", "failed", "canceled"}
-    counts = {
-        "completed": sum(a.get("status") == "completed" for a in actions),
-        "blocked": sum(a.get("status") == "blocked" for a in actions),
-        "failed": sum(a.get("status") in {"failed", "canceled"} for a in actions),
+    counts, summary_counts, observations = _summarize_action_lifecycle(run, actions)
+    if (
+        run["status"] == "awaiting_approval"
+        and statuses == {"canceled"}
+        and all(
+            action.get("closure_reason") == "approval_expired_unexecuted"
+            for action in actions
+        )
+    ):
+        return await _complete_stage(
+            session,
+            run_id=run_id,
+            current="awaiting_approval",
+            next_status="canceled",
+            updates={
+                "action_outcome_counts": counts,
+                "counts": summary_counts,
+                "closure_reason": "all_actions_expired_unexecuted",
+                "next_action": "none",
+            },
+        )
+    post_approval = {
+        str(action.get("status") or "")
+        for action in actions
+        if str(action.get("status") or "")
+        not in {"planned", "previewing", "previewed"}
+        and not (
+            action.get("status") == "canceled"
+            and action.get("closure_reason") == "approval_expired_unexecuted"
+        )
     }
-    observations = [
-        str(action["observation_id"]) for action in actions
-        if action.get("status") == "completed" and action.get("observation_id")
-    ]
-    post_approval = statuses - {"planned", "previewing", "previewed"}
     if run["status"] == "awaiting_approval" and post_approval:
         run = await _complete_stage(
             session, run_id=run_id, current="awaiting_approval",
             next_status="executing",
-            updates={"action_outcome_counts": counts},
+            updates={"action_outcome_counts": counts, "counts": summary_counts},
         )
         await _stage_started(session, run_id, "executing")
     if not statuses.issubset(terminal):
@@ -1992,7 +1693,7 @@ async def _reconcile_run_actions(
     if run["status"] == "executing":
         run = await _complete_stage(
             session, run_id=run_id, current="executing", next_status="verifying",
-            updates={"action_outcome_counts": counts},
+            updates={"action_outcome_counts": counts, "counts": summary_counts},
         )
         await _stage_started(session, run_id, "verifying")
     if run["status"] == "verifying":
@@ -2000,11 +1701,19 @@ async def _reconcile_run_actions(
             return await _complete_stage(
                 session, run_id=run_id, current="verifying",
                 next_status="failed" if counts["failed"] else "partial",
-                updates={"action_outcome_counts": counts, "next_action": "resolve_action_failures"},
+                updates={
+                    "action_outcome_counts": counts,
+                    "counts": summary_counts,
+                    "next_action": "resolve_action_failures",
+                },
             )
         run = await _complete_stage(
             session, run_id=run_id, current="verifying", next_status="observing",
-            updates={"action_outcome_counts": counts, "observation_ids": observations},
+            updates={
+                "action_outcome_counts": counts,
+                "counts": summary_counts,
+                "observation_ids": observations,
+            },
         )
         await _stage_started(session, run_id, "observing")
     if run["status"] == "observing":
@@ -2013,11 +1722,91 @@ async def _reconcile_run_actions(
             session, run_id=run_id, current="observing", next_status=final,
             updates={
                 "action_outcome_counts": counts,
+                "counts": summary_counts,
                 "observation_ids": observations,
                 "next_action": "none" if final == "completed" else "resolve_action_failures",
             },
         )
     return run
+
+
+def _summarize_action_lifecycle(
+    run: dict[str, Any], actions: list[dict[str, Any]]
+) -> tuple[dict[str, int], dict[str, int], list[str]]:
+    outcome_counts = {
+        "completed": sum(a.get("status") == "completed" for a in actions),
+        "blocked": sum(a.get("status") == "blocked" for a in actions),
+        "failed": sum(a.get("status") in {"failed", "canceled"} for a in actions),
+    }
+    summary_counts = dict(run.get("counts") or {})
+    summary_counts.update(
+        {
+            "executed": outcome_counts["completed"],
+            "awaiting_approval": sum(
+                str(action.get("status") or "")
+                in {"planned", "previewed", "approved"}
+                for action in actions
+            ),
+            "failed": sum(action.get("status") == "failed" for action in actions),
+        }
+    )
+    observations = [
+        str(action["observation_id"])
+        for action in actions
+        if action.get("status") == "completed" and action.get("observation_id")
+    ]
+    return outcome_counts, summary_counts, observations
+
+
+async def _refresh_terminal_run_summary(
+    session: AsyncSession,
+    *,
+    run: dict[str, Any],
+    actions: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Backfill lifecycle counters for terminal Runs without changing outcome."""
+    outcome_counts, summary_counts, observations = _summarize_action_lifecycle(
+        run, actions
+    )
+    if (
+        run.get("counts") == summary_counts
+        and run.get("action_outcome_counts") == outcome_counts
+        and list(run.get("observation_ids") or []) == observations
+    ):
+        return {**run, "reconcile_replayed": True}
+    patch = {
+        "counts": summary_counts,
+        "action_outcome_counts": outcome_counts,
+        "observation_ids": observations,
+    }
+    row = (
+        await session.execute(
+            text(
+                """
+                UPDATE seo_agent.tasks
+                   SET decision = decision || CAST(:patch AS jsonb),
+                       updated_at = now()
+                 WHERE id = CAST(:run_id AS uuid)
+                   AND task_type = 'review'
+                   AND payload->>'kind' = :kind
+                   AND decision->>'status' = :status
+                RETURNING id::text AS id, payload, decision, created_at, updated_at,
+                          started_at, finished_at, error_message
+                """
+            ),
+            {
+                "run_id": run["run_id"],
+                "kind": RUN_KIND,
+                "status": run["status"],
+                "patch": json.dumps(patch, ensure_ascii=False),
+            },
+        )
+    ).mappings().first()
+    if not row:
+        await session.commit()
+        raise ValueError("strategy run changed concurrently or was not found")
+    await session.commit()
+    return {**_serialize_run(dict(row)), "reconcile_replayed": False}
 
 
 async def _advance_if_not_canceled(
@@ -2085,6 +1874,9 @@ def _summarize_plan(planned: dict[str, Any]) -> dict[str, Any]:
         "analysis_batch_id": planned.get("analysis_batch_id"),
         "plan_id": plan.get("id"),
         "counts": counts,
+        "stale_action_reconciliation": dict(
+            planned.get("stale_action_reconciliation") or {}
+        ),
         "site_results": decisions,
         "executable_decisions": executable_decisions,
     }
@@ -2111,30 +1903,17 @@ def _attach_action_bindings(
     coverage: dict[str, Any],
     plan: dict[str, Any],
 ) -> dict[str, Any]:
-    """Bind each selected site decision to the exact persisted seo_strategy row.
-
-    ``generate_strategies`` persists one ``seo_strategy`` task per selected
-    candidate, but the coverage matrix historically retained only the candidate
-    ID.  Unified Actions need the persisted task identity so approval, article
-    generation, publishing, and recovery all operate on the same immutable
-    decision rather than trying to rediscover a "latest" row later.
-    """
+    """Bind each executable AI proposal to its exact persisted Strategy row."""
     by_option = {
         str(item.get("option_id")): item
         for item in plan.get("items") or []
         if item.get("option_id") and item.get("id")
     }
-    by_candidate = {
-        str(item.get("candidate_id")): item
-        for item in plan.get("items") or []
-        if item.get("candidate_id") and item.get("id")
-    }
     decisions: list[dict[str, Any]] = []
     for raw in coverage.get("decisions") or []:
         decision = dict(raw)
         option_id = str(decision.get("selected_option_id") or "")
-        candidate_id = str(decision.get("selected_candidate_id") or "")
-        source = by_option.get(option_id) or by_candidate.get(candidate_id)
+        source = by_option.get(option_id)
         if source:
             action_type = str(
                 source.get("action_type")
@@ -2178,7 +1957,6 @@ def _attach_action_bindings(
                         if key
                         not in {
                             "id",
-                            "candidate_id",
                             "plan_id",
                             "status",
                             "created_at",
@@ -2208,7 +1986,6 @@ def _strategy_item_action(item: dict[str, Any]) -> dict[str, Any]:
             if key
             not in {
                 "id",
-                "candidate_id",
                 "plan_id",
                 "status",
                 "created_at",
@@ -2222,14 +1999,18 @@ def _restrict_plan_to_discovered_sites(
     planned: dict[str, Any],
     discovered_sites: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    """Keep planner coverage identical to the run's enabled-site discovery snapshot."""
+    """Require planner coverage to match the run's exact discovery snapshot."""
     discovered_ids = {str(site["id"]) for site in discovered_sites}
     coverage = dict(planned.get("coverage_matrix") or {})
-    decisions = [
-        decision
-        for decision in (coverage.get("decisions") or planned.get("decisions") or [])
-        if str(decision.get("site_id")) in discovered_ids
-    ]
+    decisions = list(coverage.get("decisions") or planned.get("decisions") or [])
+    planned_ids = {str(decision.get("site_id")) for decision in decisions}
+    outside_scope = sorted(planned_ids - discovered_ids)
+    if outside_scope:
+        raise StrategyContractError(
+            "SITE_OUT_OF_SCOPE",
+            "Planner returned site IDs outside the discovered Run scope: "
+            + ", ".join(outside_scope),
+        )
     return {
         **planned,
         "site_scope": discovered_sites,
@@ -2271,13 +2052,18 @@ def _serialize_run(row: dict[str, Any]) -> dict[str, Any]:
         "evidence_snapshot_id": decision.get("evidence_snapshot_id"),
         "evidence_snapshot": decision.get("evidence_snapshot"),
         "evidence_refreshes": decision.get("evidence_refreshes") or [],
-        "run_local_options": decision.get("run_local_options") or [],
-        "run_local_option_count": int(
-            decision.get("run_local_option_count") or 0
+        "research_portfolio": decision.get("research_portfolio") or [],
+        "research_portfolio_hash": decision.get("research_portfolio_hash"),
+        "research_revision": int(decision.get("research_revision") or 0),
+        "research_receipt": decision.get("research_receipt"),
+        "proposed_actions": decision.get("proposed_actions") or [],
+        "proposed_action_count": int(
+            decision.get("proposed_action_count") or 0
         ),
-        "run_local_option_submission": decision.get(
-            "run_local_option_submission"
-        ),
+        "proposed_action_hash": decision.get("proposed_action_hash"),
+        "proposed_action_receipt": decision.get("proposed_action_receipt"),
+        "reviewed_actions": decision.get("reviewed_actions") or [],
+        "zero_action_review": decision.get("zero_action_review"),
         "action_ids": decision.get("action_ids") or [],
         "source_audit_batch_id": decision.get("source_audit_batch_id"),
         "analysis_batch_id": decision.get("analysis_batch_id"),

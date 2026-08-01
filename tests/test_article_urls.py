@@ -1,4 +1,4 @@
-from app.core.article_urls import resolve_article_public_url
+from app.core.article_urls import is_content_openapi_site, resolve_article_public_url
 
 
 def test_oemapps_can_declare_an_explicit_canonical_template():
@@ -92,3 +92,4 @@ def test_known_content_openapi_uses_blog_slug_when_stored_template_is_stale():
         resolve_article_public_url(site, slug="bester-liquid-hersteller", article_id="12")
         == "https://topvapes.de/blog/bester-liquid-hersteller"
     )
+    assert is_content_openapi_site(site) is True

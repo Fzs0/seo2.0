@@ -353,7 +353,12 @@ def classify_outcome(
     return "neutral"
 
 
-async def load_scope_locks(session: AsyncSession, *, business_id: str) -> dict[str, str]:
+async def load_scope_locks(
+    session: AsyncSession,
+    *,
+    business_id: str,
+    exclude_strategy_run_id: str | None = None,
+) -> dict[str, str]:
     rows = await session.execute(
         text(
             """
@@ -365,7 +370,8 @@ async def load_scope_locks(session: AsyncSession, *, business_id: str) -> dict[s
                    payload->>'topic_relation' AS topic_relation,
                    COALESCE((payload->>'cannibalization_detected')::boolean, false)
                        AS cannibalization_detected,
-                   COALESCE((payload->>'cooldown_until')::timestamptz > now(), false) AS cooling
+                   COALESCE((payload->>'cooldown_until')::timestamptz > now(), false) AS cooling,
+                   false AS hard_active
               FROM seo_agent.tasks
              WHERE task_type = 'review' AND payload->>'kind' = 'strategy_effect'
                AND payload->>'business_id' = :business_id
@@ -378,13 +384,88 @@ async def load_scope_locks(session: AsyncSession, *, business_id: str) -> dict[s
                    payload#>>'{strategy,topic_relation}' AS topic_relation,
                    COALESCE((payload#>>'{strategy,cannibalization_detected}')::boolean, false)
                        AS cannibalization_detected,
-                   false AS cooling
+                   false AS cooling,
+                    true AS hard_active
               FROM seo_agent.tasks
              WHERE task_type IN ('new_article', 'update_article') AND status IN ('queued', 'running')
                AND payload#>>'{strategy,business_id}' = :business_id
+            UNION ALL
+            SELECT strategy.status, strategy.payload->>'scope_key' AS scope_key,
+                   strategy.payload->>'lock_scope' AS lock_scope,
+                   strategy.payload->>'lock_key' AS lock_key,
+                   strategy.decision->>'strategy_type' AS action,
+                   strategy.decision->>'target_url' AS target_url,
+                   NULL AS topic_relation,
+                   false AS cannibalization_detected,
+                   false AS cooling,
+                    true AS hard_active
+              FROM seo_agent.tasks strategy
+              JOIN seo_agent.tasks parent_run
+                ON parent_run.id=CAST(strategy.payload->>'strategy_run_id' AS uuid)
+               AND parent_run.task_type='review'
+               AND parent_run.payload->>'kind'='strategy_run'
+               AND parent_run.status IN ('queued', 'running', 'blocked')
+             WHERE strategy.task_type='review'
+               AND strategy.payload->>'kind'='seo_strategy'
+               AND strategy.payload->>'business_id'=:business_id
+               AND strategy.payload->>'schedule_class'='execute_now'
+               AND strategy.status IN ('queued', 'running', 'blocked')
+               AND (
+                    CAST(:exclude_strategy_run_id AS text) IS NULL
+                    OR strategy.payload->>'strategy_run_id'<>CAST(:exclude_strategy_run_id AS text)
+               )
+            UNION ALL
+            SELECT status,
+                   payload#>>'{strategy_decision,scope_key}' AS scope_key,
+                   payload#>>'{strategy_decision,lock_scope}' AS lock_scope,
+                   payload#>>'{strategy_decision,lock_key}' AS lock_key,
+                   payload->>'action_type' AS action,
+                   payload->>'target_url' AS target_url,
+                   NULL AS topic_relation,
+                   false AS cannibalization_detected,
+                    false AS cooling,
+                     CASE
+                       WHEN payload->>'correction_status'='resolved' THEN false
+                       WHEN status='blocked'
+                        AND payload->>'recovery_status' IN (
+                         'confirmed_not_applied','confirmed_absent'
+                       ) THEN false
+                      ELSE true
+                    END AS hard_active
+              FROM seo_agent.tasks
+             WHERE task_type='review'
+               AND payload->>'kind'='strategy_action'
+               AND payload->>'business_id'=:business_id
+               AND status IN ('queued', 'running', 'blocked')
+               AND (
+                    CAST(:exclude_strategy_run_id AS text) IS NULL
+                    OR payload->>'run_id'<>CAST(:exclude_strategy_run_id AS text)
+               )
+            UNION ALL
+            SELECT status, payload->>'scope_key' AS scope_key,
+                   payload->>'lock_scope' AS lock_scope,
+                   payload->>'lock_key' AS lock_key,
+                   payload->>'action_type' AS action,
+                   payload->>'target_url' AS target_url,
+                   NULL AS topic_relation,
+                   false AS cannibalization_detected,
+                   false AS cooling,
+                   true AS hard_active
+              FROM seo_agent.tasks
+             WHERE task_type='effect_check'
+               AND payload->>'kind'='strategy_action_observation'
+               AND payload->>'business_id'=:business_id
+               AND status IN ('queued', 'running')
+               AND (
+                    CAST(:exclude_strategy_run_id AS text) IS NULL
+                    OR payload->>'run_id'<>CAST(:exclude_strategy_run_id AS text)
+               )
             """
         ),
-        {"business_id": business_id},
+        {
+            "business_id": business_id,
+            "exclude_strategy_run_id": exclude_strategy_run_id,
+        },
     )
     locks: dict[str, str] = {}
     for row in rows.mappings().all():
@@ -392,7 +473,9 @@ async def load_scope_locks(session: AsyncSession, *, business_id: str) -> dict[s
         lock_key = str(row.get("lock_key") or row["scope_key"] or "")
         if not lock_key or lock_scope == "unresolved_url":
             continue
-        if row["status"] in {"queued", "running"} and not row["target_url"]:
+        if bool(row.get("hard_active")) or (
+            row["status"] in {"queued", "running"} and not row["target_url"]
+        ):
             locks[lock_key] = "同一页面或意图已有策略正在执行或观察"
         elif row["action"] == "update_article" and row["cooling"]:
             locks[lock_key] = "同一页面仍在 28 天更新冷却期"

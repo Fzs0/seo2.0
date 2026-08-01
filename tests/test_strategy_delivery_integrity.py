@@ -14,7 +14,6 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 REQUIRED_SERVICE_MODULES = (
-    "app.services.strategy_decision_service",
     "app.services.strategy_evidence_refresh_service",
     "app.services.strategy_hold_service",
     "app.services.strategy_on_page_execution",
@@ -26,7 +25,6 @@ REQUIRED_MIGRATIONS = (
 )
 
 REQUIRED_FEATURE_TESTS = (
-    "tests/test_strategy_decision_service.py",
     "tests/test_strategy_evidence_refresh_service.py",
     "tests/test_strategy_hold_service.py",
     "tests/test_strategy_on_page_execution.py",

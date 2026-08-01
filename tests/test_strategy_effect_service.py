@@ -297,6 +297,36 @@ async def test_scope_locks_release_expired_url_and_topic_observation() -> None:
 
 
 @pytest.mark.asyncio
+async def test_scope_locks_ignore_execute_now_strategy_whose_parent_run_is_terminal() -> None:
+    class Session:
+        async def execute(self, statement, _params=None):
+            sql = str(statement)
+            if "parent_run.status IN ('queued', 'running', 'blocked')" in sql:
+                return Result([])
+            return Result([
+                {
+                    "status": "queued",
+                    "scope_key": "stale-parent-run-lock",
+                    "lock_scope": "url",
+                    "lock_key": "stale-parent-run-lock",
+                    "action": "update_article",
+                    "target_url": "https://example.com/blog/stale",
+                    "topic_relation": None,
+                    "cannibalization_detected": False,
+                    "cooling": False,
+                    "hard_active": True,
+                }
+            ])
+
+    locks = await service.load_scope_locks(  # type: ignore[arg-type]
+        Session(),
+        business_id="business",
+    )
+
+    assert "stale-parent-run-lock" not in locks
+
+
+@pytest.mark.asyncio
 async def test_url_cooldown_does_not_lock_an_unrelated_url_on_the_same_site() -> None:
     url_a = service.strategy_identity(
         "business", site_id="site", post_id="post-a", target_url="https://example.com/blog/a",

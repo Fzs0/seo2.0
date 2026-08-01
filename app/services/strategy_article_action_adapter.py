@@ -14,13 +14,17 @@ from datetime import UTC, datetime, timedelta
 from html import unescape
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
-from app.clients.publishers import ImageUploadRequest, connector_for_site
+from app.core.article_urls import is_content_openapi_site
+from app.clients.publishers import (
+    ImageUploadRequest,
+    validate_content_openapi_markdown,
+)
 from app.services.article_generation_service import _qa, _slug
 from app.services.article_service import save_article
 from app.services.publish_service import publish_article
@@ -31,7 +35,8 @@ from app.services.strategy_effect_service import (
     mark_effect_published,
 )
 from app.services.site_capability_service import get_site_capabilities
-from app.services.strategy_action_service import SQLActionStore
+from app.services.strategy_action_service import SQLActionStore, compare_readback_fields
+from app.services.site_media_service import resolve_site_media_uploader
 
 
 ARTICLE_ACTIONS = frozenset({"new_article", "update_article"})
@@ -66,7 +71,11 @@ class StrategyArticleActionAdapter:
             }
         try:
             context = await _load_action_context(self.session, action)
-            proposed = canonical_article_patch(patch)
+            cover_image_id_required = _cover_image_id_required(action)
+            proposed = canonical_article_patch(
+                patch,
+                cover_image_id_required=cover_image_id_required,
+            )
             _validate_article_patch(
                 proposed,
                 keyword=str(
@@ -78,6 +87,8 @@ class StrategyArticleActionAdapter:
                     (context.get("strategy_decision") or {}).get("internal_link_plan")
                     or []
                 ),
+                cover_image_id_required=cover_image_id_required,
+                site=context.get("site") or {},
             )
             proposed = _capability_filtered_article_patch(action, proposed)
         except ValueError as error:
@@ -100,8 +111,10 @@ class StrategyArticleActionAdapter:
                 "block_reason": "dry_run_actions_cannot_execute",
             }
         context = await _load_action_context(self.session, action)
+        cover_image_id_required = _cover_image_id_required(action)
         patch = canonical_article_patch(
-            dict(action.get("approved_patch") or action.get("proposed_patch") or {})
+            dict(action.get("approved_patch") or action.get("proposed_patch") or {}),
+            cover_image_id_required=cover_image_id_required,
         )
         _validate_article_patch(
             patch,
@@ -114,6 +127,8 @@ class StrategyArticleActionAdapter:
                 (context.get("strategy_decision") or {}).get("internal_link_plan")
                 or []
             ),
+            cover_image_id_required=cover_image_id_required,
+            site=context.get("site") or {},
         )
 
         execution_id = await _ensure_approved_execution(
@@ -221,7 +236,7 @@ class StrategyArticleActionAdapter:
             site=context["site"],
             remote_id=str(published.get("post_id") or update_remote_id or ""),
         )
-        readback = normalize_remote_article(remote or {})
+        readback = normalize_article_readback(remote or {}, site=context["site"])
         await self.session.commit()
         return {
             "result": (
@@ -234,6 +249,7 @@ class StrategyArticleActionAdapter:
             "submitted_patch": patch,
             "remote_response": published,
             "readback": readback,
+            "read_only_fields": _article_read_only_fields(context["site"]),
             "article_id": article_id,
             "execution_task_id": execution_id,
             "publish_task_id": published.get("task_id"),
@@ -243,6 +259,30 @@ class StrategyArticleActionAdapter:
 
     async def recover(self, action: dict[str, Any]) -> dict[str, Any]:
         try:
+            if (
+                action.get("recovery_status")
+                in {
+                    "unknown_remote_state",
+                    "partially_applied",
+                    "confirmed_not_applied",
+                }
+                and await _has_confirmed_prewrite_failure(self.session, action)
+            ):
+                await _close_confirmed_prewrite_lineage(self.session, action)
+                return {
+                    "recovery_status": "confirmed_not_applied",
+                    "submitted_patch": dict(
+                        action.get("approved_patch")
+                        or action.get("proposed_patch")
+                        or {}
+                    ),
+                    "remote_response": {
+                        "remote_outcome": "confirmed_not_applied",
+                        "reconciled_without_remote_write": True,
+                        "evidence": "persisted_local_prewrite_guard",
+                    },
+                    "readback": {},
+                }
             context = await _load_action_context(self.session, action)
             execution_id = str(action.get("execution_task_id") or "")
             remote_id = (
@@ -292,14 +332,44 @@ class StrategyArticleActionAdapter:
             )
             if not remote:
                 return {"recovery_status": "confirmed_absent"}
-            readback = normalize_remote_article(remote)
+            readback = normalize_article_readback(remote, site=context["site"])
             proposed = canonical_article_patch(
-                dict(action.get("approved_patch") or action.get("proposed_patch") or {})
+                dict(action.get("approved_patch") or action.get("proposed_patch") or {}),
+                cover_image_id_required=_cover_image_id_required(action),
             )
-            matches = all(
-                _semantic_value(field, proposed.get(field))
-                == _semantic_value(field, readback.get(field))
-                for field in proposed
+            read_only_fields = _article_read_only_fields(context["site"])
+            differences = compare_readback_fields(
+                proposed,
+                proposed,
+                readback,
+                read_only_fields=set(read_only_fields),
+                media_transport=_article_media_transport(action),
+                canonical_hosts=set(
+                    (action.get("capability_snapshot") or {}).get(
+                        "canonical_hosts"
+                    )
+                    or ()
+                ),
+            )
+            matches = bool(differences) and all(
+                item.get("match") is True for item in differences
+            )
+            before_snapshot = dict(action.get("before_snapshot") or {})
+            before_differences = compare_readback_fields(
+                before_snapshot,
+                before_snapshot,
+                readback,
+                read_only_fields=set(read_only_fields),
+                media_transport=_article_media_transport(action),
+                canonical_hosts=set(
+                    (action.get("capability_snapshot") or {}).get(
+                        "canonical_hosts"
+                    )
+                    or ()
+                ),
+            )
+            unchanged = bool(before_differences) and all(
+                item.get("match") is True for item in before_differences
             )
             reconciliation: dict[str, Any] = {}
             if matches:
@@ -311,18 +381,27 @@ class StrategyArticleActionAdapter:
                     readback=readback,
                 )
             return {
-                "recovery_status": "confirmed_applied"
-                if matches
-                else "partially_applied",
+                "recovery_status": (
+                    "confirmed_applied"
+                    if matches
+                    else "confirmed_not_applied"
+                    if unchanged
+                    else "partially_applied"
+                ),
                 "result": "updated"
                 if action.get("action_type") == "update_article"
                 else "created",
                 "submitted_patch": proposed,
                 "readback": readback,
+                "read_only_fields": read_only_fields,
                 "remote_response": {
                     "remote_id": remote_id,
                     "remote_outcome": (
-                        "confirmed_applied" if matches else "partially_applied"
+                        "confirmed_applied"
+                        if matches
+                        else "confirmed_not_applied"
+                        if unchanged
+                        else "partially_applied"
                     ),
                     "reconciled_without_remote_write": matches,
                 },
@@ -506,7 +585,7 @@ async def upload_strategy_article_image(
         await session.execute(
             text(
                 """
-                SELECT id, site_key, name, site_type, domain, base_url,
+                SELECT id, business_id, site_key, name, site_type, domain, base_url,
                        api_base_url, status, api_config
                   FROM seo_agent.sites
                  WHERE id=CAST(:id AS uuid)
@@ -515,11 +594,28 @@ async def upload_strategy_article_image(
             {"id": action["site_id"]},
         )
     ).mappings().first()
-    if not row or row["status"] != "active":
-        raise ValueError("strategy media target site is not active")
-    connector = connector_for_site(dict(row), dry_run=dry_run)
     try:
-        result = await connector.upload_image(request)
+        if not row or row["status"] != "active":
+            raise ValueError("strategy media target site is not active")
+        media = await resolve_site_media_uploader(
+            session,
+            dict(row),
+            dry_run=dry_run,
+            require_active=not dry_run,
+        )
+    except Exception as error:
+        action = await store.get(action_id, lock=True)
+        receipts = dict(action.get("media_upload_receipts") or {})
+        receipts[idempotency_key] = {
+            "request_hash": request_hash,
+            "status": "failed",
+            "error_type": type(error).__name__,
+        }
+        action["media_upload_receipts"] = receipts
+        await store.save(action)
+        raise ValueError(str(error)) from error
+    try:
+        result = await media.publisher.upload_image(request)
     except Exception as error:
         action = await store.get(action_id, lock=True)
         receipts = dict(action.get("media_upload_receipts") or {})
@@ -548,6 +644,9 @@ async def upload_strategy_article_image(
         "dry_run": result.dry_run,
         "site_id": str(action["site_id"]),
         "action_id": action_id,
+        "media_host_site_id": str(media.media_host_site["id"]),
+        "media_host_site_key": media.media_host_site.get("site_key"),
+        "media_transport": media.transport,
         "image_id": result.image_id,
         "src": result.src,
         "raw": result.raw,
@@ -625,6 +724,12 @@ async def _build_article_generation_context(
             if image_patch_supported or cover_patch_supported
             else None
         ),
+        "media_transport": _article_media_transport(action),
+        "accepted_media_inputs": (
+            ["url", "file", "base64"]
+            if image_patch_supported or cover_patch_supported
+            else []
+        ),
         "next_step": f"POST /api/v1/strategy-actions/{action_id}/preview",
     }
 
@@ -674,6 +779,11 @@ async def _load_action_context(
     strategy_task_id = str(action.get("source_strategy_task_id") or "")
     if not strategy_task_id:
         raise ValueError("strategy action is not bound to a persisted seo_strategy")
+    target_post_id: str | None = None
+    try:
+        target_post_id = str(UUID(str(action.get("target_asset_id") or "")))
+    except (AttributeError, TypeError, ValueError):
+        target_post_id = None
     row = (
         await session.execute(
             text(
@@ -682,7 +792,7 @@ async def _load_action_context(
                        strategy.status AS strategy_status,
                        strategy.decision AS strategy_decision,
                        strategy.keyword_id::text AS keyword_id,
-                       strategy.post_id::text AS post_id,
+                       post.id::text AS post_id,
                        strategy.article_id::text AS source_article_id,
                        site.id::text AS site_id, site.business_id, site.site_key,
                        site.name, site.site_type, site.domain, site.base_url,
@@ -699,19 +809,32 @@ async def _load_action_context(
                        post.raw AS post_raw
                   FROM seo_agent.tasks strategy
                   JOIN seo_agent.sites site ON site.id=strategy.site_id
-                  LEFT JOIN seo_agent.posts post
-                    ON post.id=strategy.post_id AND post.site_id=strategy.site_id
+                   LEFT JOIN seo_agent.posts post
+                     ON post.id=COALESCE(
+                          strategy.post_id, CAST(:target_post_id AS uuid)
+                        )
+                    AND post.site_id=strategy.site_id
                  WHERE strategy.id=CAST(:strategy_task_id AS uuid)
                    AND strategy.task_type='review'
                    AND strategy.payload->>'kind'='seo_strategy'
                 """
             ),
-            {"strategy_task_id": strategy_task_id},
+            {
+                "strategy_task_id": strategy_task_id,
+                "target_post_id": target_post_id,
+            },
         )
     ).mappings().first()
     if not row:
         raise ValueError("bound seo_strategy task not found")
     context = dict(row)
+    if (
+        action.get("action_type") == "update_article"
+        and not context.get("post_external_id")
+    ):
+        context["post_external_id"] = (
+            str(action.get("remote_object_id") or "").strip() or None
+        )
     if (
         str(context["site_id"]) != str(action.get("site_id"))
         or str(context["business_id"]) != str(action.get("business_id"))
@@ -743,7 +866,11 @@ async def _load_action_context(
     return context
 
 
-def canonical_article_patch(patch: dict[str, Any]) -> dict[str, Any]:
+def canonical_article_patch(
+    patch: dict[str, Any],
+    *,
+    cover_image_id_required: bool = True,
+) -> dict[str, Any]:
     unsupported = set(patch) - ARTICLE_FIELDS
     if unsupported:
         raise ValueError(f"article patch contains forbidden fields: {sorted(unsupported)}")
@@ -763,15 +890,16 @@ def canonical_article_patch(patch: dict[str, Any]) -> dict[str, Any]:
         cover_alt = str(raw_cover.get("alt") or "").strip()
         if not cover_src.startswith(("http://", "https://")):
             raise ValueError("cover_image src must be an absolute HTTP URL")
-        if not cover_id.isdigit():
+        if cover_image_id_required and not cover_id.isdigit():
             raise ValueError("cover_image image_id must be a numeric media ID")
         if not cover_alt:
             raise ValueError("cover_image alt is required")
         cover_image = {
-            "image_id": cover_id,
             "src": cover_src,
             "alt": cover_alt,
         }
+        if cover_id:
+            cover_image["image_id"] = cover_id
 
     images: list[str] = []
     alts: dict[str, str] = {}
@@ -822,7 +950,8 @@ def _image_patch_supported(action: dict[str, Any]) -> bool:
     return (
         {"images", "image_alts"} <= fields
         and images.get("status") == "available"
-        and images.get("upload") is True
+        and images.get("write") is True
+        and (images.get("upload") is True or images.get("ingest") is True)
     )
 
 
@@ -837,8 +966,106 @@ def _cover_patch_supported(action: dict[str, Any]) -> bool:
     return (
         "cover_image" in fields
         and images.get("status") == "available"
-        and images.get("upload") is True
+        and images.get("write") is True
+        and (images.get("upload") is True or images.get("ingest") is True)
     )
+
+
+def _article_media_ingest_supported(action: dict[str, Any]) -> bool:
+    capability = action.get("capability_snapshot")
+    if not isinstance(capability, dict):
+        return False
+    images = (capability.get("connectors") or {}).get("images") or {}
+    return (
+        images.get("status") == "available"
+        and images.get("write") is True
+        and images.get("ingest") is True
+        and str(images.get("transport") or "").endswith("article_publish")
+    )
+
+
+def _article_media_transport(action: dict[str, Any]) -> str | None:
+    capability = action.get("capability_snapshot")
+    if not isinstance(capability, dict):
+        return None
+    images = (capability.get("connectors") or {}).get("images") or {}
+    transport = str(images.get("transport") or "").strip()
+    if transport:
+        return transport
+    return "direct_upload" if images.get("upload") is True else None
+
+
+def _article_read_only_fields(site: dict[str, Any]) -> list[str]:
+    # The self-hosted content API exposes one article title only.  Its public
+    # template derives the document <title> from that value; a separate
+    # meta-title cannot be written or independently read back.
+    return ["meta_title"] if is_content_openapi_site(site) else []
+
+
+async def _has_confirmed_prewrite_failure(
+    session: AsyncSession, action: dict[str, Any]
+) -> bool:
+    """Recognize persisted local guards that failed before a remote call."""
+    row = (
+        await session.execute(
+            text(
+                """
+                SELECT payload->>'raw_error' AS raw_error
+                  FROM seo_agent.tasks
+                 WHERE task_type='review'
+                   AND payload->>'kind'='strategy_exception'
+                   AND payload->>'action_id'=:action_id
+                   AND payload->>'error_code'='ACTION_CONNECTOR_ERROR'
+                 ORDER BY updated_at DESC
+                 LIMIT 1
+                """
+            ),
+            {"action_id": str(action.get("action_id") or "")},
+        )
+    ).mappings().first()
+    return str((row or {}).get("raw_error") or "") in {
+        "update publish must use the remote ID approved by the seo_strategy execution",
+        "article published_post_id does not match the approved update target",
+        "article is not linked to a human-approved seo_strategy execution",
+        "new article strategy cannot publish as an update",
+    }
+
+
+async def _close_confirmed_prewrite_lineage(
+    session: AsyncSession, action: dict[str, Any]
+) -> None:
+    execution = (
+        await session.execute(
+            text(
+                """
+                UPDATE seo_agent.tasks
+                   SET status='failed',
+                       error_message='confirmed local pre-write failure; remote writer was not called',
+                       decision=decision || jsonb_build_object(
+                         'remote_outcome','confirmed_not_applied'
+                       ),
+                       finished_at=COALESCE(finished_at, now()),
+                       updated_at=now()
+                 WHERE task_type IN ('new_article','update_article')
+                   AND payload->>'strategy_action_id'=:action_id
+                   AND status IN ('queued','running')
+                 RETURNING id::text AS id
+                """
+            ),
+            {"action_id": str(action.get("action_id") or "")},
+        )
+    ).mappings().first()
+    if execution:
+        await cancel_unpublished_effect(
+            session,
+            execution_task_id=str(execution["id"]),
+            reason="confirmed local pre-write failure; remote writer was not called",
+        )
+    await session.commit()
+
+
+def _cover_image_id_required(action: dict[str, Any]) -> bool:
+    return not _article_media_ingest_supported(action)
 
 
 def _capability_filtered_article_patch(
@@ -859,6 +1086,8 @@ def _validate_article_patch(
     *,
     keyword: str,
     internal_link_plan: list[dict[str, Any]],
+    cover_image_id_required: bool = True,
+    site: dict[str, Any] | None = None,
 ) -> None:
     if len(patch["title"]) < 8:
         raise ValueError("article title is too short")
@@ -870,6 +1099,8 @@ def _validate_article_patch(
         raise ValueError("article body must contain at least 1200 characters")
     if len(re.findall(r"^#\s+.+$", patch["body"], re.M)) != 1:
         raise ValueError("article body must contain exactly one Markdown H1")
+    if is_content_openapi_site(site or {}):
+        validate_content_openapi_markdown(patch["body"])
     for src in patch["images"]:
         if src not in patch["body"]:
             raise ValueError(f"article image is not inserted in the body: {src}")
@@ -878,11 +1109,14 @@ def _validate_article_patch(
     cover_image = patch.get("cover_image")
     if cover_image and (
         not str(cover_image.get("src") or "").startswith(("http://", "https://"))
-        or not str(cover_image.get("image_id") or "").isdigit()
+        or (
+            cover_image_id_required
+            and not str(cover_image.get("image_id") or "").isdigit()
+        )
         or not str(cover_image.get("alt") or "").strip()
     ):
         raise ValueError(
-            "cover_image requires uploaded src, numeric image_id, and alt"
+            "cover_image requires an absolute src, alt, and connector-specific media identity"
         )
     checks = _qa(
         patch["body"],
@@ -942,6 +1176,13 @@ async def _ensure_approved_execution(
     if action.get("run_mode") != "approval_execution":
         raise ValueError("dry-run Strategy Actions cannot create execution records")
     source_strategy_task_id = str(action["source_strategy_task_id"])
+    approved_post_id = (
+        str(context.get("post_id") or "").strip()
+        if action.get("action_type") == "update_article"
+        else ""
+    )
+    if action.get("action_type") == "update_article" and not approved_post_id:
+        raise ValueError("approved update target has no local post identity")
     await session.execute(
         text("SELECT pg_advisory_xact_lock(hashtext(:key))"),
         {"key": f"strategy-action-execution:{action['action_id']}"},
@@ -950,7 +1191,7 @@ async def _ensure_approved_execution(
         await session.execute(
             text(
                 """
-                SELECT id::text AS id
+                SELECT id::text AS id, post_id::text AS post_id
                   FROM seo_agent.tasks
                  WHERE task_type IN ('new_article','update_article')
                    AND payload->>'strategy_action_id'=:action_id
@@ -962,6 +1203,21 @@ async def _ensure_approved_execution(
         )
     ).mappings().first()
     if existing:
+        existing_post_id = str(existing.get("post_id") or "").strip()
+        if approved_post_id and existing_post_id and existing_post_id != approved_post_id:
+            raise ValueError("existing execution target no longer matches the approved article")
+        if approved_post_id and not existing_post_id:
+            await session.execute(
+                text(
+                    """
+                    UPDATE seo_agent.tasks
+                       SET post_id=COALESCE(post_id, CAST(:post_id AS uuid)),
+                           updated_at=now()
+                     WHERE id=CAST(:id AS uuid)
+                    """
+                ),
+                {"id": existing["id"], "post_id": approved_post_id},
+            )
         await session.commit()
         return str(existing["id"])
 
@@ -1033,7 +1289,7 @@ async def _ensure_approved_execution(
             "score": strategy["score"] or 0,
             "site_id": strategy["site_id"],
             "keyword_id": strategy["keyword_id"],
-            "post_id": strategy["post_id"],
+            "post_id": approved_post_id or strategy["post_id"],
             "article_id": strategy["article_id"],
             "title": f"Strategy Action: {strategy['title']}",
             "target_url": target_url,
@@ -1063,7 +1319,8 @@ async def _ensure_approved_execution(
     )
     decision.update(
         {
-            "review_status": "approved_via_strategy_action",
+            "review_status": "approved",
+            "approval_source": "strategy_action",
             "execution_task_id": execution_id,
             "execution_status": "running",
         }
@@ -1488,6 +1745,23 @@ def normalize_remote_article(remote: dict[str, Any]) -> dict[str, Any]:
         "image_alts": images,
         "cover_image": cover_image,
     }
+
+
+def normalize_article_readback(
+    remote: dict[str, Any], *, site: dict[str, Any]
+) -> dict[str, Any]:
+    """Apply connector-specific derived fields to the common readback shape."""
+    readback = normalize_remote_article(remote)
+    if (
+        is_content_openapi_site(site)
+        and not readback.get("meta_title")
+        and readback.get("title")
+    ):
+        # This API has no separate meta-title field.  Its public template builds
+        # the document title from the article title, so that title is the only
+        # remotely writable and verifiable SEO-title value.
+        readback["meta_title"] = readback["title"]
+    return readback
 
 
 def _extract_cover_image(remote: dict[str, Any]) -> dict[str, str] | None:

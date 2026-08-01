@@ -1,6 +1,14 @@
 # SEO Workbench 项目进度
 
-更新时间：2026-07-30（Asia/Shanghai）
+2026-08-01 AI Hold 判断已收紧为 URL/主题级：Research Portfolio 不再接受泛化
+动作类别冒充机会；每个机会必须绑定具体 URL/对象或 `intent_key + topic_cluster`，
+并记录逐项结果。即使组合中其他站点存在可执行动作，后端仍会独立审查每个 Hold
+站点；存在未调度的合格机会、未覆盖现有页面/新主题、未穷尽机会 ID，或把目标
+冷却扩大为整站冷却时，统一返回 `research_revision_required`。契约版本为
+`ai-led-strategy-v2`，无数据库 migration。详细说明见
+`docs/AI_URL_TOPIC_COOLDOWN_DECISION_CONTRACT_2026-08-01.md`。
+
+更新时间：2026-07-31（Asia/Shanghai）
 
 2026-07-30 AI On-page 统一 Action 已完成后端接入：AI 仍以 `on_page_fix`
 提交编辑决策，Formal Plan 转换为具体首页、产品、分类或图片 ALT Action；新增
@@ -34,13 +42,57 @@ On-page 旁路保持退役，前端未修改，仍为只读看板。Custom OpenA
 | 主站电商 SEO 内容分层 | 已实现只读 V1 | 可查看产品页/分类页/支持文章职责；主站文章候选和生文尚未接入 |
 | 自定义商品数据连接器 | 后端已实现并完成本地验证 | 通用连接器保持只读；支持配置、样例预览、真实请求测试、版本、激活、分页同步和 SEO 缺口审计；尚未制作前端配置页 |
 | 自建站 OEMApps 商品接口 | 后端已实现，待站点配置验收 | 所有自建站共用内置读取/修改协议，每站只配置 Token；SEO 修改要求预览、快照确认、单商品 PUT、审计和回读；Shopify 暂缓 |
-| SEO 自主运营后端 V2 | 人工审批执行版已实现 | PostgreSQL 17、完整 Strategy Run、全站覆盖、能力快照、统一 Action、执行租约、平台回读、异常脱敏和效果观察已接入；生产真实写 adapter 仍受认证与业务授权门禁阻塞 |
+| SEO 自主运营后端 V2 | 本机人工审批执行版已实现 | PostgreSQL 17、完整 Strategy Run、全站覆盖、能力快照、统一 Action、执行租约、平台回读、异常脱敏和效果观察已接入；本机回环操作员模式可用，共享或对外部署仍受认证与业务授权门禁阻塞 |
 | 正式策略执行链 | 代码与 PG17 门禁已收口 | Action 执行/恢复到终态后自动推动父级 Run 完成验证、观察和收口；`/reconcile` 仅作为幂等人工兜底，不再依赖第二次 `/start` |
 | 内容审计长任务 | 已改为异步可轮询 | POST 快速返回批次，同业务进行中任务自动复用；客户端超时不再等同于审计失败 |
 | Strategy Run 启动 | SQL 根因已修复，待受控重放 | PG17 参数类型、同键重放、冲突检测和失败标记清理已通过真实数据库测试；原三个 queued Run 尚未重放 |
 | 当前运行环境 | 本轮源码已加载并通过指纹校验 | 本地 8000 后端健康，`source_drift=false`；后续源码变化必须重启 |
 
 当前最近的安全动作是：先对 HealthyOxy、Avinoti、Exdivo 现有三个 queued Strategy Run 做一次受控重放，只检查事件、站点覆盖矩阵、能力快照和 Action 预览，不批准或执行远端写入。三站回读通过后，再选择 1 条低风险动作进行人工审批验收。真实回读完成前，不能把 V2 描述为全自动生产上线。
+
+### 2026-07-31 文章 Action 审批发布契约修复
+
+- 修复 `_ensure_approved_execution` 与 `publish_service._approved_execution`
+  的审批枚举错配：正式 Strategy Action 现在沿用发布链既有的
+  `review_status=approved`，并通过 `approval_source=strategy_action` 保留审批来源。
+  Run、Plan、Action、审批、执行、发布和回读顺序均未改变。
+- 新增真实 PostgreSQL 17 回归测试，直接执行审批台账创建后再调用现有发布门禁；
+  修复前稳定返回 `None`，修复后能按相同 Action/Run 身份回读审批。
+- 验证：定向回归 `44 passed`；主项目全量 `625 passed, 26 skipped`；
+  PG17 发布门禁 `24 passed`；Python 编译和 `git diff --check` 通过。PG17 使用
+  一次性测试库，未连接生产数据库、未执行远端文章或页面写入。
+- 本机后端已重启并加载当前工作区源码，PID `29928`，`source_drift=false`。
+- 用户已明确授权本机回环操作员边界；`execute-seo-strategy` 升级为合同 1.7，
+  只有在 `env=local`、源码无漂移、精确 business/site 范围和完整 Action 门禁
+  均通过时，才不会因共享部署认证尚未完成而统一 Hold。对外部署门禁未放宽。
+- Skill 新增确定性本机边界验证器，实际回读当前监听仅为
+  `127.0.0.1:8000`、PID 与健康接口一致、`env=local`、`source_drift=false`；
+  使用错误端口的负向测试被稳定拒绝。Skill 合同、日志自检和官方快速验证均通过。
+
+### 2026-07-31 AI 主导策略正式链路收口
+
+- 新增 `AutonomousStrategyOrchestrator`，正式入口统一为逐站
+  Research Portfolio、AI Proposed Actions 和 Zero Action Review；后端只做范围、
+  精确目标、能力、受保护字段、风险、冲突、幂等和安全容量门禁，不再替 AI 选题。
+- 删除 `run-local-options` 生产路由和旧候选转计划逻辑；候选池仅保留历史只读查询。
+  新 Research、Strategy 和 Action 拒绝 `candidate_id`，`keyword_id` 仅能作为通用
+  evidence reference。
+- 调度保留所有合格动作；`action_budget` 仅作为失控保护，容量外动作进入 Deferred。
+  每站当前波次最多一个远程写 Action，调用方不能通过更高站点配额扩大上限。
+- 精确 scope lock 同时覆盖 Formal Strategy、Unified Action 和 Observation；同站
+  不同 URL/意图互不阻塞。越界 site_id 返回 `SITE_OUT_OF_SCOPE`，不再静默丢弃。
+- Zero Action Review 能要求第二证据通道、允许证据充分的全量 Hold，并在连续两次
+  证据和理由无实质变化时创建 `STRATEGY_STAGNATION`。
+- `execute-seo-strategy` 已升级为合同 1.8，运行日志改为 Research Portfolio/研究
+  方向合同，候选池不再是新 Run 的研究来源。Skill 合同、日志自检和官方快速验证通过。
+- 产品决定暂缓地区化实时 SERP/SEMrush GUI 自动采集；在目标地区、语言、设备和
+  采集网络明确前不混用不同地区结果。本轮继续支持统一 Evidence Adapter 和固定快照。
+- 验证：主项目离线全量 `580 passed, 31 skipped`；PostgreSQL 17.10 发布门禁
+  `29 passed`；Skill 三项验证全部通过；未执行生产远端写入。
+- 真实只读回读：OEMApps、WordPress、Shopify、Custom OpenAPI 均找到目标文章。
+  验收期间发现并修复 WordPress/Custom OpenAPI 运行时凭据未装配及 OEMApps
+  Adapter 优先级问题。一次诊断命令曾把本机配置凭据带入工具输出，已记录为 P1；
+  必须轮换相关 WordPress Application Password 和博客 Open API Key 后复验。
 
 ### 2026-07-30 正式 Strategy 生命周期收口
 
@@ -527,3 +579,18 @@ Get-Item 'E:\Keywords\vape_pages_2026-06-25-US.xlsx'
   `seo_workbench` 修复 4 条活动记录，活动状态残留计数为 0。
 - 验证：相关模块 `121 passed`；全量 `589 passed, 17 skipped`；PG17 门禁
   `15 passed`；后端重启后 `source_drift=false`；无远端文章写入。
+## 2026-07-31 AI 主导 SEO 正式链路最终验收
+
+- 用户明确授权先使用现有 WordPress Application Password 和博客 Open API Key
+  完成目标，凭据轮换延后到目标完成后执行；该风险记录为
+  `risk_accepted_temporarily`，未伪装为已解决。
+- 四平台真实远端只读文章回读重新通过：OEMApps `2626471`、WordPress `1869`、
+  Shopify `gid://shopify/Article/573653745777`、Custom OpenAPI `22`。
+- 全部验收调用均为本机 `GET /api/v1/sites/{site_id}/articles/lookup`；未执行远程
+  PUT、POST、文章发布、媒体上传或数据库写入。
+- 全量离线测试：`580 passed, 31 skipped`。
+- PostgreSQL 17 发布门禁：`29 passed`。
+- Skill 合同、日志自检、官方快速校验和本机操作边界均通过。
+- 本机正式健康路径为 `/api/health`；`/health` 返回 404 不代表服务异常。
+- 地区化实时 SERP、SEMrush GUI 和 Computer Use 采集继续按用户决定暂缓，不作为
+  当前上线门禁。

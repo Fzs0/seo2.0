@@ -4,7 +4,7 @@ import base64
 
 import pytest
 
-from app.clients.publishers import ImageUploadRequest, OpenAPIPublisher, PublishRequest, ShopifyPublisher, WordPressPublisher, _oemapps_published_date, markdown_to_gutenberg, oemapps_html_from_markdown, strip_markdown_frontmatter
+from app.clients.publishers import ImageUploadRequest, OpenAPIPublisher, PublishRequest, ShopifyPublisher, WordPressPublisher, _oemapps_published_date, markdown_to_gutenberg, oemapps_html_from_markdown, strip_markdown_frontmatter, validate_content_openapi_markdown
 from app.clients.http_client import ExternalCallError
 from app.connectors.safe_http import BinaryHttpResponse
 
@@ -154,7 +154,15 @@ async def test_openapi_publisher_posts_batch_json(monkeypatch):
     )
 
     result = await publisher.publish(
-        PublishRequest(title='Hello', slug='hello', content_md='---\ntitle: Other\n---\n\n# Body', status='publish')
+        PublishRequest(
+            title='Hello',
+            slug='hello',
+            content_md=(
+                '---\ntitle: Other\n---\n\n# Hello\n\n'
+                'Intro paragraph.\n\n# Competing section'
+            ),
+            status='publish',
+        )
     )
 
     assert result.ok is True
@@ -163,7 +171,9 @@ async def test_openapi_publisher_posts_batch_json(monkeypatch):
     assert called['headers'] == {'X-API-Key': 'key-1', 'Host': 'api.example.com'}
     assert called['json']['items'][0]['slug'] == 'hello'
     assert called['json']['items'][0]['status'] == 'published'
-    assert called['json']['items'][0]['content_md'] == '# Body'
+    assert called['json']['items'][0]['content_md'] == (
+        'Intro paragraph.\n\n## Competing section'
+    )
 
 
 @pytest.mark.asyncio
@@ -595,7 +605,15 @@ async def test_openapi_publisher_updates_one_post(monkeypatch):
         dry_run=False,
     )
 
-    result = await publisher.update('summer vape/guide', PublishRequest(title='Updated', slug='ignored-new-slug', content_md='# Updated', status='publish'))
+    result = await publisher.update(
+        'summer vape/guide',
+        PublishRequest(
+            title='Updated',
+            slug='ignored-new-slug',
+            content_md='# Updated\n\nUpdated paragraph.\n\n# Competing section',
+            status='publish',
+        ),
+    )
 
     assert result.ok is True
     assert result.post_id == '2'
@@ -605,10 +623,91 @@ async def test_openapi_publisher_updates_one_post(monkeypatch):
     assert called['headers'] == {'Authorization': 'Bearer key-1'}
     assert called['json'] == {
         'title': 'Updated',
-        'content_md': '# Updated',
+        'content_md': 'Updated paragraph.\n\n## Competing section',
         'format': 'markdown',
         'status': 'published',
     }
+
+
+@pytest.mark.asyncio
+async def test_content_openapi_rejects_mixed_body_before_remote_write(monkeypatch):
+    async def fail_if_called(*_args, **_kwargs):
+        raise AssertionError('remote writer must not be called')
+
+    monkeypatch.setattr('app.clients.publishers.request_json', fail_if_called)
+    publisher = OpenAPIPublisher(
+        {
+            'site_type': 'blog',
+            'base_url': 'https://vapestest.de',
+            'api_base_url': 'https://vapestest.de/api/open/v1',
+            'api_config': {
+                'openApiKey': 'key-1',
+                'connector_type': 'custom_openapi',
+            },
+        },
+        dry_run=False,
+    )
+
+    result = await publisher.update(
+        '10',
+        PublishRequest(
+            title='Updated guide',
+            slug='updated-guide',
+            content_md='# Updated guide\n\n<p>This paragraph would be discarded.</p>',
+            status='publish',
+        ),
+    )
+
+    assert result.ok is False
+    assert result.error == (
+        'content_openapi article body must be pure Markdown; HTML tags are not allowed'
+    )
+    assert result.raw == {'remote_write_occurred': False}
+
+
+def test_content_openapi_markdown_allows_html_examples_inside_code() -> None:
+    validate_content_openapi_markdown(
+        '# Markdown guide\n\nUse `<p>example</p>` as text.\n\n'
+        '```html\n<p>example</p>\n```'
+    )
+
+
+@pytest.mark.asyncio
+async def test_openapi_publisher_removes_html_body_h1_without_changing_format(monkeypatch):
+    called: dict[str, object] = {}
+
+    async def fake_request_json(method: str, url: str, **kwargs):
+        called['json'] = kwargs.get('json')
+        return {'created': [{'id': '42', 'slug': 'hello'}], 'failed': []}
+
+    monkeypatch.setattr('app.clients.publishers.request_json', fake_request_json)
+    publisher = OpenAPIPublisher(
+        {
+            'site_type': 'blog',
+            'api_base_url': 'https://api.example.com',
+            'domain': 'api.example.com',
+            'api_config': {'openApiKey': 'key-1'},
+        },
+        dry_run=False,
+    )
+
+    result = await publisher.publish(
+        PublishRequest(
+            title='Hello',
+            slug='hello',
+            content_md=(
+                '<h1 class="title">Hello</h1>'
+                '<p>Intro paragraph.</p>'
+                '<h1 id="section">Competing section</h1>'
+            ),
+            status='publish',
+        )
+    )
+
+    assert result.ok is True
+    assert called['json']['items'][0]['content_md'] == (
+        '<p>Intro paragraph.</p><h2 id="section">Competing section</h2>'
+    )
 
 
 @pytest.mark.asyncio

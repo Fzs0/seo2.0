@@ -20,6 +20,10 @@ from app.clients.publishers import (
 from app.connectors.secrets import SecretCipher
 from app.core.article_urls import is_oemapps_site
 from app.core.config import get_settings
+from app.services.site_config_service import (
+    load_openapi_runtime_api_config,
+    load_wordpress_runtime_api_config,
+)
 
 
 _SHOP_DOMAIN = re.compile(r"^[a-z0-9][a-z0-9-]*\.myshopify\.com$", re.IGNORECASE)
@@ -331,7 +335,12 @@ async def publisher_for_site_runtime(
     ).casefold()
     if site_type not in {"shopify", "shopify_admin"}:
         runtime_site = site
-        if is_oemapps_site(site):
+        if site_type in {"wp", "wordpress"}:
+            runtime_site = {
+                **site,
+                "api_config": load_wordpress_runtime_api_config(site),
+            }
+        elif is_oemapps_site(site):
             token = await _load_active_oemapps_token(
                 session,
                 site_id=str(site["id"]),
@@ -345,6 +354,11 @@ async def publisher_for_site_runtime(
                         "tokenB": token,
                     },
                 }
+        elif site_type in {"blog", "custom_openapi", "openapi"}:
+            runtime_site = {
+                **site,
+                "api_config": load_openapi_runtime_api_config(site),
+            }
         return publisher_for_site(runtime_site, dry_run=dry_run)
     if dry_run and not require_active:
         try:

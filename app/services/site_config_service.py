@@ -70,6 +70,94 @@ def _api_config(s: dict[str, Any], site_type: str) -> dict[str, Any]:
     return config
 
 
+def load_wordpress_runtime_api_config(site: dict[str, Any]) -> dict[str, Any]:
+    """Merge local WordPress credentials into an in-memory site copy only.
+
+    Older installations keep WordPress Application Passwords in the existing
+    local config file while synchronized ``sites`` rows may intentionally omit
+    them.  The runtime Publisher still needs those values for readback and
+    publishing, but they must not be written back to the row or returned by a
+    public site endpoint.
+    """
+    current = dict(site.get("api_config") or {})
+    if current.get("username") and current.get("applicationPassword"):
+        return current
+    entry = _matching_local_site(site, "wp-sites.local.json")
+    if entry:
+        username = str(entry.get("username") or "").strip()
+        application_password = str(
+            entry.get("applicationPassword") or ""
+        ).strip()
+        if username and application_password:
+            return {
+                **current,
+                "username": username,
+                "applicationPassword": application_password,
+            }
+    return current
+
+
+def load_openapi_runtime_api_config(site: dict[str, Any]) -> dict[str, Any]:
+    """Merge a local custom-blog API key into an in-memory site copy only."""
+    current = dict(site.get("api_config") or {})
+    if any(current.get(key) for key in ("openApiKey", "tokenA", "tokenB")):
+        return current
+    entry = _matching_local_site(site, "blog-sites.local.json")
+    if not entry:
+        return current
+    merged = dict(current)
+    for key in (
+        "openApiKey",
+        "tokenA",
+        "tokenB",
+        "articlesPath",
+        "publishPath",
+        "articleUrlPath",
+    ):
+        value = entry.get(key)
+        if value not in (None, ""):
+            merged[key] = value
+    merged.setdefault("connector_type", "custom_openapi")
+    return merged
+
+
+def _matching_local_site(
+    site: dict[str, Any],
+    filename: str,
+) -> dict[str, Any] | None:
+    path = CONFIG / filename
+    if not path.is_file():
+        return None
+    try:
+        entries = json.loads(path.read_text(encoding="utf-8")).get("sites", [])
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    identities = {
+        str(value or "").strip().casefold()
+        for value in (site.get("site_key"), site.get("name"))
+        if str(value or "").strip()
+    }
+    hosts = {
+        _domain(str(value or "")).casefold()
+        for value in (site.get("domain"), site.get("base_url"))
+        if _domain(str(value or ""))
+    }
+    for entry in entries if isinstance(entries, list) else []:
+        if not isinstance(entry, dict):
+            continue
+        entry_identities = {
+            str(value or "").strip().casefold()
+            for value in (entry.get("siteKey"), entry.get("name"))
+            if str(value or "").strip()
+        }
+        entry_host = _domain(
+            str(entry.get("siteUrl") or entry.get("apiBaseUrl") or "")
+        ).casefold()
+        if identities & entry_identities or (entry_host and entry_host in hosts):
+            return entry
+    return None
+
+
 def _publish_config(s: dict[str, Any]) -> dict[str, Any]:
     keys = ("defaultAuthor", "defaultStatus", "defaultCategoryId", "defaultCoverUrl", "defaultSrcPrefix", "defaultImageId")
     return {k: s.get(k) for k in keys if s.get(k) not in (None, "")}

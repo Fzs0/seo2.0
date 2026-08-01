@@ -15,11 +15,13 @@ from uuid import UUID, uuid4
 
 import asyncpg
 import pytest
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 import app.services.content_audit_service as content_audit_service
 import app.services.post_sync_service as post_sync_service
 import app.services.publish_service as publish_service
+import app.services.strategy_article_action_adapter as strategy_article_action_adapter
 from app.clients.publishers import PublishResult
 from app.services.content_audit_service import start_content_audit
 from app.core.time_values import require_aware_datetime
@@ -39,12 +41,177 @@ from app.services.strategy_run_service import (
     list_strategy_runs,
     retry_strategy_run,
     run_strategy_run,
-    submit_strategy_run_local_options,
 )
-from app.services.strategy_service import _replace_strategy_plan
+from app.services.autonomous_strategy_orchestrator import (
+    build_reviewed_plan,
+    capture_research_portfolio,
+    submit_proposed_actions,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def _pg17_research_item(
+    *,
+    site_id: str,
+    snapshot_id: str,
+    material_action: str,
+    user_intent: str,
+) -> dict:
+    actions = [
+        "new_article",
+        "update_article",
+        "on_page_fix",
+        "hold",
+        "configuration_repair",
+    ]
+    if material_action == "hold":
+        material_options = [
+            {
+                "option_id": "pg17-existing-page",
+                "action": "update_article",
+                "target_identity": {"remote_object_id": "existing-article-1"},
+                "user_intent": user_intent,
+                "evidence_refs": ["site-api-current", "public-search-current"],
+                "outcome": "rejected",
+                "reason": "The exact existing page has no supported improvement now.",
+            },
+            {
+                "option_id": "pg17-distinct-topic",
+                "action": "new_article",
+                "target_identity": {
+                    "intent_key": "distinct current buyer question",
+                    "topic_cluster": "current buyer questions",
+                },
+                "user_intent": "Answer a distinct current buyer question.",
+                "evidence_refs": ["site-api-current", "public-search-current"],
+                "outcome": "rejected",
+                "reason": "The independent source does not confirm this exact demand.",
+            },
+        ]
+    else:
+        target_identity = (
+            {
+                "intent_key": "independently researched topic",
+                "topic_cluster": "independent research topics",
+            }
+            if material_action == "new_article"
+            else {"remote_object_id": "existing-object-1"}
+        )
+        material_options = [
+            {
+                "option_id": f"pg17-{material_action}",
+                "action": material_action,
+                "target_identity": target_identity,
+                "user_intent": user_intent,
+                "evidence_refs": ["site-api-current", "public-search-current"],
+                "outcome": "qualified",
+                "reason": "Current evidence supports this exact opportunity.",
+            }
+        ]
+    return {
+        "site_id": site_id,
+        "site_language": "en",
+        "site_market": "US",
+        "evidence_snapshot_id": snapshot_id,
+        "research_questions": ["Which current action best serves this site?"],
+        "actions_considered": actions,
+        "material_options": material_options,
+        "opportunity_exhaustion": {
+            "surfaces_checked": ["existing_pages", "new_topics"],
+            "evaluated_option_ids": [
+                option["option_id"] for option in material_options
+            ],
+            "conclusion": "Existing pages and distinct new topics were evaluated.",
+        },
+        "action_assessments": {
+            action: {
+                "outcome": "considered",
+                "reason": f"PG17 fixture assessed {action}.",
+                "evidence_refs": [
+                    "site-api-current",
+                    "public-search-current",
+                ],
+            }
+            for action in actions
+        },
+        "hard_blockers": [],
+        "sources_attempted": ["site API", "fixed public-search snapshot"],
+        "evidence_sources": [
+            {
+                "source_type": "site_api",
+                "source_name": "PG17 current site fixture",
+                "captured_at": "2026-07-31T00:00:00+00:00",
+                "data_window": {},
+                "market": "US",
+                "language": "en",
+                "device": "desktop",
+                "dimensions": [],
+                "filters": {},
+                "freshness": "current",
+                "fact_scope": "product_fact",
+                "artifact_refs": ["tests/fixtures/pg17-site.json"],
+                "collection_status": "success",
+                "limitations": [],
+                "decision_use": "Confirm current site and target facts.",
+            },
+            {
+                "source_type": "public_search",
+                "source_name": "PG17 fixed intent fixture",
+                "captured_at": "2026-07-31T00:00:00+00:00",
+                "data_window": {},
+                "market": "US",
+                "language": "en",
+                "device": "desktop",
+                "dimensions": [],
+                "filters": {},
+                "freshness": "current",
+                "fact_scope": "intent",
+                "artifact_refs": ["tests/fixtures/pg17-search.json"],
+                "collection_status": "success",
+                "limitations": ["Fixed test snapshot; no network request."],
+                "decision_use": "Confirm the test intent independently.",
+            },
+        ],
+        "missing_evidence": [],
+        "evidence_conflicts": [],
+        "research_conclusion": "Current evidence supports the proposed action.",
+    }
+
+
+def _pg17_normalized_article_option(
+    *,
+    site_id: str,
+    scope_key: str,
+    sequence: int = 1,
+) -> dict:
+    return {
+        "option_id": f"proposal-{scope_key}-{sequence}",
+        "option_origin": "ai_proposed_action",
+        "proposal_sequence": sequence,
+        "site_id": site_id,
+        "site_name": f"Site {site_id[-4:]}",
+        "editorial_action": "new_article",
+        "strategy_type": "new_article",
+        "action_type": "new_article",
+        "requested_schedule_class": "execute_now",
+        "schedule_class": "execute_now",
+        "priority": "P1",
+        "risk_level": "low",
+        "risk_gate_passed": True,
+        "scope_key": scope_key,
+        "lock_key": scope_key,
+        "lock_scope": "intent",
+        "title": f"Strategy {scope_key}",
+        "topic": f"topic {scope_key}",
+        "query": f"topic {scope_key}",
+        "reason": "PG17 current evidence supports the AI proposal.",
+        "evidence_refs": ["site-api-current", "public-search-current"],
+        "strategy_fingerprint": f"strategy-{scope_key}",
+        "evidence_fingerprint": f"evidence-{scope_key}",
+        "policy_version": "ai-led-strategy-v1",
+    }
 
 
 async def _seed_pg17_action_lineage(engine, *, action_type: str = "product_seo"):
@@ -179,6 +346,47 @@ async def test_pg17_full_migrations_and_repair_migrations_are_idempotent():
 
 
 @pytest.mark.asyncio
+async def test_pg17_strategy_action_approval_is_visible_to_publish_gate():
+    """The real Action approval ledger must satisfy the existing publish gate."""
+    sqlalchemy_dsn = _dsn().replace("postgresql://", "postgresql+asyncpg://", 1)
+    engine = create_async_engine(sqlalchemy_dsn)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    ids = await _seed_pg17_action_lineage(engine, action_type="new_article")
+    action_id = str(uuid4())
+
+    async with factory() as session:
+        execution_id = (
+            await strategy_article_action_adapter._ensure_approved_execution(
+                session,
+                action={
+                    "action_id": action_id,
+                    "run_id": str(ids["run_id"]),
+                    "plan_id": str(ids["plan_id"]),
+                    "run_mode": "approval_execution",
+                    "business_id": ids["business_id"],
+                    "site_id": str(ids["site_id"]),
+                    "source_strategy_task_id": str(ids["strategy_id"]),
+                    "action_type": "new_article",
+                    "target_url": "https://example.test/blogs/action-approval",
+                },
+                context={},
+            )
+        )
+
+    async with factory() as session:
+        approval = await publish_service._approved_execution(
+            session,
+            execution_id,
+            str(ids["site_id"]),
+        )
+
+    assert approval is not None
+    assert approval["strategy_action_id"] == action_id
+    assert approval["strategy_run_id"] == str(ids["run_id"])
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_replanning_one_run_does_not_supersede_another_run_plan():
     sqlalchemy_dsn = _dsn().replace("postgresql://", "postgresql+asyncpg://", 1)
     engine = create_async_engine(sqlalchemy_dsn)
@@ -199,34 +407,70 @@ async def test_replanning_one_run_does_not_supersede_another_run_plan():
     def option(label: str) -> dict:
         return {
             "option_id": f"option-{label}",
-            "option_origin": "run_local",
-            "candidate_id": None,
-            "keyword_id": None,
+            "option_origin": "ai_proposed_action",
+            "proposal_sequence": 1,
             "site_id": str(site_id),
+            "site_name": "Plan isolation",
+            "editorial_action": "new_article",
             "strategy_type": "new_article",
+            "action_type": "new_article",
+            "requested_schedule_class": "execute_now",
             "schedule_class": "execute_now",
             "schedule_reason": "PG17 plan isolation test",
             "wave_number": 1,
             "priority": "P1",
-            "score": 90,
+            "risk_gate_passed": True,
+            "scope_key": f"scope-{label}",
+            "lock_key": f"scope-{label}",
+            "lock_scope": "intent",
             "title": f"Strategy {label}",
+            "topic": f"topic {label}",
+            "query": f"topic {label}",
+            "reason": "PG17 plan isolation test",
+            "evidence_refs": ["site-api-current"],
         }
 
     async def persist(run_id: str, label: str) -> dict:
         async with factory() as session:
-            result = await _replace_strategy_plan(
+            result = await build_reviewed_plan(
                 session,
-                business_id=business_id,
-                analysis_batch_id=str(uuid4()),
-                source_audit_batch_id=str(uuid4()),
-                source_audit_scanned_at="2026-07-30T00:00:00+00:00",
-                action_budget=200,
-                site_quotas={},
-                candidates=[option(label)],
-                strategy_run_id=run_id,
+                run={
+                    "run_id": run_id,
+                    "business_id": business_id,
+                    "action_budget": 200,
+                    "site_quotas": {},
+                    "discovered_sites": [
+                        {
+                            "id": str(site_id),
+                            "name": "Plan isolation",
+                            "strategy_enabled": True,
+                            "language_code": "en",
+                            "market": "US",
+                            "domain": "plan-isolation.test",
+                            "base_url": "https://plan-isolation.test",
+                        }
+                    ],
+                    "capability_snapshot": {
+                        "sites": [
+                            {
+                                "site_id": str(site_id),
+                                "supported_actions": {
+                                    "new_article": "approval_required"
+                                },
+                                "configuration_issues": [],
+                            }
+                        ]
+                    },
+                    "proposed_actions": [option(label)],
+                    "research_portfolio_hash": f"research-{label}",
+                    "proposed_action_hash": f"proposal-{label}",
+                    "evidence_snapshot": {
+                        "captured_at": "2026-07-30T00:00:00+00:00"
+                    },
+                },
             )
             await session.commit()
-            return result
+            return result["plan"]
 
     plan_a1 = await persist(run_a, "a1")
     plan_b = await persist(run_b, "b")
@@ -274,6 +518,329 @@ async def test_replanning_one_run_does_not_supersede_another_run_plan():
 
 
 @pytest.mark.asyncio
+async def test_concurrent_formal_plans_allow_one_exact_target_on_pg17():
+    sqlalchemy_dsn = _dsn().replace("postgresql://", "postgresql+asyncpg://", 1)
+    engine = create_async_engine(sqlalchemy_dsn)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    business_id = f"pg17-target-conflict-{uuid4()}"
+    site_id = uuid4()
+    scope_key = f"exact-intent-{uuid4()}"
+    run_ids = [str(uuid4()), str(uuid4())]
+    async with engine.begin() as connection:
+        await connection.exec_driver_sql(
+            """
+            INSERT INTO seo_agent.sites
+              (id, site_key, name, site_type, business_id, strategy_enabled,
+               status, domain, base_url, market, language_code)
+            VALUES
+              ($1::uuid, $2, 'Target conflict', 'main', $3, true, 'active',
+               $4, $5, 'US', 'en')
+            """,
+            (
+                site_id,
+                f"target-conflict-{site_id}",
+                business_id,
+                f"{site_id}.test",
+                f"https://{site_id}.test",
+            ),
+        )
+        await connection.exec_driver_sql(
+            """
+            INSERT INTO seo_agent.tasks
+              (id, task_type, status, priority, title, payload, decision)
+            VALUES
+              ($1::uuid, 'review', 'running', 'P1', 'Target conflict run A',
+               jsonb_build_object(
+                 'kind','strategy_run','business_id',$3::text,'run_id',$1::text
+               ),
+               '{"status":"planning","current_stage":"planning"}'::jsonb),
+              ($2::uuid, 'review', 'running', 'P1', 'Target conflict run B',
+               jsonb_build_object(
+                 'kind','strategy_run','business_id',$3::text,'run_id',$2::text
+               ),
+               '{"status":"planning","current_stage":"planning"}'::jsonb)
+            """,
+            (run_ids[0], run_ids[1], business_id),
+        )
+
+    def run_payload(run_id: str) -> dict:
+        return {
+            "run_id": run_id,
+            "business_id": business_id,
+            "action_budget": 10,
+            "site_quotas": {},
+            "discovered_sites": [
+                {
+                    "id": str(site_id),
+                    "name": "Target conflict",
+                    "strategy_enabled": True,
+                    "language_code": "en",
+                    "market": "US",
+                    "domain": f"{site_id}.test",
+                    "base_url": f"https://{site_id}.test",
+                }
+            ],
+            "capability_snapshot": {
+                "sites": [
+                    {
+                        "site_id": str(site_id),
+                        "supported_actions": {
+                            "new_article": "approval_required"
+                        },
+                        "configuration_issues": [],
+                    }
+                ]
+            },
+            "proposed_actions": [
+                _pg17_normalized_article_option(
+                    site_id=str(site_id), scope_key=scope_key
+                )
+            ],
+            "research_portfolio_hash": f"research-{run_id}",
+            "proposed_action_hash": f"proposal-{run_id}",
+            "evidence_snapshot": {
+                "captured_at": "2026-07-31T00:00:00+00:00"
+            },
+        }
+
+    async def persist(run_id: str):
+        async with factory() as session:
+            result = await build_reviewed_plan(
+                session, run=run_payload(run_id)
+            )
+            await session.commit()
+            return result
+
+    first, second = await asyncio.gather(
+        persist(run_ids[0]), persist(run_ids[1])
+    )
+    schedules = sorted(
+        [
+            first["reviewed_actions"][0]["schedule_class"],
+            second["reviewed_actions"][0]["schedule_class"],
+        ]
+    )
+    assert schedules == ["deferred", "execute_now"]
+    deferred = (
+        first
+        if first["reviewed_actions"][0]["schedule_class"] == "deferred"
+        else second
+    )
+    assert (
+        deferred["reviewed_actions"][0]["reason_code"]
+        == "TARGET_CONFLICT_ACTIVE"
+    )
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_pg17_safety_ceiling_persists_all_deferred_without_candidates():
+    sqlalchemy_dsn = _dsn().replace("postgresql://", "postgresql+asyncpg://", 1)
+    engine = create_async_engine(sqlalchemy_dsn)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    business_id = f"pg17-deferred-{uuid4()}"
+    site_ids = [uuid4() for _ in range(10)]
+    async with engine.begin() as connection:
+        for site_id in site_ids:
+            await connection.exec_driver_sql(
+                """
+                INSERT INTO seo_agent.sites
+                  (id, site_key, name, site_type, business_id,
+                   strategy_enabled, status, domain, base_url,
+                   market, language_code)
+                VALUES
+                  ($1::uuid, $2, $3, 'main', $4, true, 'active',
+                   $5, $6, 'US', 'en')
+                """,
+                (
+                    site_id,
+                    f"deferred-{site_id}",
+                    f"Deferred {site_id}",
+                    business_id,
+                    f"{site_id}.test",
+                    f"https://{site_id}.test",
+                ),
+            )
+    discovered = [
+        {
+            "id": str(site_id),
+            "name": f"Deferred {site_id}",
+            "strategy_enabled": True,
+            "language_code": "en",
+            "market": "US",
+            "domain": f"{site_id}.test",
+            "base_url": f"https://{site_id}.test",
+        }
+        for site_id in site_ids
+    ]
+    run_id = str(uuid4())
+    async with factory() as session:
+        planned = await build_reviewed_plan(
+            session,
+            run={
+                "run_id": run_id,
+                "business_id": business_id,
+                "action_budget": 3,
+                "site_quotas": {},
+                "discovered_sites": discovered,
+                "capability_snapshot": {
+                    "sites": [
+                        {
+                            "site_id": str(site_id),
+                            "supported_actions": {
+                                "new_article": "approval_required"
+                            },
+                            "configuration_issues": [],
+                        }
+                        for site_id in site_ids
+                    ]
+                },
+                "proposed_actions": [
+                    _pg17_normalized_article_option(
+                        site_id=str(site_id),
+                        scope_key=f"scope-{index}-{uuid4()}",
+                        sequence=index,
+                    )
+                    for index, site_id in enumerate(site_ids, start=1)
+                ],
+                "research_portfolio_hash": "research-deferred",
+                "proposed_action_hash": "proposal-deferred",
+                "evidence_snapshot": {
+                    "captured_at": "2026-07-31T00:00:00+00:00"
+                },
+            },
+        )
+        await session.commit()
+    assert planned["planned_actions"] == 3
+    assert planned["deferred_actions"] == 7
+    async with engine.begin() as connection:
+        counts = (
+            await connection.exec_driver_sql(
+                """
+                SELECT payload->>'schedule_class' AS schedule_class,
+                       count(*) AS count
+                  FROM seo_agent.tasks
+                 WHERE payload->>'kind'='seo_strategy'
+                   AND payload->>'strategy_run_id'=$1
+                 GROUP BY payload->>'schedule_class'
+                """,
+                (run_id,),
+            )
+        ).mappings()
+        by_schedule = {
+            row["schedule_class"]: int(row["count"]) for row in counts
+        }
+        legacy_refs = (
+            await connection.exec_driver_sql(
+                """
+                SELECT count(*)
+                  FROM seo_agent.tasks
+                 WHERE payload->>'strategy_run_id'=$1
+                   AND payload->>'kind'='seo_strategy'
+                   AND (
+                       payload ? 'candidate_id'
+                       OR keyword_id IS NOT NULL
+                   )
+                """,
+                (run_id,),
+            )
+        ).scalar_one()
+    assert by_schedule == {"execute_now": 3, "deferred": 7}
+    assert legacy_refs == 0
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_pg17_configuration_repair_keeps_its_type_in_formal_plan():
+    sqlalchemy_dsn = _dsn().replace("postgresql://", "postgresql+asyncpg://", 1)
+    engine = create_async_engine(sqlalchemy_dsn)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    business_id = f"pg17-config-repair-{uuid4()}"
+    site_id = uuid4()
+    run_id = str(uuid4())
+    async with engine.begin() as connection:
+        await connection.exec_driver_sql(
+            """
+            INSERT INTO seo_agent.sites
+              (id, site_key, name, site_type, business_id, strategy_enabled,
+               status, domain, base_url, market, language_code)
+            VALUES
+              ($1::uuid, $2, 'Disabled strategy', 'main', $3, false,
+               'active', $4, $5, 'US', 'en')
+            """,
+            (
+                site_id,
+                f"config-repair-{site_id}",
+                business_id,
+                f"{site_id}.test",
+                f"https://{site_id}.test",
+            ),
+        )
+    site = {
+        "id": str(site_id),
+        "name": "Disabled strategy",
+        "strategy_enabled": False,
+        "language_code": "en",
+        "market": "US",
+        "domain": f"{site_id}.test",
+        "base_url": f"https://{site_id}.test",
+    }
+    async with factory() as session:
+        planned = await build_reviewed_plan(
+            session,
+            run={
+                "run_id": run_id,
+                "business_id": business_id,
+                "action_budget": 10,
+                "site_quotas": {},
+                "discovered_sites": [site],
+                "capability_snapshot": {
+                    "sites": [
+                        {
+                            "site_id": str(site_id),
+                            "supported_actions": {},
+                            "configuration_issues": ["strategy_disabled"],
+                        }
+                    ]
+                },
+                "proposed_actions": [
+                    _pg17_normalized_article_option(
+                        site_id=str(site_id),
+                        scope_key=f"disabled-{uuid4()}",
+                    )
+                ],
+                "research_portfolio_hash": "research-config",
+                "proposed_action_hash": "proposal-config",
+                "evidence_snapshot": {
+                    "captured_at": "2026-07-31T00:00:00+00:00"
+                },
+            },
+        )
+        await session.commit()
+    assert planned["decisions"][0]["action"] == "configuration_repair"
+    assert (
+        planned["decisions"][0]["schedule_class"]
+        == "configuration_repair"
+    )
+    assert planned["planned_actions"] == 0
+    async with engine.begin() as connection:
+        stored = (
+            await connection.exec_driver_sql(
+                """
+                SELECT decision->'site_results'->0->>'action',
+                       decision->'site_results'->0->>'schedule_class'
+                  FROM seo_agent.tasks
+                 WHERE payload->>'kind'='strategy_plan'
+                   AND payload->>'strategy_run_id'=$1
+                """,
+                (run_id,),
+            )
+        ).one()
+    assert tuple(stored) == ("configuration_repair", "configuration_repair")
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_pg17_strategy_run_list_accepts_null_optional_filters():
     sqlalchemy_dsn = _dsn().replace("postgresql://", "postgresql+asyncpg://", 1)
     engine = create_async_engine(sqlalchemy_dsn)
@@ -316,7 +883,7 @@ async def test_pg17_strategy_run_list_accepts_null_optional_filters():
 
 
 @pytest.mark.asyncio
-async def test_pg17_keywordless_run_local_options_persist_and_replay():
+async def test_pg17_keywordless_research_and_proposals_persist_and_replay():
     sqlalchemy_dsn = _dsn().replace("postgresql://", "postgresql+asyncpg://", 1)
     engine = create_async_engine(sqlalchemy_dsn)
     factory = async_sessionmaker(engine, expire_on_commit=False)
@@ -351,49 +918,115 @@ async def test_pg17_keywordless_run_local_options_persist_and_replay():
                 approval_policy="use_site_capabilities",
             )
             run_id = run["run_id"]
-            options = [
+            snapshot_id = f"snapshot-{uuid4()}"
+            await session.execute(
+                text(
+                    """
+                    UPDATE seo_agent.tasks
+                       SET status='blocked',
+                           decision=decision || CAST(:patch AS jsonb)
+                     WHERE id=CAST(:run_id AS uuid)
+                    """
+                ),
+                {
+                    "run_id": run_id,
+                    "patch": json.dumps(
+                        {
+                            "status": "ai_researching",
+                            "current_stage": "ai_researching",
+                            "discovered_sites": [
+                                {
+                                    "id": str(site_id),
+                                    "name": "Research option site",
+                                    "strategy_enabled": True,
+                                    "language_code": "en",
+                                    "market": "US",
+                                    "domain": "research.example.test",
+                                    "base_url": "https://research.example.test",
+                                }
+                            ],
+                            "evidence_snapshot_id": snapshot_id,
+                            "evidence_snapshot": {
+                                "snapshot_id": snapshot_id,
+                                "captured_at": (
+                                    "2026-07-31T00:00:00+00:00"
+                                ),
+                            },
+                        }
+                    ),
+                },
+            )
+            await session.commit()
+            research = await capture_research_portfolio(
+                session,
+                run_id=run_id,
+                requested_by="codex",
+                idempotency_key="pg17-research-capture",
+                evidence_snapshot_id=snapshot_id,
+                portfolio=[
+                    _pg17_research_item(
+                        site_id=str(site_id),
+                        snapshot_id=snapshot_id,
+                        material_action="new_article",
+                        user_intent="Learn before choosing a product.",
+                    )
+                ],
+            )
+            assert research["research_portfolio"]
+            actions = [
                 {
                     "site_id": str(site_id),
                     "action": "new_article",
-                    "schedule_class": "execute_now",
+                    "schedule_request": "execute_now",
+                    "target_identity": {
+                        "intent_key": "independently researched topic"
+                    },
                     "topic": "independently researched topic",
                     "title": "Independent Research Topic",
-                    "reason": "Current product and SERP evidence support it.",
+                    "decision_reason": (
+                        "Current site and intent evidence support it."
+                    ),
                     "user_intent": "Learn before choosing a product.",
-                    "evidence": {"product_api": ["product-1"]},
-                    "candidate_id": None,
-                    "keyword_id": None,
+                    "evidence_refs": [
+                        "site-api-current",
+                        "public-search-current",
+                    ],
+                    "alternatives_considered": [],
+                    "hypothesis": "The page can satisfy current demand.",
+                    "success_metrics": ["GSC impressions"],
+                    "priority": "P1",
+                    "risk_level": "low",
                 }
             ]
-            first = await submit_strategy_run_local_options(
+            first = await submit_proposed_actions(
                 session,
                 run_id=run_id,
                 requested_by="codex",
                 idempotency_key="pg17-research-submit",
-                options=options,
+                actions=actions,
             )
-            replay = await submit_strategy_run_local_options(
+            replay = await submit_proposed_actions(
                 session,
                 run_id=run_id,
                 requested_by="codex",
                 idempotency_key="pg17-research-submit",
-                options=options,
+                actions=actions,
             )
 
-            assert first["run_local_option_count"] == 1
-            assert first["run_local_options"][0]["candidate_id"] is None
-            assert first["run_local_options"][0]["keyword_id"] is None
+            assert first["proposed_action_count"] == 1
+            assert "candidate_id" not in first["proposed_actions"][0]
+            assert "keyword_id" not in first["proposed_actions"][0]
             assert replay["idempotency_replayed"] is True
         async with engine.begin() as connection:
             saved = await connection.exec_driver_sql(
                 """
-                SELECT decision->'run_local_options'->0->>'option_origin'
+                SELECT decision->'proposed_actions'->0->>'option_origin'
                   FROM seo_agent.tasks
                  WHERE id=$1::uuid
                 """,
                 (UUID(run_id),),
             )
-            assert saved.scalar_one() == "codex_research"
+            assert saved.scalar_one() == "ai_proposed_action"
     finally:
         async with engine.begin() as connection:
             if run_id:
@@ -401,6 +1034,374 @@ async def test_pg17_keywordless_run_local_options_persist_and_replay():
                     "DELETE FROM seo_agent.tasks WHERE id=$1::uuid",
                     (UUID(run_id),),
                 )
+            await connection.exec_driver_sql(
+                "DELETE FROM seo_agent.sites WHERE id=$1::uuid",
+                (site_id,),
+            )
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_pg17_zero_action_review_requires_research_then_recovers():
+    sqlalchemy_dsn = _dsn().replace("postgresql://", "postgresql+asyncpg://", 1)
+    engine = create_async_engine(sqlalchemy_dsn)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    business_id = f"pg17-zero-review-{uuid4()}"
+    site_id = uuid4()
+    snapshot_id = f"snapshot-{uuid4()}"
+    async with engine.begin() as connection:
+        await connection.exec_driver_sql(
+            """
+            INSERT INTO seo_agent.sites
+              (id, site_key, name, site_type, business_id, strategy_enabled,
+               status, domain, base_url, market, language_code)
+            VALUES
+              ($1::uuid, $2, 'Zero review', 'main', $3, true, 'active',
+               $4, $5, 'US', 'en')
+            """,
+            (
+                site_id,
+                f"zero-review-{site_id}",
+                business_id,
+                f"{site_id}.test",
+                f"https://{site_id}.test",
+            ),
+        )
+    async with factory() as session:
+        created = await create_strategy_run(
+            session,
+            business_id=business_id,
+            site_ids=[str(site_id)],
+            scope="selected_sites",
+            mode="dry_run",
+            requested_by="pytest",
+            idempotency_key=f"zero-create-{uuid4()}",
+            action_budget=10,
+            site_quotas={},
+            approval_policy="use_site_capabilities",
+        )
+
+    site = {
+        "id": str(site_id),
+        "name": "Zero review",
+        "site_type": "main",
+        "strategy_enabled": True,
+        "language_code": "en",
+        "market": "US",
+        "domain": f"{site_id}.test",
+        "base_url": f"https://{site_id}.test",
+    }
+
+    async def discoverer(*_args, **_kwargs):
+        return [site]
+
+    async def capabilities(_session, requested_business_id):
+        return {
+            "business_id": requested_business_id,
+            "generated_at": "2026-07-31T00:00:00+00:00",
+            "sites": [
+                {
+                    "site_id": str(site_id),
+                    "supported_actions": {},
+                    "configuration_issues": [],
+                }
+            ],
+        }
+
+    async def evidence(*_args, **_kwargs):
+        return {
+            "snapshot_id": snapshot_id,
+            "captured_at": "2026-07-31T00:00:00+00:00",
+        }
+
+    hold_action = {
+        "site_id": str(site_id),
+        "action": "hold",
+        "target_identity": {},
+        "schedule_request": "hold",
+        "user_intent": "Decide whether any current SEO action is justified.",
+        "decision_reason": "Current evidence does not justify a safe change.",
+        "evidence_refs": ["gsc-current"],
+        "alternatives_considered": [],
+        "hypothesis": "New evidence may unlock a later action.",
+        "success_metrics": [],
+        "reevaluation_condition": "Collect another evidence channel.",
+        "priority": "Hold",
+        "risk_level": "low",
+    }
+
+    async with factory() as session:
+        researching = await run_strategy_run(
+            session,
+            run_id=created["run_id"],
+            idempotency_key=f"zero-start-{uuid4()}",
+            site_discoverer=discoverer,
+            capability_loader=capabilities,
+            evidence_gatherer=evidence,
+        )
+        assert researching["status"] == "ai_researching"
+        incomplete = _pg17_research_item(
+            site_id=str(site_id),
+            snapshot_id=snapshot_id,
+            material_action="hold",
+            user_intent=hold_action["user_intent"],
+        )
+        incomplete["actions_considered"] = ["hold"]
+        incomplete["action_assessments"] = {}
+        incomplete["evidence_sources"] = [
+            {
+                **incomplete["evidence_sources"][0],
+                "source_type": "gsc",
+                "source_name": "GSC only",
+                "fact_scope": "first_party_performance",
+            }
+        ]
+        await capture_research_portfolio(
+            session,
+            run_id=created["run_id"],
+            requested_by="pytest",
+            idempotency_key=f"zero-incomplete-research-{uuid4()}",
+            evidence_snapshot_id=snapshot_id,
+            portfolio=[incomplete],
+        )
+        await submit_proposed_actions(
+            session,
+            run_id=created["run_id"],
+            requested_by="pytest",
+            idempotency_key=f"zero-incomplete-proposal-{uuid4()}",
+            actions=[hold_action],
+        )
+        revision = await run_strategy_run(
+            session,
+            run_id=created["run_id"],
+            idempotency_key=f"zero-review-{uuid4()}",
+        )
+        assert revision["status"] == "research_revision_required"
+        assert (
+            revision["zero_action_review"]["result"]
+            == "research_revision_required"
+        )
+        assert "ACTION_SPACE_ARTIFICIALLY_RESTRICTED" in (
+            revision["zero_action_review"]["reason_codes"]
+        )
+        complete = _pg17_research_item(
+            site_id=str(site_id),
+            snapshot_id=snapshot_id,
+            material_action="hold",
+            user_intent=hold_action["user_intent"],
+        )
+        await capture_research_portfolio(
+            session,
+            run_id=created["run_id"],
+            requested_by="pytest",
+            idempotency_key=f"zero-complete-research-{uuid4()}",
+            evidence_snapshot_id=snapshot_id,
+            portfolio=[complete],
+        )
+        await submit_proposed_actions(
+            session,
+            run_id=created["run_id"],
+            requested_by="pytest",
+            idempotency_key=f"zero-complete-proposal-{uuid4()}",
+            actions=[
+                {
+                    **hold_action,
+                    "evidence_refs": [
+                        "site-api-current",
+                        "public-search-current",
+                    ],
+                    "reevaluation_condition": (
+                        "Re-evaluate when first-party or market evidence changes."
+                    ),
+                }
+            ],
+        )
+        completed = await run_strategy_run(
+            session,
+            run_id=created["run_id"],
+            idempotency_key=f"zero-complete-{uuid4()}",
+        )
+    assert completed["status"] == "completed"
+    assert (
+        completed["zero_action_review"]["result"]
+        == "all_hold_review_passed"
+    )
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_pg17_repeated_materially_unchanged_all_hold_creates_stagnation():
+    sqlalchemy_dsn = _dsn().replace("postgresql://", "postgresql+asyncpg://", 1)
+    engine = create_async_engine(sqlalchemy_dsn)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    business_id = f"pg17-stagnation-{uuid4()}"
+    site_id = uuid4()
+    run_ids: list[str] = []
+    async with engine.begin() as connection:
+        await connection.exec_driver_sql(
+            """
+            INSERT INTO seo_agent.sites
+              (id, site_key, name, site_type, business_id, strategy_enabled,
+               status, domain, base_url, market, language_code)
+            VALUES
+              ($1::uuid, $2, 'Stagnation', 'main', $3, true, 'active',
+               $4, $5, 'US', 'en')
+            """,
+            (
+                site_id,
+                f"stagnation-{site_id}",
+                business_id,
+                f"{site_id}.test",
+                f"https://{site_id}.test",
+            ),
+        )
+
+    site = {
+        "id": str(site_id),
+        "name": "Stagnation",
+        "site_type": "main",
+        "strategy_enabled": True,
+        "language_code": "en",
+        "market": "US",
+        "domain": f"{site_id}.test",
+        "base_url": f"https://{site_id}.test",
+    }
+
+    async def discoverer(*_args, **_kwargs):
+        return [site]
+
+    async def capabilities(_session, requested_business_id):
+        return {
+            "business_id": requested_business_id,
+            "generated_at": "2026-07-31T00:00:00+00:00",
+            "sites": [
+                {
+                    "site_id": str(site_id),
+                    "supported_actions": {},
+                    "configuration_issues": [],
+                }
+            ],
+        }
+
+    async def complete_hold_run(*, sequence: int) -> dict:
+        snapshot_id = f"stagnation-snapshot-{sequence}-{uuid4()}"
+
+        async def evidence(*_args, **_kwargs):
+            return {
+                "snapshot_id": snapshot_id,
+                "captured_at": f"2026-08-{sequence:02d}T00:00:00+00:00",
+            }
+
+        async with factory() as session:
+            created = await create_strategy_run(
+                session,
+                business_id=business_id,
+                site_ids=[str(site_id)],
+                scope="selected_sites",
+                mode="dry_run",
+                requested_by="pytest",
+                idempotency_key=f"stagnation-create-{sequence}-{uuid4()}",
+                action_budget=10,
+                site_quotas={},
+                approval_policy="use_site_capabilities",
+            )
+            run_ids.append(created["run_id"])
+            researching = await run_strategy_run(
+                session,
+                run_id=created["run_id"],
+                idempotency_key=f"stagnation-start-{sequence}-{uuid4()}",
+                site_discoverer=discoverer,
+                capability_loader=capabilities,
+                evidence_gatherer=evidence,
+            )
+            assert researching["status"] == "ai_researching"
+            research = _pg17_research_item(
+                site_id=str(site_id),
+                snapshot_id=snapshot_id,
+                material_action="hold",
+                user_intent="Decide whether any current SEO action is justified.",
+            )
+            for source in research["evidence_sources"]:
+                source["captured_at"] = (
+                    f"2026-08-{sequence:02d}T00:00:00+00:00"
+                )
+                source["artifact_refs"] = [
+                    f"tests/fixtures/stagnation-{sequence}.json"
+                ]
+            await capture_research_portfolio(
+                session,
+                run_id=created["run_id"],
+                requested_by="pytest",
+                idempotency_key=f"stagnation-research-{sequence}-{uuid4()}",
+                evidence_snapshot_id=snapshot_id,
+                portfolio=[research],
+            )
+            await submit_proposed_actions(
+                session,
+                run_id=created["run_id"],
+                requested_by="pytest",
+                idempotency_key=f"stagnation-proposal-{sequence}-{uuid4()}",
+                actions=[
+                    {
+                        "site_id": str(site_id),
+                        "action": "hold",
+                        "target_identity": {},
+                        "schedule_request": "hold",
+                        "user_intent": (
+                            "Decide whether any current SEO action is justified."
+                        ),
+                        "decision_reason": (
+                            "Current evidence does not justify a safe change."
+                        ),
+                        "evidence_refs": [
+                            "site-api-current",
+                            "public-search-current",
+                        ],
+                        "alternatives_considered": [],
+                        "hypothesis": "New evidence may unlock a later action.",
+                        "success_metrics": [],
+                        "reevaluation_condition": (
+                            "Re-evaluate when material evidence changes."
+                        ),
+                        "priority": "Hold",
+                        "risk_level": "low",
+                    }
+                ],
+            )
+            return await run_strategy_run(
+                session,
+                run_id=created["run_id"],
+                idempotency_key=f"stagnation-review-{sequence}-{uuid4()}",
+            )
+
+    try:
+        first = await complete_hold_run(sequence=1)
+        second = await complete_hold_run(sequence=2)
+
+        assert first["status"] == "completed"
+        assert second["status"] == "research_revision_required"
+        assert second["zero_action_review"]["reason_codes"] == [
+            "STRATEGY_STAGNATION"
+        ]
+        async with engine.begin() as connection:
+            saved = await connection.exec_driver_sql(
+                """
+                SELECT count(*)
+                  FROM seo_agent.tasks
+                 WHERE task_type='review'
+                   AND payload->>'kind'='strategy_exception'
+                   AND payload->>'business_id'=$1
+                   AND payload->>'error_code'='STRATEGY_STAGNATION'
+                """,
+                (business_id,),
+            )
+            assert saved.scalar_one() == 1
+    finally:
+        async with engine.begin() as connection:
+            await connection.exec_driver_sql(
+                "DELETE FROM seo_agent.tasks WHERE payload->>'business_id'=$1",
+                (business_id,),
+            )
             await connection.exec_driver_sql(
                 "DELETE FROM seo_agent.sites WHERE id=$1::uuid",
                 (site_id,),
@@ -681,7 +1682,8 @@ async def test_strategy_run_start_control_idempotency_executes_on_pg17():
             evidence_gatherer=evidence,
             planner=planner,
         )
-    assert first["status"] == "blocked"
+    assert first["status"] == "ai_researching"
+    assert first["next_action"] == "capture_research"
 
     async with factory() as session:
         replay = await run_strategy_run(
@@ -725,7 +1727,7 @@ async def test_strategy_run_start_control_idempotency_executes_on_pg17():
             approval_policy="use_site_capabilities",
         )
 
-    async def failing_planner(*_args, **_kwargs):
+    async def failing_evidence(*_args, **_kwargs):
         raise RuntimeError("planned test failure")
 
     failed_key = f"failed-start-{uuid4()}"
@@ -734,10 +1736,9 @@ async def test_strategy_run_start_control_idempotency_executes_on_pg17():
             session,
             run_id=failed_run["run_id"],
             idempotency_key=failed_key,
-            site_discoverer=stable_discoverer,
-            capability_loader=capabilities,
-            evidence_gatherer=evidence,
-            planner=failing_planner,
+                site_discoverer=stable_discoverer,
+                capability_loader=capabilities,
+                evidence_gatherer=failing_evidence,
         )
     assert failed["status"] == "failed"
 
@@ -824,7 +1825,18 @@ async def test_formal_run_action_readback_observation_chain_closes_on_pg17():
         )
 
     async def discoverer(*_args, **_kwargs):
-        return [{"id": str(site_id), "name": "Formal lifecycle", "site_type": "main"}]
+        return [
+            {
+                "id": str(site_id),
+                "name": "Formal lifecycle",
+                "site_type": "main",
+                "strategy_enabled": True,
+                "language_code": "en",
+                "market": "US",
+                "domain": "example.com",
+                "base_url": "https://example.com",
+            }
+        ]
 
     async def capabilities(_session, requested_business_id):
         assert requested_business_id == business_id
@@ -847,64 +1859,76 @@ async def test_formal_run_action_readback_observation_chain_closes_on_pg17():
             }],
         }
 
-    async def evidence(*_args, **_kwargs):
-        return {"snapshot_id": f"evidence-{uuid4()}"}
+    evidence_snapshot_id = f"evidence-{uuid4()}"
 
-    async def planner(session, *, business_id, _strategy_run_id, **_kwargs):
-        option_id = f"formal-option-{uuid4()}"
-        analysis_batch_id = str(uuid4())
-        audit_batch_id = str(uuid4())
-        plan = await _replace_strategy_plan(
-            session,
-            business_id=business_id,
-            analysis_batch_id=analysis_batch_id,
-            source_audit_batch_id=audit_batch_id,
-            source_audit_scanned_at="2099-01-01T00:00:00+00:00",
-            action_budget=10,
-            site_quotas={},
-            candidates=[{
-                "option_id": option_id,
-                "option_origin": "run_local",
-                "candidate_id": None,
-                "keyword_id": None,
-                "site_id": str(site_id),
-                "strategy_type": "update_article",
-                "action_type": "update_article",
-                "schedule_class": "execute_now",
-                "schedule_reason": "PG17 formal lifecycle gate",
-                "wave_number": 1,
-                "priority": "P1",
-                "score": 90,
-                "title": "Formal lifecycle update",
-                "target_url": "https://example.com/blogs/formal-lifecycle",
-                "query": "formal lifecycle",
-            }],
-            strategy_run_id=_strategy_run_id,
-        )
+    async def evidence(*_args, **_kwargs):
         return {
-            "analysis_batch_id": analysis_batch_id,
-            "site_scope": [{"id": str(site_id)}],
-            "plan": plan,
-            "coverage_matrix": {
-                "discovered_site_count": 1,
-                "decided_site_count": 1,
-                "decisions": [{
-                    "site_id": str(site_id),
-                    "action": "update_article",
-                    "selected_option_id": option_id,
-                }],
-            },
+            "snapshot_id": evidence_snapshot_id,
+            "captured_at": "2099-01-01T00:00:00+00:00",
         }
 
     async with factory() as session:
-        awaiting = await run_strategy_run(
+        researching = await run_strategy_run(
             session,
             run_id=created_run["run_id"],
-            idempotency_key=f"formal-start-{uuid4()}",
+            idempotency_key=f"formal-research-start-{uuid4()}",
             site_discoverer=discoverer,
             capability_loader=capabilities,
             evidence_gatherer=evidence,
-            planner=planner,
+        )
+        assert researching["status"] == "ai_researching"
+        await capture_research_portfolio(
+            session,
+            run_id=created_run["run_id"],
+            requested_by="pytest",
+            idempotency_key=f"formal-research-{uuid4()}",
+            evidence_snapshot_id=evidence_snapshot_id,
+            portfolio=[
+                _pg17_research_item(
+                    site_id=str(site_id),
+                    snapshot_id=evidence_snapshot_id,
+                    material_action="update_article",
+                    user_intent="Improve this exact existing article.",
+                )
+            ],
+        )
+        await submit_proposed_actions(
+            session,
+            run_id=created_run["run_id"],
+            requested_by="pytest",
+            idempotency_key=f"formal-proposal-{uuid4()}",
+            actions=[
+                {
+                    "site_id": str(site_id),
+                    "action": "update_article",
+                    "target_identity": {
+                        "target_url": (
+                            "https://example.com/blogs/formal-lifecycle"
+                        )
+                    },
+                    "schedule_request": "execute_now",
+                    "topic": "formal lifecycle",
+                    "title": "Formal lifecycle update",
+                    "user_intent": "Improve this exact existing article.",
+                    "decision_reason": (
+                        "Current article and intent evidence support an update."
+                    ),
+                    "evidence_refs": [
+                        "site-api-current",
+                        "public-search-current",
+                    ],
+                    "alternatives_considered": [],
+                    "hypothesis": "The update improves qualified discovery.",
+                    "success_metrics": ["GSC impressions"],
+                    "priority": "P1",
+                    "risk_level": "low",
+                }
+            ],
+        )
+        awaiting = await run_strategy_run(
+            session,
+            run_id=created_run["run_id"],
+            idempotency_key=f"formal-plan-start-{uuid4()}",
         )
     assert awaiting["status"] == "awaiting_approval"
     assert len(awaiting["action_ids"]) == 1
@@ -989,7 +2013,7 @@ async def test_formal_run_action_readback_observation_chain_closes_on_pg17():
         ("shopify", "gid://shopify/Product/42"),
     ],
 )
-async def test_on_page_product_run_local_to_observation_closes_on_pg17(
+async def test_on_page_product_ai_proposal_to_observation_closes_on_pg17(
     connector_type: str,
     remote_object_id: str,
 ):
@@ -1080,38 +2104,6 @@ async def test_on_page_product_run_local_to_observation_closes_on_pg17(
             site_quotas={},
             approval_policy="use_site_capabilities",
         )
-        submitted = await submit_strategy_run_local_options(
-            session,
-            run_id=created_run["run_id"],
-            requested_by="pytest",
-            idempotency_key=f"on-page-options-{uuid4()}",
-            options=[
-                {
-                    "site_id": str(site_id),
-                    "action": "on_page_fix",
-                    "action_type": "product_seo",
-                    "page_type": "product",
-                    "target_asset_id": str(product_id),
-                    "remote_object_id": remote_object_id,
-                    "target_url": target_url,
-                    "connector_id": str(connector_id) if connector_id else None,
-                    "connector_type": connector_type,
-                    "reason": "PG17 on-page lifecycle evidence.",
-                    "user_intent": "Evaluate this exact product before purchase.",
-                    "evidence": {
-                        "product_api": {"remote_object_id": remote_object_id}
-                    },
-                    "schedule_class": "execute_now",
-                    "priority": "P1",
-                    "risk_level": "medium",
-                    "expected_fields": [
-                        "meta_title",
-                        "meta_description",
-                    ],
-                }
-            ],
-        )
-    assert submitted["run_local_option_count"] == 1
 
     async def discoverer(*_args, **_kwargs):
         return [
@@ -1121,6 +2113,11 @@ async def test_on_page_product_run_local_to_observation_closes_on_pg17(
                 "site_type": (
                     "shopify" if connector_type == "shopify" else "main"
                 ),
+                "strategy_enabled": True,
+                "language_code": "en",
+                "market": "US",
+                "domain": f"{connector_type}-{site_id}.test",
+                "base_url": f"https://{connector_type}-{site_id}.test",
             }
         ]
 
@@ -1180,55 +2177,87 @@ async def test_on_page_product_run_local_to_observation_closes_on_pg17(
             ],
         }
 
-    async def evidence(*_args, **_kwargs):
-        return {"snapshot_id": f"evidence-{uuid4()}"}
+    evidence_snapshot_id = f"evidence-{uuid4()}"
 
-    async def planner(
-        session,
-        *,
-        business_id,
-        _strategy_run_id,
-        run_local_options,
-        **_kwargs,
-    ):
-        plan = await _replace_strategy_plan(
-            session,
-            business_id=business_id,
-            analysis_batch_id=str(uuid4()),
-            source_audit_batch_id=str(uuid4()),
-            source_audit_scanned_at="2099-01-01T00:00:00+00:00",
-            action_budget=10,
-            site_quotas={},
-            candidates=run_local_options,
-            strategy_run_id=_strategy_run_id,
-        )
-        option = run_local_options[0]
+    async def evidence(*_args, **_kwargs):
         return {
-            "analysis_batch_id": str(uuid4()),
-            "site_scope": [{"id": str(site_id)}],
-            "plan": plan,
-            "coverage_matrix": {
-                "discovered_site_count": 1,
-                "decided_site_count": 1,
-                "decisions": [
-                    {
-                        "site_id": str(site_id),
-                        "action": "product_seo",
-                        "selected_option_id": option["option_id"],
-                    }
-                ],
-            },
+            "snapshot_id": evidence_snapshot_id,
+            "captured_at": "2099-01-01T00:00:00+00:00",
         }
 
     async with factory() as session:
-        awaiting = await run_strategy_run(
+        researching = await run_strategy_run(
             session,
             run_id=created_run["run_id"],
-            idempotency_key=f"on-page-start-{uuid4()}",
+            idempotency_key=f"on-page-research-start-{uuid4()}",
             site_discoverer=discoverer,
             capability_loader=capabilities,
             evidence_gatherer=evidence,
-            planner=planner,
+        )
+        assert researching["status"] == "ai_researching"
+        await capture_research_portfolio(
+            session,
+            run_id=created_run["run_id"],
+            requested_by="pytest",
+            idempotency_key=f"on-page-research-{uuid4()}",
+            evidence_snapshot_id=evidence_snapshot_id,
+            portfolio=[
+                _pg17_research_item(
+                    site_id=str(site_id),
+                    snapshot_id=evidence_snapshot_id,
+                    material_action="on_page_fix",
+                    user_intent=(
+                        "Evaluate this exact product before purchase."
+                    ),
+                )
+            ],
+        )
+        submitted = await submit_proposed_actions(
+            session,
+            run_id=created_run["run_id"],
+            requested_by="pytest",
+            idempotency_key=f"on-page-proposal-{uuid4()}",
+            actions=[
+                {
+                    "site_id": str(site_id),
+                    "action": "on_page_fix",
+                    "action_type": "product_seo",
+                    "page_type": "product",
+                    "target_asset_id": str(product_id),
+                    "target_identity": {
+                        "target_url": target_url,
+                        "remote_object_id": remote_object_id,
+                        "local_object_id": str(product_id),
+                    },
+                    "connector_id": (
+                        str(connector_id) if connector_id else None
+                    ),
+                    "connector_type": connector_type,
+                    "user_intent": (
+                        "Evaluate this exact product before purchase."
+                    ),
+                    "decision_reason": (
+                        "Current product evidence shows incomplete metadata."
+                    ),
+                    "evidence_refs": [
+                        "site-api-current",
+                        "public-search-current",
+                    ],
+                    "schedule_request": "execute_now",
+                    "priority": "P1",
+                    "risk_level": "medium",
+                    "expected_fields": [
+                        "meta_title",
+                        "meta_description",
+                    ],
+                }
+            ],
+        )
+        assert submitted["proposed_action_count"] == 1
+        awaiting = await run_strategy_run(
+            session,
+            run_id=created_run["run_id"],
+            idempotency_key=f"on-page-plan-start-{uuid4()}",
         )
     assert awaiting["status"] == "awaiting_approval"
     action_id = awaiting["action_ids"][0]

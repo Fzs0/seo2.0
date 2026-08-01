@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from app.core.article_urls import is_oemapps_site
+from app.core.article_urls import is_content_openapi_site, is_oemapps_site
 
 
 FORBIDDEN_ACTIONS = {
@@ -182,6 +182,13 @@ def contract_for_site(site: dict[str, Any], adapters: set[str]) -> dict[str, Any
             "cover_image",
         ]
     if merged["supported_fields"].get("articles") and _is_wordpress_site(site):
+        merged["supported_fields"]["articles"] = [
+            *merged["supported_fields"]["articles"],
+            "images",
+            "image_alts",
+            "cover_image",
+        ]
+    if merged["supported_fields"].get("articles") and is_content_openapi_site(site):
         merged["supported_fields"]["articles"] = [
             *merged["supported_fields"]["articles"],
             "images",

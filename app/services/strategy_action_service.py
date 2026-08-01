@@ -21,6 +21,9 @@ from app.services.strategy_plan_contract import (
 )
 
 RESULTS = {"created", "updated", "already_applied", "blocked", "failed", "readback_mismatch"}
+DEFAULT_UNEXECUTED_ACTION_TTL_HOURS = 24
+UNEXECUTED_ACTION_STATUSES = {"planned", "previewing", "previewed", "approved"}
+SAFE_UNAPPLIED_RECOVERY_STATUSES = {"confirmed_not_applied", "confirmed_absent"}
 ON_PAGE_ACTION_TYPES = {
     "homepage_seo",
     "product_seo",
@@ -41,6 +44,13 @@ class ActionStore(Protocol):
     async def save(self, action: dict[str, Any]) -> None: ...
     async def record_exception(self, exception: dict[str, Any]) -> dict[str, Any]: ...
     async def create_observation(self, observation: dict[str, Any]) -> dict[str, Any]: ...
+    async def list_reconciliation_candidates(
+        self, business_id: str
+    ) -> list[dict[str, Any]]: ...
+    async def reconcile_source_strategy(
+        self, strategy_task_id: str, *, action_status: str
+    ) -> None: ...
+    async def resolve_corrective_parent(self, action: dict[str, Any]) -> None: ...
 
 
 class BlockedActionAdapter:
@@ -127,11 +137,40 @@ class SQLActionStore:
 
         await reconcile_strategy_run(self.session, run_id=run_id)
 
+    async def reconcile_source_strategy(
+        self, strategy_task_id: str, *, action_status: str
+    ) -> None:
+        """Close the selected Strategy when its only executable Action terminates."""
+        await self.session.execute(
+            text(
+                """
+                UPDATE seo_agent.tasks
+                   SET status=:status,
+                       decision=decision || jsonb_build_object(
+                           'closure_reason', 'source_action_terminal',
+                           'source_action_status', CAST(:action_status AS text)
+                       ),
+                       finished_at=now(), updated_at=now()
+                 WHERE id=CAST(:strategy_task_id AS uuid)
+                   AND task_type='review'
+                   AND payload->>'kind'='seo_strategy'
+                   AND payload->>'schedule_class'='execute_now'
+                   AND status IN ('queued','running','blocked')
+                """
+            ),
+            {
+                "strategy_task_id": strategy_task_id,
+                "status": _task_status(action_status),
+                "action_status": action_status,
+            },
+        )
+        await self.session.commit()
+
     async def get(self, action_id: str, *, lock: bool = False) -> dict[str, Any]:
         row = (
             await self.session.execute(
                 text(
-                    "SELECT payload FROM seo_agent.tasks "
+                    "SELECT payload, created_at FROM seo_agent.tasks "
                     "WHERE id=CAST(:id AS uuid) AND task_type='review' "
                     "AND payload->>'kind'='strategy_action'" + (" FOR UPDATE" if lock else "")
                 ),
@@ -140,7 +179,39 @@ class SQLActionStore:
         ).mappings().first()
         if not row:
             raise ValueError("strategy action not found")
-        return dict(row["payload"] or {})
+        action = dict(row["payload"] or {})
+        action.setdefault("action_created_at", row.get("created_at"))
+        return action
+
+    async def list_reconciliation_candidates(
+        self, business_id: str
+    ) -> list[dict[str, Any]]:
+        """Return Actions that may need local expiry or remote recovery."""
+        rows = (
+            await self.session.execute(
+                text(
+                    """
+                    SELECT payload, created_at
+                      FROM seo_agent.tasks
+                     WHERE task_type='review'
+                       AND payload->>'kind'='strategy_action'
+                       AND payload->>'business_id'=:business_id
+                       AND payload->>'status' IN (
+                         'planned','previewing','previewed','approved',
+                         'executing','recovering','blocked','failed'
+                       )
+                     ORDER BY created_at, id
+                    """
+                ),
+                {"business_id": business_id},
+            )
+        ).mappings().all()
+        candidates: list[dict[str, Any]] = []
+        for row in rows:
+            action = dict(row["payload"] or {})
+            action.setdefault("action_created_at", row.get("created_at"))
+            candidates.append(action)
+        return candidates
 
     async def save(self, action: dict[str, Any]) -> None:
         await self.session.execute(
@@ -213,6 +284,66 @@ class SQLActionStore:
         await self.session.commit()
         return payload
 
+    async def resolve_corrective_parent(self, action: dict[str, Any]) -> None:
+        """Close the original incident after its approved child passes readback."""
+        parent_id = str(action.get("corrective_of_action_id") or "").strip()
+        if not parent_id:
+            return
+        await self.session.execute(
+            text(
+                """
+                UPDATE seo_agent.tasks
+                   SET payload=payload || jsonb_build_object(
+                         'correction_status','resolved',
+                         'corrective_action_id',CAST(:child_id AS text),
+                         'corrected_at',now()::text
+                       ),
+                       decision=decision || jsonb_build_object(
+                         'correction_status','resolved',
+                         'corrective_action_id',CAST(:child_id AS text)
+                       ),
+                       updated_at=now()
+                 WHERE id=CAST(:parent_id AS uuid)
+                   AND task_type='review'
+                   AND payload->>'kind'='strategy_action'
+                   AND payload->>'business_id'=:business_id
+                   AND payload->>'site_id'=:site_id
+                   AND payload->>'action_type'='update_article'
+                """
+            ),
+            {
+                "parent_id": parent_id,
+                "child_id": str(action.get("action_id") or ""),
+                "business_id": str(action.get("business_id") or ""),
+                "site_id": str(action.get("site_id") or ""),
+            },
+        )
+        await self.session.execute(
+            text(
+                """
+                UPDATE seo_agent.tasks
+                   SET status='done',
+                       payload=payload || jsonb_build_object(
+                         'status','resolved',
+                         'resolved_by_action_id',CAST(:child_id AS text),
+                         'resolved_at',now()::text,
+                         'resolution','corrective Action passed independent readback'
+                       ),
+                       finished_at=COALESCE(finished_at,now()),
+                       updated_at=now()
+                 WHERE task_type='review'
+                   AND payload->>'kind'='strategy_exception'
+                   AND payload->>'action_id'=CAST(:parent_id AS text)
+                   AND status IN ('queued','running','blocked')
+                """
+            ),
+            {
+                "parent_id": parent_id,
+                "child_id": str(action.get("action_id") or ""),
+            },
+        )
+        await self.session.commit()
+
 
 async def get_action(store: ActionStore, *, action_id: str) -> dict[str, Any]:
     return await store.get(action_id)
@@ -255,6 +386,7 @@ async def create_action(store: ActionStore, **values: Any) -> dict[str, Any]:
                 "on-page strategy action requires an exact readable, writable, "
                 "independently readable adapter identity"
             )
+    ttl_hours = _ttl_hours(values.get("unexecuted_ttl_hours"))
     action = {
         "action_id": str(values.get("action_id") or uuid4()),
         "status": "planned",
@@ -267,6 +399,8 @@ async def create_action(store: ActionStore, **values: Any) -> dict[str, Any]:
         "readback": None,
         "rollback_snapshot": {},
         "observation_id": None,
+        "unexecuted_ttl_hours": ttl_hours,
+        "unexecuted_expires_at": _expiry_after(ttl_hours),
         "legacy_capability_compatibility": False,
         **values,
     }
@@ -346,6 +480,9 @@ async def preview_action(
             "patch_hash": _hash(proposed),
             "rollback_snapshot": before,
             "previewed_at": _now(),
+            "unexecuted_expires_at": _expiry_after(
+                _ttl_hours(action.get("unexecuted_ttl_hours"))
+            ),
             "capability_snapshot_hash": capability_snapshot_hash,
             **preview_provenance,
         }
@@ -421,6 +558,12 @@ async def approve_action(
             "approved_snapshot_hash": snapshot_hash,
             "approved_patch_hash": patch_hash,
             "approved_at": _now(),
+            "approval_expires_at": _expiry_after(
+                _ttl_hours(action.get("unexecuted_ttl_hours"))
+            ),
+            "unexecuted_expires_at": _expiry_after(
+                _ttl_hours(action.get("unexecuted_ttl_hours"))
+            ),
             "approved_patch": dict(action.get("proposed_patch") or {}),
             "approved_capability_snapshot_hash": capability_snapshot_hash,
             "approved_adapter_identity": action.get("adapter_identity"),
@@ -678,6 +821,20 @@ async def complete_execution(
         submitted_patch,
         result.get("readback") or {},
         read_only_fields=set(result.get("read_only_fields") or ()),
+        media_transport=str(
+            (
+                (
+                    (action.get("capability_snapshot") or {}).get("connectors")
+                    or {}
+                ).get("images")
+                or {}
+            ).get("transport")
+            or ""
+        )
+        or None,
+        canonical_hosts=set(
+            (action.get("capability_snapshot") or {}).get("canonical_hosts") or ()
+        ),
     )
     action.update(
         {
@@ -733,6 +890,12 @@ async def complete_execution(
     else:
         action["status"] = "failed"
     await store.save(action)
+    if action.get("status") == "completed" and action.get(
+        "corrective_of_action_id"
+    ):
+        resolver = getattr(store, "resolve_corrective_parent", None)
+        if resolver is not None:
+            await resolver(action)
     return {**_response(action, semantic), **({"block_reason": result.get("block_reason")} if result.get("block_reason") else {})}
 
 
@@ -749,11 +912,23 @@ async def recover_action(
     replay = _idempotency_replay(action, "recover", idempotency_key, request_hash)
     if replay is not None:
         return replay
-    original_status = str(action.get("status") or "")
+    current_status = str(action.get("status") or "")
+    original_status = (
+        str(action.get("recovery_from_status") or "")
+        if current_status == "recovering"
+        else current_status
+    )
     terminal_reconciliation = original_status in {"failed", "blocked"}
-    if original_status != "executing" and not terminal_reconciliation:
+    if current_status not in {"executing", "recovering"} and not terminal_reconciliation:
         return {**_response(action, "blocked"), "block_reason": "action_not_executing"}
-    if original_status == "executing":
+    if current_status == "recovering":
+        recovery_expires_at = _parse_time(action.get("recovery_lease_expires_at"))
+        if recovery_expires_at is None or recovery_expires_at > datetime.now(UTC):
+            return {
+                **_response(action, "blocked"),
+                "block_reason": "recovery_lease_active",
+            }
+    elif original_status == "executing":
         expires_at = _parse_time(action.get("execution_lease_expires_at"))
         if expires_at is None or expires_at > datetime.now(UTC):
             return {**_response(action, "blocked"), "block_reason": "execution_lease_active"}
@@ -768,6 +943,10 @@ async def recover_action(
             "status": "recovering",
             "recovery_token": recovery_token,
             "recovery_from_status": original_status,
+            "recovery_claimed_at": _now(),
+            "recovery_lease_expires_at": (
+                datetime.now(UTC) + timedelta(minutes=5)
+            ).isoformat(),
         }
     )
     await store.save(action)
@@ -784,6 +963,9 @@ async def recover_action(
                     "result": "blocked",
                     "last_heartbeat_at": _now(),
                     "recovery_status": status,
+                    "recovery_token": None,
+                    "recovery_claimed_at": None,
+                    "recovery_lease_expires_at": None,
                 }
             )
         else:
@@ -807,10 +989,20 @@ async def recover_action(
                     "side_effect_confirmations": {},
                     "last_heartbeat_at": _now(),
                     "recovery_status": status,
+                    "recovery_token": None,
+                    "recovery_claimed_at": None,
+                    "recovery_lease_expires_at": None,
                 }
             )
     elif status == "confirmed_applied":
-        action.update({"last_heartbeat_at": _now(), "recovery_status": status})
+        action.update(
+            {
+                "last_heartbeat_at": _now(),
+                "recovery_status": status,
+                "recovery_claimed_at": None,
+                "recovery_lease_expires_at": None,
+            }
+        )
         if terminal_reconciliation:
             action["execution_token"] = recovery_token
         action["status"] = "executing"
@@ -870,6 +1062,9 @@ async def recover_action(
                     if status in {"partially_applied", "unknown_remote_state"}
                     else "unknown_remote_state"
                 ),
+                "recovery_token": None,
+                "recovery_claimed_at": None,
+                "recovery_lease_expires_at": None,
             }
         )
         exception = await store.record_exception(
@@ -914,6 +1109,180 @@ async def recover_action_and_reconcile(
     return response
 
 
+async def expire_unexecuted_action(
+    store: ActionStore,
+    *,
+    action_id: str,
+    now: datetime | None = None,
+    ttl_hours: int = DEFAULT_UNEXECUTED_ACTION_TTL_HOURS,
+) -> dict[str, Any]:
+    """Close one expired Action only when remote write absence is provable.
+
+    Planned, previewed, and approved Actions are canceled.  A terminal blocked
+    Action with no execution evidence keeps its diagnostic status but receives
+    ``confirmed_not_applied`` so it no longer owns a strategy scope lock.
+    """
+    current_time = now or datetime.now(UTC)
+    if current_time.tzinfo is None:
+        current_time = current_time.replace(tzinfo=UTC)
+    action = await store.get(action_id, lock=True)
+    status = str(action.get("status") or "")
+    if status in {"completed", "canceled", "failed"}:
+        await _reconcile_source_strategy_if_terminal(store, action)
+        await _reconcile_parent_run_if_terminal(store, action)
+        return {**action, "closure_result": "already_terminal"}
+    if status not in UNEXECUTED_ACTION_STATUSES | {"blocked"}:
+        return {**action, "closure_result": "remote_recovery_required"}
+    safe_recovery = (
+        str(action.get("recovery_status") or "")
+        in SAFE_UNAPPLIED_RECOVERY_STATUSES
+    )
+    if _has_remote_write_evidence(action) and not safe_recovery:
+        return {**action, "closure_result": "remote_recovery_required"}
+    expires_at = _unexecuted_expiry(action, ttl_hours=ttl_hours)
+    if expires_at is None or expires_at > current_time:
+        return {**action, "closure_result": "not_expired"}
+
+    closure = {
+        "closure_reason": "approval_expired_unexecuted",
+        "closure_result": "lock_released",
+        "closed_at": current_time.isoformat(),
+        "lock_released_at": current_time.isoformat(),
+        "remote_write_occurred": False,
+    }
+    if status == "blocked":
+        action.update(
+            {
+                **closure,
+                "recovery_status": "confirmed_not_applied",
+            }
+        )
+    else:
+        action.update(
+            {
+                **closure,
+                "status": "canceled",
+                "result": "blocked",
+                "canceled_at": current_time.isoformat(),
+            }
+        )
+    await store.save(action)
+    await _reconcile_source_strategy_if_terminal(store, action)
+    await _reconcile_parent_run_if_terminal(store, action)
+    return action
+
+
+async def reconcile_stale_actions(
+    store: ActionStore,
+    *,
+    business_id: str,
+    adapter: ActionAdapter | None = None,
+    now: datetime | None = None,
+    ttl_hours: int = DEFAULT_UNEXECUTED_ACTION_TTL_HOURS,
+) -> dict[str, Any]:
+    """Reconcile stale Actions before a new formal plan calculates locks.
+
+    Local cancellation is used only for Actions with no possible write.  Any
+    execution evidence goes through the existing read-only recovery adapter;
+    uncertain remote state remains blocked and keeps its exact target lock.
+    """
+    current_time = now or datetime.now(UTC)
+    if current_time.tzinfo is None:
+        current_time = current_time.replace(tzinfo=UTC)
+    loader = getattr(store, "list_reconciliation_candidates", None)
+    if loader is None:
+        return {
+            "business_id": business_id,
+            "checked": 0,
+            "canceled": 0,
+            "released": 0,
+            "recovered": 0,
+            "uncertain": 0,
+            "details": [],
+        }
+    candidates = await loader(business_id)
+    report: dict[str, Any] = {
+        "business_id": business_id,
+        "checked": len(candidates),
+        "canceled": 0,
+        "released": 0,
+        "recovered": 0,
+        "uncertain": 0,
+        "details": [],
+    }
+    for candidate in candidates:
+        action_id = str(candidate.get("action_id") or "")
+        if not action_id:
+            continue
+        status = str(candidate.get("status") or "")
+        result: dict[str, Any]
+        if (
+            status == "blocked"
+            and candidate.get("recovery_status")
+            in SAFE_UNAPPLIED_RECOVERY_STATUSES
+        ):
+            result = {**candidate, "closure_result": "lock_released"}
+        elif status in UNEXECUTED_ACTION_STATUSES or (
+            status == "blocked" and not _has_remote_write_evidence(candidate)
+        ):
+            result = await expire_unexecuted_action(
+                store,
+                action_id=action_id,
+                now=current_time,
+                ttl_hours=ttl_hours,
+            )
+        elif _action_requires_readback_recovery(candidate, now=current_time):
+            result = await recover_action_and_reconcile(
+                store,
+                action_id=action_id,
+                adapter=adapter,
+                idempotency_key=_stale_recovery_key(candidate),
+            )
+            report["recovered"] += 1
+            if (
+                result.get("status") == "planned"
+                and result.get("recovery_status") in SAFE_UNAPPLIED_RECOVERY_STATUSES
+            ):
+                result = await expire_unexecuted_action(
+                    store,
+                    action_id=action_id,
+                    now=current_time,
+                    ttl_hours=ttl_hours,
+                )
+        elif status in {"executing", "recovering"}:
+            result = {**candidate, "closure_result": "not_stale"}
+        elif status == "failed" and not _has_remote_write_evidence(candidate):
+            result = {**candidate, "closure_result": "already_terminal"}
+        else:
+            result = {**candidate, "closure_result": "remote_recovery_required"}
+
+        closure_result = str(result.get("closure_result") or "")
+        if result.get("status") == "canceled":
+            report["canceled"] += 1
+        if closure_result == "lock_released" or (
+            result.get("status") == "blocked"
+            and result.get("recovery_status") in SAFE_UNAPPLIED_RECOVERY_STATUSES
+        ):
+            report["released"] += 1
+        if closure_result == "remote_recovery_required" or (
+            result.get("status") == "blocked"
+            and result.get("recovery_status")
+            not in SAFE_UNAPPLIED_RECOVERY_STATUSES
+        ):
+            report["uncertain"] += 1
+        report["details"].append(
+            {
+                "action_id": action_id,
+                "previous_status": status,
+                "status": result.get("status"),
+                "closure_result": result.get("closure_result"),
+                "closure_reason": result.get("closure_reason"),
+                "recovery_status": result.get("recovery_status"),
+            }
+        )
+    return report
+
+
 async def heartbeat_action(
     store: ActionStore,
     *,
@@ -950,6 +1319,8 @@ def compare_readback_fields(
     readback: dict[str, Any],
     *,
     read_only_fields: set[str] | None = None,
+    media_transport: str | None = None,
+    canonical_hosts: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Compare approved, submitted, and remote values without trusting adapter booleans."""
     ignored = read_only_fields or set()
@@ -962,8 +1333,17 @@ def compare_readback_fields(
         approved_matches_submission = _normalize_value(expected, field=field) == _normalize_value(
             submitted, field=field
         )
-        remote_matches = _normalize_value(expected, field=field) == _normalize_value(
-            actual, field=field
+        remote_matches = (
+            _article_publish_media_matches(
+                field,
+                expected,
+                actual,
+                canonical_hosts=canonical_hosts or set(),
+            )
+            if str(media_transport or "").endswith("article_publish")
+            and field in {"images", "image_alts", "cover_image"}
+            else _normalize_value(expected, field=field)
+            == _normalize_value(actual, field=field)
         )
         rows.append(
             {
@@ -975,6 +1355,85 @@ def compare_readback_fields(
             }
         )
     return rows
+
+
+def _article_publish_media_matches(
+    field: str,
+    expected: Any,
+    actual: Any,
+    *,
+    canonical_hosts: set[str],
+) -> bool:
+    """Compare media after a custom blog has localized source URLs.
+
+    The self-hosted content API deliberately rewrites submitted public URLs to
+    same-site ``/assets/media/...`` URLs.  URL equality and a media ID are
+    therefore not valid readback invariants for this connector; presence,
+    same-site localization, count, and ALT text are.
+    """
+    normalized_hosts = {
+        str(host).strip().casefold().removeprefix("www.")
+        for host in canonical_hosts
+        if str(host).strip()
+    }
+
+    def localized(value: Any) -> bool:
+        raw = str(value or "").strip()
+        if not raw:
+            return False
+        parsed = urlsplit(raw)
+        if not parsed.netloc:
+            return raw.startswith("/")
+        host = str(parsed.hostname or "").casefold().removeprefix("www.")
+        return bool(host and host in normalized_hosts)
+
+    if field == "images":
+        expected_items = expected if isinstance(expected, list) else []
+        actual_items = actual if isinstance(actual, list) else []
+        return (
+            len(actual_items) == len(expected_items)
+            and (
+                _normalize_value(expected_items, field="images")
+                == _normalize_value(actual_items, field="images")
+                or all(localized(item) for item in actual_items)
+            )
+        )
+    if field == "image_alts":
+        expected_items = expected if isinstance(expected, dict) else {}
+        actual_items = actual if isinstance(actual, dict) else {}
+        expected_alts = sorted(
+            re.sub(r"\s+", " ", str(value)).strip()
+            for value in expected_items.values()
+        )
+        actual_alts = sorted(
+            re.sub(r"\s+", " ", str(value)).strip()
+            for value in actual_items.values()
+        )
+        return (
+            len(actual_items) == len(expected_items)
+            and expected_alts == actual_alts
+            and (
+                set(actual_items) == set(expected_items)
+                or all(localized(src) for src in actual_items)
+            )
+        )
+    expected_cover = expected if isinstance(expected, dict) else {}
+    actual_cover = actual if isinstance(actual, dict) else {}
+    if not expected_cover:
+        return not actual_cover
+    if not actual_cover or not (
+        _normalize_value(expected_cover.get("src"))
+        == _normalize_value(actual_cover.get("src"))
+        or localized(actual_cover.get("src"))
+    ):
+        return False
+    expected_alt = re.sub(
+        r"\s+", " ", str(expected_cover.get("alt") or "")
+    ).strip()
+    actual_alt = re.sub(
+        r"\s+", " ", str(actual_cover.get("alt") or "")
+    ).strip()
+    return not actual_alt or actual_alt == expected_alt
 
 
 def _idempotency_replay(
@@ -1163,6 +1622,14 @@ def _normalize_value(value: Any, *, field: str | None = None) -> Any:
         # exclude a body H1 on either representation before semantic comparison.
         plain = re.sub(r"<h1\b[^>]*>.*?</h1>", " ", plain, flags=re.I | re.S)
         plain = re.sub(r"^#\s+.*(?:\r?\n|$)", " ", plain, count=1, flags=re.M)
+        # Markdown table delimiter rows carry layout/alignment syntax only.
+        # Rendered HTML has no text equivalent for ``|---|---:|``.
+        plain = re.sub(
+            r"^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*$",
+            " ",
+            plain,
+            flags=re.M,
+        )
         # Preserve boundaries between block, list, and table cells before tags
         # are removed; otherwise adjacent HTML cells collapse into one token.
         plain = re.sub(
@@ -1251,6 +1718,12 @@ def _observation_for(action: dict[str, Any]) -> dict[str, Any]:
         "action_id": action.get("action_id"),
         "target_url": action.get("target_url"),
         "action_type": action.get("action_type"),
+        "scope_key": action.get("scope_key")
+        or strategy_decision.get("scope_key"),
+        "lock_scope": action.get("lock_scope")
+        or strategy_decision.get("lock_scope"),
+        "lock_key": action.get("lock_key")
+        or strategy_decision.get("lock_key"),
         "page_type": action.get("page_type"),
         "target_asset_id": action.get("target_asset_id"),
         "remote_object_id": action.get("remote_object_id"),
@@ -1304,6 +1777,81 @@ def _parse_time(value: Any) -> datetime | None:
         return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
     except (TypeError, ValueError):
         return None
+
+
+def _ttl_hours(value: Any) -> int:
+    try:
+        hours = int(value or DEFAULT_UNEXECUTED_ACTION_TTL_HOURS)
+    except (TypeError, ValueError):
+        hours = DEFAULT_UNEXECUTED_ACTION_TTL_HOURS
+    return max(1, min(hours, 24 * 30))
+
+
+def _expiry_after(ttl_hours: int) -> str:
+    return (datetime.now(UTC) + timedelta(hours=_ttl_hours(ttl_hours))).isoformat()
+
+
+def _unexecuted_expiry(
+    action: dict[str, Any], *, ttl_hours: int
+) -> datetime | None:
+    explicit = _parse_time(
+        action.get("approval_expires_at")
+        or action.get("unexecuted_expires_at")
+    )
+    if explicit is not None:
+        return explicit
+    anchor = _parse_time(
+        action.get("approved_at")
+        or action.get("previewed_at")
+        or action.get("action_created_at")
+        or action.get("created_at")
+    )
+    if anchor is None:
+        return None
+    return anchor + timedelta(hours=_ttl_hours(ttl_hours))
+
+
+def _has_remote_write_evidence(action: dict[str, Any]) -> bool:
+    return any(
+        action.get(field) is not None
+        for field in (
+            "execution_token",
+            "execution_claimed_at",
+            "submitted_patch",
+            "remote_response",
+            "execution_task_id",
+            "publish_task_id",
+            "effect_id",
+            "remote_outcome",
+        )
+    )
+
+
+def _action_requires_readback_recovery(
+    action: dict[str, Any], *, now: datetime
+) -> bool:
+    status = str(action.get("status") or "")
+    if status == "executing":
+        lease_expires_at = _parse_time(action.get("execution_lease_expires_at"))
+        return lease_expires_at is not None and lease_expires_at <= now
+    if status == "recovering":
+        lease_expires_at = _parse_time(action.get("recovery_lease_expires_at"))
+        return lease_expires_at is not None and lease_expires_at <= now
+    if status in {"blocked", "failed"}:
+        return bool(action.get("submitted_patch") is not None) and bool(
+            action.get("remote_response") is not None
+        )
+    return False
+
+
+def _stale_recovery_key(action: dict[str, Any]) -> str:
+    marker = (
+        action.get("execution_lease_expires_at")
+        or action.get("recovery_status")
+        or action.get("status")
+        or "unknown"
+    )
+    return f"stale-action-reconcile:{action.get('action_id')}:{_hash(str(marker))[:16]}"
 
 
 def _hash(value: Any) -> str:
@@ -1375,6 +1923,19 @@ async def _reconcile_parent_run_if_terminal(
         await reconciler(str(run_id))
 
 
+async def _reconcile_source_strategy_if_terminal(
+    store: ActionStore, action: dict[str, Any]
+) -> None:
+    if action.get("status") not in {"completed", "blocked", "failed", "canceled"}:
+        return
+    strategy_task_id = str(action.get("source_strategy_task_id") or "").strip()
+    if not strategy_task_id:
+        return
+    reconciler = getattr(store, "reconcile_source_strategy", None)
+    if reconciler is not None:
+        await reconciler(strategy_task_id, action_status=str(action["status"]))
+
+
 def _now() -> str:
     return datetime.now(UTC).isoformat()
 
@@ -1390,11 +1951,13 @@ __all__ = [
     "create_action",
     "execute_action",
     "execute_action_and_reconcile",
+    "expire_unexecuted_action",
     "get_action",
     "heartbeat_action",
     "preview_action",
     "recover_action",
     "recover_action_and_reconcile",
+    "reconcile_stale_actions",
     "rollback_action",
     "rollback_preview",
 ]

@@ -80,7 +80,8 @@ Action。测试数据库名称明确包含 `test`，测试 Adapter 不发网络�
 
 ## 保留限制
 
-- 全局身份认证和 business scope 授权仍是独立生产门禁。
+- 本机回环、`env=local`、源码无漂移且由用户显式调用时，可继续使用完整 Action
+  审批链；全局身份认证和 business scope 授权仍是共享或对外部署门禁。
 - `/start` 仍是同步、可恢复入口，不是独立常驻队列 Worker。
 - Custom OpenAPI 没有写入和独立回读契约，因此默认 Hold。
 - Shopify 首页和分类没有已验证写入能力，因此默认 Hold。

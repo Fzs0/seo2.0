@@ -28,7 +28,11 @@ import structlog
 
 from app.clients.http_client import ExternalCallError, request_json
 from app.connectors.safe_http import ConnectorHttpError, SafeBinaryHttpClient
-from app.core.article_urls import is_oemapps_site, resolve_article_public_url
+from app.core.article_urls import (
+    is_content_openapi_site,
+    is_oemapps_site,
+    resolve_article_public_url,
+)
 from app.core.config import get_settings
 
 logger = structlog.get_logger(__name__)
@@ -533,6 +537,17 @@ class OpenAPIPublisher(PublisherBase):
         if self._is_oemapps():
             body = self._oemapps_article_body(req, content_md)
         else:
+            if is_content_openapi_site(self.site):
+                try:
+                    validate_content_openapi_markdown(content_md)
+                except ValueError as error:
+                    return PublishResult(
+                        ok=False,
+                        dry_run=False,
+                        error=str(error),
+                        raw={"remote_write_occurred": False},
+                    )
+            content_md = _article_source_without_h1(content_md, req.title)
             body = {
                 "title": req.title,
                 "content_md": content_md,
@@ -611,6 +626,17 @@ class OpenAPIPublisher(PublisherBase):
         if self._is_oemapps():
             body = self._oemapps_article_body(req, content_md)
         else:
+            if is_content_openapi_site(self.site):
+                try:
+                    validate_content_openapi_markdown(content_md)
+                except ValueError as error:
+                    return PublishResult(
+                        ok=False,
+                        dry_run=False,
+                        error=str(error),
+                        raw={"remote_write_occurred": False},
+                    )
+            content_md = _article_source_without_h1(content_md, req.title)
             body = {
             "items": [{
                 "title": req.title,
@@ -1744,6 +1770,26 @@ def oemapps_html_from_markdown(source: str, article_title: str) -> str:
     return re.sub(r"<!--\s*/?wp:[\s\S]*?-->", "", rendered).strip()
 
 
+def validate_content_openapi_markdown(source: str) -> None:
+    """Reject raw HTML that the self-hosted Markdown renderer would discard.
+
+    HTML examples inside fenced or inline code remain valid Markdown content;
+    executable tags and comments outside code are forbidden at both preview and
+    final connector boundaries.
+    """
+    without_fences = re.sub(
+        r"^\s*```[^\n]*\n[\s\S]*?^\s*```\s*$",
+        "",
+        str(source or ""),
+        flags=re.M,
+    )
+    without_code = re.sub(r"`[^`\n]*`", "", without_fences)
+    if re.search(r"<!--|</?[A-Za-z][^>]*>", without_code, flags=re.I):
+        raise ValueError(
+            "content_openapi article body must be pure Markdown; HTML tags are not allowed"
+        )
+
+
 def shopify_body_from_markdown(source: str, article_title: str) -> str:
     """Prepare an article body for Shopify, whose article title is stored separately.
 
@@ -1757,6 +1803,18 @@ def shopify_body_from_markdown(source: str, article_title: str) -> str:
 
 def _article_body_without_h1(source: str, article_title: str) -> str:
     """Remove the redundant title H1 and demote every other body H1 to H2."""
+    normalized = _article_source_without_h1(source, article_title)
+    if re.search(r"</?[a-z][^>]*>", source or "", flags=re.I):
+        return normalized
+    body = markdown_to_gutenberg(normalized)
+    # A previously rendered HTML/Gutenberg body may be sent back through an
+    # update path, so enforce the invariant again at the final HTML boundary.
+    body = re.sub(r"<h1\b([^>]*)>", r"<h2\1>", body, flags=re.I)
+    return re.sub(r"</h1\s*>", "</h2>", body, flags=re.I)
+
+
+def _article_source_without_h1(source: str, article_title: str) -> str:
+    """Normalize HTML or Markdown while preserving the source representation."""
     title_key = _heading_key(article_title)
     if re.search(r"</?[a-z][^>]*>", source or "", flags=re.I):
         removed_html_title = False
@@ -1779,7 +1837,17 @@ def _article_body_without_h1(source: str, article_title: str) -> str:
             source,
             flags=re.I,
         )
+    return _article_markdown_without_h1(source, article_title)
 
+
+def _article_markdown_without_h1(source: str, article_title: str) -> str:
+    """Return Markdown body content without any page-level H1.
+
+    Custom OpenAPI stores the article title separately but expects Markdown in
+    ``content_md``.  Preserve that format: remove the matching title heading and
+    demote every other body H1 to H2 instead of converting the body to HTML.
+    """
+    title_key = _heading_key(article_title)
     removed_title = False
     normalized_lines: list[str] = []
     for line in (source or "").replace("\r\n", "\n").replace("\r", "\n").split("\n"):
@@ -1792,12 +1860,7 @@ def _article_body_without_h1(source: str, article_title: str) -> str:
             removed_title = True
             continue
         normalized_lines.append(f"{heading.group(1)}## {heading_text}")
-
-    body = markdown_to_gutenberg("\n".join(normalized_lines))
-    # A previously rendered HTML/Gutenberg body may be sent back through an
-    # update path, so enforce the invariant again at the final HTML boundary.
-    body = re.sub(r"<h1\b([^>]*)>", r"<h2\1>", body, flags=re.I)
-    return re.sub(r"</h1\s*>", "</h2>", body, flags=re.I)
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(normalized_lines)).strip()
 
 
 def _heading_key(value: str) -> str:

@@ -12,7 +12,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.clients.image_provider import search_images
-from app.clients.publishers import ImageUploadRequest, connector_for_site
+from app.clients.publishers import ImageUploadRequest
 from app.core.database import get_db
 from app.services.article_service import (
     articles_kpi,
@@ -58,6 +58,7 @@ from app.services.shopify_product_service import (
 )
 from app.services.site_snapshot_service import probe_apis
 from app.services.serp_snapshot_service import fetch_and_save_serp_snapshot
+from app.services.site_media_service import resolve_site_media_uploader
 
 router = APIRouter()
 logger = structlog.get_logger(__name__)
@@ -621,7 +622,7 @@ async def upload_site_image_route(
 ) -> dict[str, Any]:
     row = await session.execute(
         text(
-            "SELECT id, site_key, name, site_type, domain, base_url, api_base_url, status, api_config "
+            "SELECT id, business_id, site_key, name, site_type, domain, base_url, api_base_url, status, api_config "
             "FROM seo_agent.sites WHERE id = CAST(:id AS uuid)"
         ),
         {"id": site_id},
@@ -632,8 +633,16 @@ async def upload_site_image_route(
     if site["status"] != "active":
         raise HTTPException(status_code=400, detail="site is not active")
 
-    connector = connector_for_site(dict(site), dry_run=body.dry_run)
-    result = await connector.upload_image(ImageUploadRequest(
+    try:
+        media = await resolve_site_media_uploader(
+            session,
+            dict(site),
+            dry_run=body.dry_run,
+            require_active=not body.dry_run,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    result = await media.publisher.upload_image(ImageUploadRequest(
         type=body.type,
         url=body.url,
         file=body.file,
@@ -649,6 +658,9 @@ async def upload_site_image_route(
         "ok": True,
         "dry_run": result.dry_run,
         "site_id": site_id,
+        "media_host_site_id": str(media.media_host_site["id"]),
+        "media_host_site_key": media.media_host_site.get("site_key"),
+        "media_transport": media.transport,
         "image_id": result.image_id,
         "src": result.src,
         "raw": result.raw,

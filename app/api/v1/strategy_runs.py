@@ -1,11 +1,11 @@
-"""Public dry-run orchestration API for SEO strategy runs."""
+"""Public Interface for the one AI-led SEO Strategy Run chain."""
 from __future__ import annotations
 
 from datetime import datetime
 from typing import Any, Literal
 from uuid import UUID
 from fastapi import APIRouter, Depends, Header, Query, Request, status
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
@@ -19,7 +19,12 @@ from app.services.strategy_run_service import (
     reconcile_strategy_run,
     retry_strategy_run,
     run_strategy_run,
-    submit_strategy_run_local_options,
+)
+from app.services.autonomous_strategy_orchestrator import (
+    StrategyContractError,
+    capture_research_portfolio,
+    review_zero_action_run,
+    submit_proposed_actions,
 )
 
 
@@ -58,7 +63,156 @@ class StrategyRunRetryBody(StrategyRunControlBody):
     idempotency_key: str = Field(min_length=8, max_length=300)
 
 
-class StrategyRunLocalOptionBody(BaseModel):
+class EvidenceSourceBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source_type: Literal[
+        "gsc",
+        "ga4",
+        "site_api",
+        "serpapi",
+        "public_search",
+        "semrush_ui",
+        "other",
+    ]
+    source_name: str = Field(min_length=1, max_length=300)
+    captured_at: datetime
+    data_window: dict[str, Any] = Field(default_factory=dict)
+    market: str | None = Field(default=None, max_length=50)
+    language: str | None = Field(default=None, max_length=50)
+    device: str | None = Field(default=None, max_length=50)
+    dimensions: list[str] = Field(default_factory=list, max_length=50)
+    filters: dict[str, Any] = Field(default_factory=dict)
+    freshness: Literal["current", "recent", "lagging", "unknown"] = "unknown"
+    fact_scope: Literal[
+        "product_fact",
+        "first_party_performance",
+        "user_behavior",
+        "intent",
+        "competitor_estimate",
+        "other",
+    ] = "other"
+    artifact_refs: list[str] = Field(default_factory=list, max_length=100)
+    collection_status: Literal["success", "partial", "empty", "failed"]
+    limitations: list[str] = Field(default_factory=list, max_length=50)
+    decision_use: str = Field(min_length=1, max_length=2000)
+
+
+class ResearchTargetIdentityBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    target_url: str | None = Field(default=None, max_length=3000)
+    remote_object_id: str | None = Field(default=None, max_length=1000)
+    local_object_id: str | None = Field(default=None, max_length=1000)
+    intent_key: str | None = Field(default=None, max_length=1000)
+    topic_cluster: str | None = Field(default=None, max_length=1000)
+
+
+class ResearchMaterialOptionBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    option_id: str = Field(min_length=1, max_length=300)
+    action: Literal[
+        "new_article",
+        "update_article",
+        "on_page_fix",
+    ]
+    action_type: Literal[
+        "homepage_seo",
+        "product_seo",
+        "category_seo",
+        "product_image_alt",
+    ] | None = None
+    target_identity: ResearchTargetIdentityBody
+    user_intent: str = Field(min_length=1, max_length=2000)
+    evidence_refs: list[str] = Field(min_length=1, max_length=100)
+    outcome: Literal["qualified", "rejected", "blocked"]
+    reason: str = Field(min_length=1, max_length=3000)
+    blocker_code: str | None = Field(default=None, max_length=200)
+    block_scope: Literal["url", "topic"] | None = None
+
+
+class OpportunityExhaustionBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    surfaces_checked: list[str] = Field(default_factory=list, max_length=50)
+    evaluated_option_ids: list[str] = Field(default_factory=list, max_length=100)
+    conclusion: str | None = Field(default=None, max_length=3000)
+
+
+class ActionAssessmentBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    outcome: str = Field(min_length=1, max_length=100)
+    reason: str = Field(min_length=1, max_length=3000)
+    evidence_refs: list[str] = Field(min_length=1, max_length=100)
+
+
+class SiteResearchBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    site_id: UUID
+    site_language: str | None = Field(default=None, max_length=50)
+    site_market: str | None = Field(default=None, max_length=50)
+    evidence_snapshot_id: str | None = Field(default=None, max_length=200)
+    research_questions: list[str] = Field(default_factory=list, max_length=100)
+    actions_considered: list[
+        Literal[
+            "new_article",
+            "update_article",
+            "on_page_fix",
+            "hold",
+            "configuration_repair",
+        ]
+    ] = Field(default_factory=list, max_length=5)
+    material_options: list[ResearchMaterialOptionBody] = Field(
+        default_factory=list, max_length=100
+    )
+    opportunity_exhaustion: OpportunityExhaustionBody = Field(
+        default_factory=OpportunityExhaustionBody
+    )
+    action_assessments: dict[
+        Literal[
+            "new_article",
+            "update_article",
+            "on_page_fix",
+            "hold",
+            "configuration_repair",
+        ],
+        ActionAssessmentBody,
+    ] = Field(default_factory=dict, max_length=5)
+    hard_blockers: list[dict[str, Any]] = Field(default_factory=list, max_length=50)
+    sources_attempted: list[str] = Field(default_factory=list, max_length=100)
+    evidence_sources: list[EvidenceSourceBody] = Field(
+        default_factory=list, max_length=200
+    )
+    missing_evidence: list[str] = Field(default_factory=list, max_length=100)
+    evidence_conflicts: list[dict[str, Any]] = Field(
+        default_factory=list, max_length=100
+    )
+    research_conclusion: str = Field(min_length=1, max_length=5000)
+
+
+class ResearchPortfolioBody(StrategyRunControlBody):
+    model_config = ConfigDict(extra="forbid")
+
+    evidence_snapshot_id: str = Field(min_length=1, max_length=200)
+    portfolio: list[SiteResearchBody] = Field(min_length=1, max_length=500)
+
+
+class TargetIdentityBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    target_url: str | None = Field(default=None, max_length=3000)
+    remote_object_id: str | None = Field(default=None, max_length=1000)
+    local_object_id: str | None = Field(default=None, max_length=1000)
+    intent_key: str | None = Field(default=None, max_length=1000)
+    topic_cluster: str | None = Field(default=None, max_length=1000)
+
+
+class ProposedActionBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     site_id: UUID
     action: Literal[
         "new_article",
@@ -67,124 +221,41 @@ class StrategyRunLocalOptionBody(BaseModel):
         "hold",
         "configuration_repair",
     ]
-    schedule_class: Literal[
-        "execute_now", "deferred", "hold", "configuration_repair"
-    ]
-    topic: str | None = Field(default=None, max_length=500)
-    title: str | None = Field(default=None, max_length=500)
-    reason: str = Field(min_length=1, max_length=4000)
-    user_intent: str = Field(min_length=1, max_length=2000)
-    evidence: dict[str, Any] = Field(default_factory=dict)
-    candidate_id: UUID | None = None
-    keyword_id: UUID | None = None
-    post_id: UUID | None = None
-    article_id: UUID | None = None
     action_type: Literal[
         "homepage_seo",
         "product_seo",
         "category_seo",
         "product_image_alt",
     ] | None = None
-    page_type: Literal["homepage", "product", "category"] | None = None
-    target_asset_id: str | None = Field(default=None, min_length=1, max_length=500)
-    remote_object_id: str | None = Field(default=None, min_length=1, max_length=1000)
-    target_url: str | None = Field(default=None, max_length=3000)
-    connector_id: UUID | None = None
-    connector_type: str | None = Field(default=None, min_length=1, max_length=100)
-    expected_fields: list[str] = Field(default_factory=list, max_length=20)
-    priority: Literal["P0", "P1", "P2", "P3", "Hold"] = "P2"
-    opportunity_score: float = Field(default=0, ge=0, le=100)
-    readiness_score: float = Field(default=0.5, ge=0, le=1)
-    risk_score: float = Field(default=0.5, ge=0, le=1)
-    risk_level: Literal["low", "medium", "high"] = "medium"
+    target_identity: TargetIdentityBody = Field(default_factory=TargetIdentityBody)
+    schedule_request: Literal[
+        "execute_now", "deferred", "hold", "configuration_repair"
+    ]
+    topic: str | None = Field(default=None, max_length=500)
+    title: str | None = Field(default=None, max_length=500)
+    user_intent: str = Field(min_length=1, max_length=2000)
+    decision_reason: str = Field(min_length=1, max_length=4000)
+    evidence_refs: list[str] = Field(min_length=1, max_length=100)
+    alternatives_considered: list[dict[str, Any]] = Field(
+        default_factory=list, max_length=100
+    )
     hypothesis: str | None = Field(default=None, max_length=3000)
-    success_metrics: list[str] = Field(default_factory=list, max_length=20)
-    rejected_alternatives: list[str] = Field(default_factory=list, max_length=20)
-    candidate_influence: str | None = Field(default=None, max_length=1000)
-    reevaluate_at: datetime | None = None
+    success_metrics: list[str] = Field(default_factory=list, max_length=50)
     reevaluation_condition: str | None = Field(default=None, max_length=2000)
-
-    @model_validator(mode="after")
-    def validate_action_contract(self):
-        if self.action in {"new_article", "update_article"} and not self.topic:
-            raise ValueError("article run-local options require topic")
-        if (
-            self.action == "update_article"
-            and not self.post_id
-            and not self.article_id
-            and not self.target_url
-        ):
-            raise ValueError(
-                "update_article run-local options require a target identity"
-            )
-        page_type_by_action = {
-            "homepage_seo": "homepage",
-            "product_seo": "product",
-            "category_seo": "category",
-            "product_image_alt": "product",
-        }
-        if self.action == "on_page_fix":
-            if not self.action_type:
-                raise ValueError(
-                    "on_page_fix run-local options require a concrete action_type"
-                )
-            expected_page_type = page_type_by_action[self.action_type]
-            if self.page_type != expected_page_type:
-                raise ValueError(
-                    f"{self.action_type} requires page_type={expected_page_type}"
-                )
-            if (
-                self.page_type != "homepage"
-                and not self.target_asset_id
-                and not self.remote_object_id
-            ):
-                raise ValueError(
-                    "product/category on_page_fix options require target_asset_id "
-                    "or remote_object_id"
-                )
-            if not self.target_url:
-                raise ValueError(
-                    "on_page_fix run-local options require target_url"
-                )
-            if not self.expected_fields:
-                raise ValueError(
-                    "on_page_fix run-local options require expected_fields"
-                )
-        elif any(
-            (
-                self.action_type,
-                self.page_type,
-                self.target_asset_id,
-                self.remote_object_id,
-                self.connector_id,
-                self.connector_type,
-                self.expected_fields,
-            )
-        ):
-            raise ValueError(
-                "concrete on-page target fields require action=on_page_fix"
-            )
-        expected_schedule = {
-            "hold": "hold",
-            "configuration_repair": "configuration_repair",
-        }.get(self.action)
-        if expected_schedule and self.schedule_class != expected_schedule:
-            raise ValueError(
-                f"{self.action} requires schedule_class={expected_schedule}"
-            )
-        if self.schedule_class in {"hold", "configuration_repair"} and (
-            self.action != self.schedule_class
-        ):
-            raise ValueError(
-                "hold/configuration_repair schedule must match the action"
-            )
-        if not self.evidence:
-            raise ValueError("run-local options require current research evidence")
-        return self
+    priority: Literal["P0", "P1", "P2", "P3", "Hold"] = "P2"
+    risk_level: Literal["low", "medium", "high"] = "medium"
+    page_type: Literal["homepage", "product", "category"] | None = None
+    target_asset_id: str | None = Field(default=None, max_length=1000)
+    corrective_of_action_id: UUID | None = None
+    connector_id: UUID | None = None
+    connector_type: str | None = Field(default=None, max_length=100)
+    expected_fields: list[str] = Field(default_factory=list, max_length=50)
 
 
-class StrategyRunLocalOptionsBody(StrategyRunControlBody):
-    options: list[StrategyRunLocalOptionBody] = Field(min_length=1, max_length=200)
+class ProposedActionsBody(StrategyRunControlBody):
+    model_config = ConfigDict(extra="forbid")
+
+    actions: list[ProposedActionBody] = Field(min_length=1, max_length=500)
 
 
 @router.post("", status_code=status.HTTP_201_CREATED)
@@ -207,6 +278,14 @@ async def create_strategy_run_route(
             approval_policy=body.approval_policy,
         )
         return success(request, run, status_code=status.HTTP_201_CREATED)
+    except StrategyContractError as error:
+        return failure(
+            request,
+            status_code=409,
+            code=error.code,
+            message=str(error),
+            retryable=False,
+        )
     except ValueError as error:
         return failure(
             request, status_code=400, code="STRATEGY_RUN_INVALID_REQUEST",
@@ -214,33 +293,88 @@ async def create_strategy_run_route(
         )
 
 
-@router.post("/{run_id}/run-local-options")
-async def submit_strategy_run_local_options_route(
+@router.post("/{run_id}/research-portfolio")
+async def capture_research_portfolio_route(
     run_id: str,
-    body: StrategyRunLocalOptionsBody,
+    body: ResearchPortfolioBody,
     request: Request,
     idempotency_key: str = Header(min_length=8, alias="Idempotency-Key"),
     session: AsyncSession = Depends(get_db),
 ):
-    """Persist research-driven options before the formal planning stage."""
+    """Bind auditable, site-complete AI research to the current evidence."""
     try:
         return success(
             request,
-            await submit_strategy_run_local_options(
+            await capture_research_portfolio(
                 session,
                 run_id=run_id,
                 requested_by=body.requested_by.strip(),
                 idempotency_key=idempotency_key.strip(),
-                options=[
-                    option.model_dump(mode="json") for option in body.options
+                evidence_snapshot_id=body.evidence_snapshot_id,
+                portfolio=[
+                    item.model_dump(mode="json") for item in body.portfolio
                 ],
             ),
         )
-    except ValueError as error:
+    except StrategyContractError as error:
         return failure(
             request,
             status_code=409,
-            code="STRATEGY_RUN_OPTIONS_REJECTED",
+            code=error.code,
+            message=str(error),
+            retryable=False,
+        )
+
+
+@router.post("/{run_id}/proposed-actions")
+async def submit_proposed_actions_route(
+    run_id: str,
+    body: ProposedActionsBody,
+    request: Request,
+    idempotency_key: str = Header(min_length=8, alias="Idempotency-Key"),
+    session: AsyncSession = Depends(get_db),
+):
+    """Submit AI editorial decisions for backend-only safety review."""
+    try:
+        return success(
+            request,
+            await submit_proposed_actions(
+                session,
+                run_id=run_id,
+                requested_by=body.requested_by.strip(),
+                idempotency_key=idempotency_key.strip(),
+                actions=[
+                    item.model_dump(mode="json") for item in body.actions
+                ],
+            ),
+        )
+    except StrategyContractError as error:
+        return failure(
+            request,
+            status_code=409,
+            code=error.code,
+            message=str(error),
+            retryable=False,
+        )
+
+
+@router.post("/{run_id}/zero-action-review")
+async def review_zero_action_route(
+    run_id: str,
+    request: Request,
+    session: AsyncSession = Depends(get_db),
+):
+    """Return the persisted backend zero-action review for the Run."""
+    try:
+        return success(
+            request,
+            await review_zero_action_run(session, run_id=run_id),
+        )
+    except StrategyContractError as error:
+        return failure(
+            request,
+            status_code=409,
+            code=error.code,
             message=str(error),
             retryable=False,
         )

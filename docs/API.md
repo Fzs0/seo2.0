@@ -1,5 +1,12 @@
 # API 接口文档
 
+> 2026-08-01：`POST /api/v1/strategy-runs/{run_id}/research-portfolio`
+> 已升级为具体机会契约。`material_options` 必须包含 `option_id`、具体
+> `target_identity`、`outcome`、`reason` 与证据；`opportunity_exhaustion`
+> 必须记录已检查的现有页面/新主题和全部已评估机会 ID。URL 或主题冷却不得
+> 声明为站点级冷却。完整契约见
+> `docs/AI_URL_TOPIC_COOLDOWN_DECISION_CONTRACT_2026-08-01.md`。
+
 > 基于 2026-07-26 当前工作区源码与动态 OpenAPI 核对。本文覆盖 182 个显式 HTTP 操作：主服务 151 个、独立知识服务 29 个、社媒执行器 2 个。FastAPI 自动生成的 `/docs`、`/redoc`、`/openapi.json` 及静态资源未计入接口总数；同一路径的不同 HTTP 方法分别计数。
 
 ## 1. 服务概览
@@ -111,8 +118,23 @@
 | POST | `/api/v1/sites/sync-config` | 无 | 从项目配置同步站点到数据库。 |
 | DELETE | `/api/v1/sites/{site_id}` | 路径：`site_id` | `{deleted: true}`；不存在返回 404。 |
 | GET | `/api/v1/sites/{site_id}/connector` | 路径：`site_id` | 检测该站点发布连接器，返回站点信息和连接结果；会发起外部调用。 |
-| POST | `/api/v1/sites/{site_id}/images/upload` | `SiteImageUploadBody` | 通过站点发布连接器上传 URL、文件路径或 Base64 图片；OEMApps 与 WordPress 均返回可用于正文的 `src` 和封面所需的 `image_id`；默认 `dry_run=true`。 |
+| POST | `/api/v1/sites/{site_id}/images/upload` | `SiteImageUploadBody` | 上传 URL、文件路径或 Base64 图片；默认 `dry_run=true`。OEMApps 主站和 WordPress 使用自身媒体接口；自建 Custom OpenAPI 博客自动路由到同 `business_id` 的 OEMApps 主站媒体库。响应同时返回目标 `site_id`、实际 `media_host_site_id/media_host_site_key`、`image_id` 和 `src`；禁止跨业务选择媒体主站。 |
 | POST | `/api/v1/sites/{site_id}/posts/sync` | 路径：`site_id`；可选 `SyncPostsBody` | 从一个外部站点同步已有文章。 |
+
+文章媒体必须按站点连接器执行，不能共用一种请求体：
+
+| 站点类型 | 媒体传输 | 封面字段 | 正文图片 |
+| --- | --- | --- | --- |
+| OEMApps 主站（如 Exdivo） | `POST /file/upload` | `src` + 真实数字 `image_id` | 使用上传返回的 `src` |
+| WordPress 文章站 | WordPress Media API | `featured_media` | 使用 Media API 返回的 URL |
+| 自建 Custom OpenAPI 博客（如 topvapes.de） | 先上传到同业务 OEMApps 主站，再由文章 API 采集；禁止跨业务 | 使用主站返回的真实 `src` 写入 `cover_url` | 主站 `src` 写入 `content_md`，博客后端可继续转存为本域媒体 |
+
+Strategy Action 的 generation context 会返回 `media_transport` 和
+`accepted_media_inputs`。Custom OpenAPI 博客返回
+`media_transport=business_oemapps_upload_then_article_publish`、
+`accepted_media_inputs=["url","file","base64"]`；Action 媒体接口先根据
+`business_id` 锁定同业务 OEMApps 主站并真实上传，再把返回的 `src` 交给目标博客
+文章 POST/PUT。`media_host_business_id` 必须与目标站业务一致。
 
 ### 2.6 关键词
 
@@ -269,7 +291,7 @@ GA4 数据源可在本地配置中提供 `ga4Hostnames: string[]`。未显式配
 | `SerpApiBody` | `keyword: string`，`gl?: string`，`hl?: string` |
 | `ImageSearchBody` | `provider: string = "pexels"`，`query: string`，`per_page: integer = 10`，`page: integer = 1` |
 | `PublishBody` | `article_id: string`，`site_id?: string`，`dry_run: boolean = true`，`actor?: string`，`update_post_id?: string`；更新旧文时锁定远端文章 ID |
-| `SiteImageUploadBody` | `type: string`；三选一提供 `url?`、`file?`、`base64?`；可选 `filename?`、`alt_text?`、`title?`、`caption?`；`dry_run: boolean = true`。把上传返回的 `image_id`、`src` 和 ALT 存入文章 `image_plan` 的 `role=cover` 项；OEMApps 发布适配器以 `src` + 数字 `image_id` 设置封面，并以 `YYYY-MM-DD` 传递 `published_at`；WordPress 以该 `image_id` 设置 `featured_media`。正文图片使用 `src` 和非空 ALT 插入 Markdown。 |
+| `SiteImageUploadBody` | `type: string`；三选一提供 `url?`、`file?`、`base64?`；可选 `filename?`、`alt_text?`、`title?`、`caption?`；`dry_run: boolean = true`。OEMApps 主站保存 `image_id/src`；WordPress 以 Media API 的 `image_id` 设置 `featured_media`；Custom OpenAPI 自建博客由系统自动选择同业务 OEMApps 主站保存图片，再以返回的 `src` 写入目标博客的 `cover_url/content_md`。 |
 | `AnalyticsSyncBody` | 三选一：`sourceId: string`、`siteId: string` 或 `all: true`；可附 `daysBack?: integer`、`skipGsc?: boolean`、`skipGa4?: boolean` |
 | `RuleSetBody` | `name: string`，`version: string`，`source: string = "api"`，`payload: object`，`notes?: string`，`set_active: boolean = false`，`actor?: string` |
 
@@ -521,7 +543,16 @@ curl -X POST http://127.0.0.1:8010/api/v1/knowledge/retrieve \
 `docs/SEO_AUTONOMOUS_OPERATIONS_BACKEND_V2.md`。
 
 - `POST /api/v1/strategy-runs`：创建幂等 `dry_run` 或 `approval_execution` Run。
-- `POST /api/v1/strategy-runs/{run_id}/run-local-options`：在 Run 启动前提交本轮实时研究得到的自主选题。`candidate_id`、`keyword_id` 均为可选来源；On-page 以 `action=on_page_fix` 表达编辑决策，同时提交具体 `action_type`、`page_type`、`target_asset_id` 或稳定远端 ID、`target_url`、连接器身份和 `expected_fields`。后端从现有数据库回查业务、站点、本地资产、远端对象、URL 和连接器归属，再交给 Formal Plan。已提交选题不能在同一 Run 中静默替换，需要更改时创建新 Run。
+- `POST /api/v1/strategy-runs/{run_id}/research-portfolio`：提交与当前
+  Evidence Snapshot 绑定、逐站完整的 AI Research Portfolio。每站必须记录五类
+  动作评估、证据来源、实质备选方向、冲突和研究结论。
+- `POST /api/v1/strategy-runs/{run_id}/proposed-actions`：提交 AI 的正式编辑决策。
+  新 Interface 禁止 `candidate_id` 和 `keyword_id`；关键词仅能作为通用
+  `evidence_refs` 引用。后端只做范围、目标、能力、冲突、风险和安全容量审查，
+  不替换主题或重新排名。
+- `POST /api/v1/strategy-runs/{run_id}/zero-action-review`：读取已经持久化的零动作
+  复审。全量无 Execute/Deferred 时，研究不足返回补证；证据充分才允许全量 Hold；
+  连续两次证据和理由无实质变化的全量 Hold 返回 `STRATEGY_STAGNATION`。
 - `GET /api/v1/strategy-runs/{run_id}`：查询统一运行状态。
 - `GET /api/v1/strategy-runs/{run_id}/events`：查询结构化事件。
 - `POST /api/v1/strategy-runs/{run_id}/start`：幂等启动或恢复人工审批运行。
@@ -534,11 +565,19 @@ curl -X POST http://127.0.0.1:8010/api/v1/knowledge/retrieve \
 - `/api/v1/businesses/{business_id}/sites/capabilities`：读取业务全站能力。
 - `/api/v1/sites/{site_id}/capabilities`：读取单站能力。
 
-自主选题的标准顺序是：
-`创建 Run → 实时研究 → 提交 run-local-options → start → Formal Plan → Action`。
-一旦存在已提交的 run-local options，旧审计候选和关键词只保留研究参考价值，
-不能与提交选题竞争或自动创建 Action。
+正式顺序是：
+`创建 Run → start 发现范围和证据 → AI Research Portfolio
+→ AI Proposed Actions → start Safety/Zero Action Review
+→ Formal Plan → Unified Action`。旧 `run-local-options` 路由已删除并返回 404。
+候选池只保留历史只读查询，不参与新 Run、Research、Plan、Strategy 或 Action；
+关键词库是可选研究证据，不拥有决策权。
+
+`action_budget` 是最大 200 的失控保护上限，不是日更数量、选题分数或必须完成量。
+超出上限的合格动作完整保存为 Deferred。每个站点当前波次最多一个远程写 Action，
+即使调用方提交更高 `site_quotas` 也不能扩大这一上限。
 
 以上 Run、Action 和 Capabilities 接口统一返回
 `{ok, request_id, data, error}`；所有写接口要求幂等键。前端只承担只读看板，
-不参与选题、路由或执行决策。全局身份认证与 business scope 授权仍是独立生产门禁。
+不参与选题、路由或执行决策。本机回环、`env=local`、源码无漂移且由用户显式
+调用时，可按现有 business/site 血缘与 Action 审批链执行；全局身份认证与
+business scope 授权仍是共享或对外部署前的独立强制门禁。

@@ -1,11 +1,15 @@
 # SEO 自主运营后端 V2
 
-本版本定位为“人工审批执行版”，不是无审批生产自动化。全局身份认证和
-business scope 授权完成前，生产真实写适配器必须保持禁用。
+本版本定位为“人工审批执行版”，不是无审批生产自动化。项目规定的本机启动
+方式仅绑定回环地址；在用户显式调用、运行环境为 local、源码无漂移、业务/站点
+范围明确且完整 Action 审批门禁通过时，可执行本机操作员链路。全局身份认证和
+business scope 授权仍是共享或对外部署前的强制门禁，未完成时不得对外暴露接口。
 
 ## 安全边界
 
 - 仅支持 PostgreSQL 17；应用启动和 CI 发布门禁都会检查主版本。
+- 本机操作员模式必须验证回环绑定、local 环境、源码指纹和精确 business/site
+  血缘；任一条件不成立时不得使用该模式。
 - 默认 Action adapter 返回稳定阻塞结果，不执行远端写入。
 - 文章和基础 SEO 字段只有在能力快照声明可写、预览哈希和补丁哈希均获审批时
   才能交给显式注入的 adapter。
@@ -19,20 +23,28 @@ Run 使用现有 `seo_agent.tasks.payload` 持久化，不增加数据库结构�
 开始、查询、事件、取消、重试和人工收口。阶段输出、事件、站点清单、能力快照和
 覆盖矩阵均持久化，重启后从未完成阶段继续，已完成阶段不会重复执行。
 
-Run 在 `queued` 状态支持
-`POST /strategy-runs/{run_id}/run-local-options`。Codex 可先读取站点、产品、
-内容、GSC、GA4、SERP 和公开资料，自主决定新写、更新、On-page、Hold 或配置修复，
-再提交本轮选题。提交内容要求当前证据、用户意图和决策理由；更新文章还必须携带
-现有目标身份。后端校验 business/site/目标引用和幂等键后，将选题保存在当前 Run，
-不新增表或字段。
+Run 通过 `AutonomousStrategyOrchestrator` 的三个正式入口保存 AI 研究和决策：
+
+- `POST /strategy-runs/{run_id}/research-portfolio`；
+- `POST /strategy-runs/{run_id}/proposed-actions`；
+- `POST /strategy-runs/{run_id}/zero-action-review`。
+
+Codex 先启动 Run 完成范围发现、能力快照和 Evidence Snapshot，再针对每个站点提交
+完整 Research Portfolio 和 Proposed Actions。后端校验 business/site、精确目标、
+能力、受保护字段、在途冲突、风险、幂等和安全容量，但不选择、替换或评分 AI 主题。
+旧 `run-local-options` 路由已删除；候选池不再是新链路的研究输入或授权来源。
 
 ```text
 queued
 → discovering_sites
 → checking_capabilities
 → gathering_evidence
+→ ai_researching
+→ proposed_actions_submitted
+→ safety_reviewing
 → planning
-→ refreshing_evidence → replanning
+→ zero_action_reviewing
+→ research_revision_required → ai_researching
 → awaiting_approval
 → executing
 → verifying
@@ -59,15 +71,17 @@ Run 不得完成。
 `safety_action_ceiling`。超过安全上限的合格选项只能转为 `deferred`，不得丢弃，
 也不得改变其研究结论。站点级上限遵循相同规则。
 
-关键词和候选记录只作为研究来源：正式 Strategy 的 `candidate_id`、`keyword_id`
-均可为空。候选记录本身不能创建 Action。Action 必须同时精确引用当前
+候选记录已退出新策略链路，只保留历史只读查询。正式 Research、Proposed Action、
+Strategy 和 Action 均不接受 `candidate_id`。`keyword_id` 不进入核心 Interface；
+关键词如被 AI 使用，只能作为通用 evidence reference，不能授权或选择动作。
+Action 必须同时精确引用当前
 `Run → Plan → execute_now Strategy`，且 business、site、action type 全部一致。
-当 Run 已提交 run-local options 时，这批当前研究选题是该 Run 的唯一正式规划
-输入；旧审计候选、关键词库和持久候选不能参与排名、替换提交选题或自动获得
-`execute_now`。提交的 `execute_now/deferred/hold/configuration_repair` 会保留，
+AI Proposed Actions 是当前 Run 唯一正式规划输入；旧审计候选和关键词分析
+任务不能参与排名、替换选题或自动获得 `execute_now`。提交的
+`execute_now/deferred/hold/configuration_repair` 会保留，
 但风险、站点配置、能力快照和安全上限仍可将危险动作降级，不会被绕过。
-重新规划只替换同一 `strategy_run_id` 的旧计划，不影响同业务的其他 Run，因此
-业务和站点数量增长不会造成计划互相覆盖。
+同一 Run、Research 和 Proposed Action 通过幂等哈希回放；输入变化使用新幂等键和
+新的研究修订。不同 Run 的 Formal Plan 独立保存，不会因业务和站点数量增长互相覆盖。
 
 ## Site Capabilities
 
@@ -200,6 +214,7 @@ Adapter 身份。OEMApps 产品/图片 ALT、分类和首页分别要求对应�
 - Custom OpenAPI 当前仍只有只读产品契约，因此未注册 On-page 写 Adapter。
 - Shopify 第一阶段只开放产品 SEO；首页和分类准确 Hold。
 - WordPress 的页面元数据继续作为文章 `update_article`，不声明商品、分类或首页能力。
-- 全局认证和 business scope 授权仍是开放生产门禁。
+- 全局认证和 business scope 授权仍是共享或对外部署门禁；本机回环操作员模式
+  继续依赖显式用户授权和现有 Action 全链路门禁，不得扩展到其他来源。
 - 恢复分类的远端只读调用当前仍可能占用动作事务锁；这是安全但保守的实现。
 - 真实回滚和无审批自动执行继续阻塞。

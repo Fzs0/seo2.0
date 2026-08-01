@@ -175,7 +175,7 @@ def test_shopify_write_products_implies_read_products_for_product_seo() -> None:
     }
 
 
-def test_custom_blog_does_not_claim_unimplemented_image_upload() -> None:
+def test_custom_content_blog_declares_same_business_oemapps_media_route() -> None:
     item = build_site_capability(
         _site(
             site_type="blog",
@@ -184,17 +184,44 @@ def test_custom_blog_does_not_claim_unimplemented_image_upload() -> None:
             api_config={
                 "connector_type": "custom_openapi",
                 "openApiKey": "configured",
-                "imageUploadPath": "/media/upload",
             },
         ),
         connectors=[],
         generated_at=datetime(2026, 7, 27, tzinfo=timezone.utc),
+        media_host_site=_site(
+            id="22222222-2222-2222-2222-222222222222",
+            site_key="example-main",
+            site_type="main",
+            is_main=True,
+            api_base_url="https://openapi.oemapps.com",
+            api_config={},
+        ),
+        media_host_connectors=[
+            {
+                "status": "active",
+                "adapter": "oemapps",
+                "secret_names": ["token"],
+            }
+        ],
     )
 
-    assert item["connectors"]["images"]["status"] == "unavailable"
-    assert item["connectors"]["images"]["upload"] is False
-    assert "images" not in item["supported_fields"]["articles"]
-    assert "image_alts" not in item["supported_fields"]["articles"]
+    assert item["connectors"]["images"]["status"] == "available"
+    assert item["connectors"]["images"]["upload"] is True
+    assert item["connectors"]["images"]["ingest"] is True
+    assert item["connectors"]["images"]["transport"] == (
+        "business_oemapps_upload_then_article_publish"
+    )
+    assert item["connectors"]["images"]["media_host_site_id"] == (
+        "22222222-2222-2222-2222-222222222222"
+    )
+    assert item["connectors"]["images"]["media_host_business_id"] == (
+        "example-business"
+    )
+    assert {
+        "images",
+        "image_alts",
+        "cover_image",
+    } <= set(item["supported_fields"]["articles"])
 
 
 def test_wordpress_capability_declares_media_upload_and_cover_fields() -> None:

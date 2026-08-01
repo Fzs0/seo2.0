@@ -11,7 +11,7 @@ from urllib.parse import urlsplit
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.article_urls import is_oemapps_site
+from app.core.article_urls import is_content_openapi_site, is_oemapps_site
 from app.services.site_capability_registry import contract_for_site
 
 HEALTH_STATES = {"available", "degraded", "unavailable", "misconfigured", "forbidden"}
@@ -30,14 +30,22 @@ async def get_business_site_capabilities(
     by_site: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for connector in connectors:
         by_site[str(connector["site_id"])].append(connector)
-    items = [
-        build_site_capability(
-            site,
-            connectors=by_site.get(str(site["id"]), []),
-            generated_at=generated_at,
+    items = []
+    for site in sites:
+        media_host = _same_business_oemapps_media_host(site, sites)
+        items.append(
+            build_site_capability(
+                site,
+                connectors=by_site.get(str(site["id"]), []),
+                generated_at=generated_at,
+                media_host_site=media_host,
+                media_host_connectors=(
+                    by_site.get(str(media_host["id"]), [])
+                    if media_host
+                    else []
+                ),
+            )
         )
-        for site in sites
-    ]
     result = {
         "business_id": business_id,
         "generated_at": generated_at.isoformat(),
@@ -59,8 +67,32 @@ async def get_site_capabilities(
     )
     if not sites:
         return None
-    connectors = await _load_connectors(session, [site_id])
-    return build_site_capability(sites[0], connectors=connectors, generated_at=_utc(now))
+    portfolio_sites = await _load_sites(
+        session,
+        business_id=str(sites[0]["business_id"]),
+    )
+    media_host = _same_business_oemapps_media_host(
+        sites[0],
+        portfolio_sites,
+    )
+    connector_site_ids = [site_id]
+    if media_host:
+        connector_site_ids.append(str(media_host["id"]))
+    connectors = await _load_connectors(session, connector_site_ids)
+    by_site: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for connector in connectors:
+        by_site[str(connector["site_id"])].append(connector)
+    return build_site_capability(
+        sites[0],
+        connectors=by_site.get(site_id, []),
+        generated_at=_utc(now),
+        media_host_site=media_host,
+        media_host_connectors=(
+            by_site.get(str(media_host["id"]), [])
+            if media_host
+            else []
+        ),
+    )
 
 
 def build_site_capability(
@@ -68,6 +100,8 @@ def build_site_capability(
     *,
     connectors: list[dict[str, Any]],
     generated_at: datetime,
+    media_host_site: dict[str, Any] | None = None,
+    media_host_connectors: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     safe_site = dict(site)
     api_config = _mapping(safe_site.get("api_config"))
@@ -114,6 +148,35 @@ def build_site_capability(
             checked_at=generated_at,
             upload=True,
         )
+    elif is_content_openapi_site(safe_site):
+        media_host_ready = bool(
+            media_host_site
+            and media_host_site.get("status") == "active"
+            and _oemapps_media_host_ready(
+                media_host_site,
+                media_host_connectors or [],
+            )
+        )
+        capability_health["images"] = _local_health(
+            available=(
+                _article_configuration_ready(safe_site)
+                and media_host_ready
+            ),
+            checked_at=generated_at,
+            missing_code="same_business_oemapps_media_host_missing",
+            upload=True,
+            ingest=True,
+            transport="business_oemapps_upload_then_article_publish",
+            media_host_site=media_host_site,
+        )
+        if not media_host_ready:
+            issues.append(
+                _issue(
+                    "same_business_oemapps_media_host_missing",
+                    "business.main_oemapps_site",
+                    "Configure one active OEMApps main site in the same business.",
+                )
+            )
 
     actions = dict(contract["supported_actions"])
     for action, connector_name in {
@@ -409,7 +472,11 @@ def _default_health(name: str, checked_at: datetime) -> dict[str, Any]:
         "status": "unavailable",
         "read": False,
         "write": False,
-        **({"upload": False} if name == "images" else {}),
+        **(
+            {"upload": False, "ingest": False, "transport": None}
+            if name == "images"
+            else {}
+        ),
         "checked_at": checked_at.isoformat(),
         "last_success_at": None,
         "error_code": "CAPABILITY_NOT_DECLARED",
@@ -419,7 +486,14 @@ def _default_health(name: str, checked_at: datetime) -> dict[str, Any]:
 
 
 def _local_health(
-    *, available: bool, checked_at: datetime, missing_code: str | None = None, upload: bool = False
+    *,
+    available: bool,
+    checked_at: datetime,
+    missing_code: str | None = None,
+    upload: bool = False,
+    ingest: bool = False,
+    transport: str | None = None,
+    media_host_site: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     result = {
         "status": "available" if available else "misconfigured",
@@ -431,8 +505,14 @@ def _local_health(
         "error_summary": None if available else "Required local configuration is missing.",
         "unlock_condition": None if available else "Complete and verify the site connector configuration.",
     }
-    if upload:
-        result["upload"] = available
+    if upload or ingest:
+        result["upload"] = available if upload else False
+        result["ingest"] = available if ingest else False
+        result["transport"] = transport
+        if media_host_site:
+            result["media_host_site_id"] = str(media_host_site.get("id") or "")
+            result["media_host_site_key"] = media_host_site.get("site_key")
+            result["media_host_business_id"] = media_host_site.get("business_id")
     return result
 
 
@@ -522,6 +602,43 @@ def _mapping(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+def _same_business_oemapps_media_host(
+    site: dict[str, Any],
+    sites: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    if not is_content_openapi_site(site):
+        return None
+    business_id = str(site.get("business_id") or "")
+    return next(
+        (
+            candidate
+            for candidate in sites
+            if str(candidate.get("business_id") or "") == business_id
+            and candidate.get("status") == "active"
+            and bool(candidate.get("is_main"))
+            and is_oemapps_site(candidate)
+        ),
+        None,
+    )
+
+
+def _oemapps_media_host_ready(
+    media_host: dict[str, Any],
+    connectors: list[dict[str, Any]],
+) -> bool:
+    if _article_configuration_ready(media_host):
+        return True
+    for connector in connectors:
+        if (
+            str(connector.get("adapter") or "").casefold() == "oemapps"
+            and connector.get("status") == "active"
+            and "token"
+            in {str(value) for value in connector.get("secret_names") or []}
+        ):
+            return True
+    return False
+
+
 def _issue(code: str, missing: str, unlock: str) -> dict[str, str]:
     return {
         "code": code,
@@ -560,7 +677,17 @@ def _capability_snapshot_hash(capability: dict[str, Any]) -> str:
     connector_policy = {
         name: {
             key: value.get(key)
-            for key in ("status", "read", "write", "upload", "error_code")
+            for key in (
+                "status",
+                "read",
+                "write",
+                "upload",
+                "ingest",
+                "transport",
+                "media_host_site_id",
+                "media_host_business_id",
+                "error_code",
+            )
             if key in value
         }
         for name, value in capability["connectors"].items()

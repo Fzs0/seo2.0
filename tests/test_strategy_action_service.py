@@ -15,6 +15,8 @@ class MemoryStore:
         self.exceptions: list[dict] = []
         self.observations: list[dict] = []
         self.reconciled_run_ids: list[str] = []
+        self.reconciled_strategy_ids: list[str] = []
+        self.resolved_corrective_parents: list[str] = []
         self.lock_held = False
 
     async def get(self, _action_id: str, *, lock: bool = False) -> dict:
@@ -36,6 +38,20 @@ class MemoryStore:
 
     async def reconcile_parent_run(self, run_id: str) -> None:
         self.reconciled_run_ids.append(run_id)
+
+    async def reconcile_source_strategy(
+        self, strategy_task_id: str, *, action_status: str
+    ) -> None:
+        assert action_status == "canceled"
+        self.reconciled_strategy_ids.append(strategy_task_id)
+
+    async def list_reconciliation_candidates(self, business_id: str) -> list[dict]:
+        if self.action.get("business_id") != business_id:
+            return []
+        return [deepcopy(self.action)]
+
+    async def resolve_corrective_parent(self, action: dict) -> None:
+        self.resolved_corrective_parents.append(action["corrective_of_action_id"])
 
 
 class Adapter:
@@ -197,6 +213,30 @@ async def test_execute_is_idempotent_and_uses_fixed_result_semantics() -> None:
     assert store.action["execution_token"]
     assert store.action["execution_claimed_at"]
     assert store.action["generation_model"] == "gpt-5.1-2026-01-15"
+
+
+@pytest.mark.asyncio
+async def test_successful_corrective_action_resolves_parent_after_readback() -> None:
+    corrective = action()
+    corrective["corrective_of_action_id"] = "parent-action-1"
+    store, adapter = MemoryStore(corrective), Adapter()
+    preview = await service.preview_action(
+        store, action_id="action-1", patch={"title": "After"}, adapter=adapter
+    )
+    await service.approve_action(
+        store,
+        action_id="action-1",
+        snapshot_hash=preview["snapshot_hash"],
+        patch_hash=preview["patch_hash"],
+        generation_mode="manual",
+    )
+
+    result = await service.execute_action(
+        store, action_id="action-1", adapter=adapter
+    )
+
+    assert result["status"] == "completed"
+    assert store.resolved_corrective_parents == ["parent-action-1"]
 
 
 @pytest.mark.asyncio
@@ -839,3 +879,183 @@ def test_exception_redacts_credentials_from_multiple_urls_in_free_text() -> None
     assert "abc" not in sanitized
     assert "q=safe" in sanitized
     assert "lang=en" in sanitized
+
+
+@pytest.mark.asyncio
+async def test_expired_unexecuted_action_is_canceled_and_parent_run_reconciled() -> None:
+    stale = action()
+    stale["source_strategy_task_id"] = "strategy-1"
+    stale["unexecuted_expires_at"] = (
+        datetime.now(UTC) - timedelta(minutes=1)
+    ).isoformat()
+    store = MemoryStore(stale)
+
+    result = await service.expire_unexecuted_action(
+        store,
+        action_id="action-1",
+        now=datetime.now(UTC),
+    )
+
+    assert result["status"] == "canceled"
+    assert result["closure_reason"] == "approval_expired_unexecuted"
+    assert result["remote_write_occurred"] is False
+    assert store.reconciled_strategy_ids == ["strategy-1"]
+    assert store.reconciled_run_ids == ["run-1"]
+
+
+@pytest.mark.asyncio
+async def test_already_canceled_action_backfills_source_strategy_reconciliation() -> None:
+    canceled = action()
+    canceled.update(
+        {
+            "status": "canceled",
+            "source_strategy_task_id": "strategy-1",
+            "closure_reason": "approval_expired_unexecuted",
+            "remote_write_occurred": False,
+        }
+    )
+    store = MemoryStore(canceled)
+
+    result = await service.expire_unexecuted_action(
+        store,
+        action_id="action-1",
+        now=datetime.now(UTC),
+    )
+
+    assert result["closure_result"] == "already_terminal"
+    assert store.reconciled_strategy_ids == ["strategy-1"]
+    assert store.reconciled_run_ids == ["run-1"]
+
+
+@pytest.mark.asyncio
+async def test_expired_action_with_execution_evidence_is_never_locally_canceled() -> None:
+    stale = action()
+    stale.update(
+        {
+            "status": "approved",
+            "unexecuted_expires_at": (
+                datetime.now(UTC) - timedelta(minutes=1)
+            ).isoformat(),
+            "execution_token": "possible-remote-write",
+        }
+    )
+    store = MemoryStore(stale)
+
+    result = await service.expire_unexecuted_action(
+        store,
+        action_id="action-1",
+        now=datetime.now(UTC),
+    )
+
+    assert result["status"] == "approved"
+    assert result["closure_result"] == "remote_recovery_required"
+    assert store.action["status"] == "approved"
+    assert store.reconciled_run_ids == []
+
+
+@pytest.mark.asyncio
+async def test_stale_reconciliation_recovers_then_closes_confirmed_unapplied_action() -> None:
+    stale = action()
+    stale.update(
+        {
+            "status": "executing",
+            "unexecuted_expires_at": (
+                datetime.now(UTC) - timedelta(hours=2)
+            ).isoformat(),
+            "execution_token": "old-token",
+            "execution_claimed_at": (
+                datetime.now(UTC) - timedelta(hours=1)
+            ).isoformat(),
+            "execution_lease_expires_at": (
+                datetime.now(UTC) - timedelta(minutes=30)
+            ).isoformat(),
+            "execution_attempt": 1,
+            "proposed_patch": {"title": "After"},
+            "approved_patch": {"title": "After"},
+        }
+    )
+    store = MemoryStore(stale)
+
+    class ConfirmedUnappliedAdapter(Adapter):
+        async def recover(self, _action: dict) -> dict:
+            return {"recovery_status": "confirmed_not_applied"}
+
+    result = await service.reconcile_stale_actions(
+        store,
+        business_id="business-1",
+        adapter=ConfirmedUnappliedAdapter(),
+        now=datetime.now(UTC),
+    )
+
+    assert result["canceled"] == 1
+    assert result["uncertain"] == 0
+    assert store.action["status"] == "canceled"
+    assert store.action["recovery_status"] == "confirmed_not_applied"
+    assert store.reconciled_run_ids[-1] == "run-1"
+
+
+@pytest.mark.asyncio
+async def test_active_execution_lease_is_not_reported_as_stale_or_uncertain() -> None:
+    active = action()
+    active.update(
+        {
+            "status": "executing",
+            "execution_token": "active-token",
+            "execution_lease_expires_at": (
+                datetime.now(UTC) + timedelta(minutes=10)
+            ).isoformat(),
+        }
+    )
+    store = MemoryStore(active)
+
+    result = await service.reconcile_stale_actions(
+        store,
+        business_id="business-1",
+        adapter=Adapter(),
+        now=datetime.now(UTC),
+    )
+
+    assert result["uncertain"] == 0
+    assert result["details"][0]["closure_result"] == "not_stale"
+    assert store.action["status"] == "executing"
+
+
+@pytest.mark.asyncio
+async def test_expired_recovery_lease_can_be_reclaimed_by_read_only_recovery() -> None:
+    recovering = action()
+    recovering.update(
+        {
+            "status": "recovering",
+            "recovery_from_status": "executing",
+            "recovery_token": "dead-worker-token",
+            "recovery_lease_expires_at": (
+                datetime.now(UTC) - timedelta(minutes=5)
+            ).isoformat(),
+            "execution_token": "old-execution-token",
+            "execution_lease_expires_at": (
+                datetime.now(UTC) - timedelta(minutes=30)
+            ).isoformat(),
+            "unexecuted_expires_at": (
+                datetime.now(UTC) - timedelta(hours=2)
+            ).isoformat(),
+            "proposed_patch": {"title": "After"},
+            "approved_patch": {"title": "After"},
+        }
+    )
+    store = MemoryStore(recovering)
+
+    class ConfirmedUnappliedAdapter(Adapter):
+        async def recover(self, claimed: dict) -> dict:
+            assert claimed["recovery_token"] != "dead-worker-token"
+            return {"recovery_status": "confirmed_not_applied"}
+
+    result = await service.reconcile_stale_actions(
+        store,
+        business_id="business-1",
+        adapter=ConfirmedUnappliedAdapter(),
+        now=datetime.now(UTC),
+    )
+
+    assert result["canceled"] == 1
+    assert store.action["status"] == "canceled"
+    assert store.action["recovery_status"] == "confirmed_not_applied"
