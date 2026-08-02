@@ -535,7 +535,47 @@ class OpenAPIPublisher(PublisherBase):
             headers = {"Authorization": f"Bearer {api_key}"}
         content_md, _ = strip_markdown_frontmatter(req.content_md)
         if self._is_oemapps():
-            body = self._oemapps_article_body(req, content_md)
+            try:
+                existing = await self.get_article(str(post_id))
+            except ExternalCallError as error:
+                return PublishResult(
+                    ok=False,
+                    dry_run=False,
+                    error=(
+                        "OEMApps safe article update could not read the remote "
+                        f"baseline: {error}"
+                    ),
+                    raw={
+                        "error_code": "OEMAPPS_SAFE_UPDATE_BASELINE_REQUIRED",
+                        "remote_write_occurred": False,
+                    },
+                )
+            if not isinstance(existing, dict) or not existing:
+                return PublishResult(
+                    ok=False,
+                    dry_run=False,
+                    error="OEMApps safe article update requires a remote baseline",
+                    raw={
+                        "error_code": "OEMAPPS_SAFE_UPDATE_BASELINE_REQUIRED",
+                        "remote_write_occurred": False,
+                    },
+                )
+            try:
+                body = self._oemapps_article_update_body(
+                    req,
+                    content_md,
+                    existing=existing,
+                )
+            except ValueError as error:
+                return PublishResult(
+                    ok=False,
+                    dry_run=False,
+                    error=str(error),
+                    raw={
+                        "error_code": "OEMAPPS_SAFE_UPDATE_BASELINE_INCOMPLETE",
+                        "remote_write_occurred": False,
+                    },
+                )
         else:
             if is_content_openapi_site(self.site):
                 try:
@@ -712,8 +752,74 @@ class OpenAPIPublisher(PublisherBase):
             body["src"] = req.image_cover_url
         if str(req.image_cover_id or "").isdigit():
             body["image_id"] = int(str(req.image_cover_id))
+        if req.image_cover_alt:
+            body["image_alt"] = req.image_cover_alt
         if str(req.category_id or "").isdigit():
             body["news_id"] = int(str(req.category_id))
+        return body
+
+    def _oemapps_article_update_body(
+        self,
+        req: PublishRequest,
+        content_md: str,
+        *,
+        existing: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Build an OEMApps PUT without changing fields absent from approval.
+
+        OEMApps uses a full article-shaped update payload.  The common
+        ``PublishRequest`` only carries the approved content/SEO patch, so its
+        defaults (today, ``admin``, one keyword, no product relations) must
+        never be treated as update intent.  Read the remote article first and
+        round-trip every non-approved field verbatim.
+        """
+        required_preserved = (
+            "handle",
+            "status",
+            "published_at",
+            "author_name",
+            "meta_keywords",
+            "related_product_ids",
+            "is_top",
+        )
+        missing = [
+            field
+            for field in required_preserved
+            if field not in existing
+            and not (field == "status" and "raw_status" in existing)
+        ]
+        if missing:
+            raise ValueError(
+                "OEMApps remote baseline is missing protected fields: "
+                + ", ".join(sorted(missing))
+            )
+
+        body = self._oemapps_article_body(req, content_md)
+        body.update(
+            {
+                "handle": existing["handle"],
+                "status": existing.get("raw_status", existing["status"]),
+                "published_at": existing["published_at"],
+                "author_name": existing["author_name"],
+                "meta_keywords": existing["meta_keywords"],
+                "related_product_ids": existing["related_product_ids"],
+                "is_top": existing["is_top"],
+            }
+        )
+
+        # Category and collection behaviour are outside the ordinary article
+        # content patch. Preserve them verbatim.
+        for field in ("news_id", "collect_content_images"):
+            if field in existing:
+                body[field] = existing[field]
+            else:
+                body.pop(field, None)
+
+        # A cover patch may update URL, media ID, and alt independently. Keep
+        # every cover component that the approved request did not replace.
+        for field in ("src", "image_id", "image_alt"):
+            if field not in body and field in existing:
+                body[field] = existing[field]
         return body
 
 

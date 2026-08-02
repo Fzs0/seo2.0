@@ -258,6 +258,7 @@ class StrategyArticleActionAdapter:
         }
 
     async def recover(self, action: dict[str, Any]) -> dict[str, Any]:
+        exact_remote_readback = False
         try:
             if (
                 action.get("recovery_status")
@@ -354,6 +355,7 @@ class StrategyArticleActionAdapter:
             matches = bool(differences) and all(
                 item.get("match") is True for item in differences
             )
+            exact_remote_readback = matches
             before_snapshot = dict(action.get("before_snapshot") or {})
             before_differences = compare_readback_fields(
                 before_snapshot,
@@ -373,12 +375,15 @@ class StrategyArticleActionAdapter:
             )
             reconciliation: dict[str, Any] = {}
             if matches:
+                approved_readback = {
+                    field: readback.get(field) for field in proposed
+                }
                 reconciliation = await _reconcile_confirmed_article_execution(
                     self.session,
                     action=action,
                     context=context,
                     remote_id=remote_id,
-                    readback=readback,
+                    readback=approved_readback,
                 )
             return {
                 "recovery_status": (
@@ -407,11 +412,20 @@ class StrategyArticleActionAdapter:
                 },
                 **reconciliation,
             }
-        except Exception:
+        except Exception as error:
             rollback = getattr(self.session, "rollback", None)
             if rollback is not None:
                 await rollback()
-            return {"recovery_status": "unknown_remote_state"}
+            # Once the approved fields have matched exactly, any subsequent
+            # failure is local reconciliation, not an unknown remote outcome.
+            # Propagate it so the API and logs preserve the true root cause.
+            if exact_remote_readback:
+                raise
+            return {
+                "recovery_status": "unknown_remote_state",
+                "recovery_error_code": "ARTICLE_RECOVERY_READBACK_FAILED",
+                "recovery_error_type": type(error).__name__,
+            }
 
 
 async def get_article_generation_context(
@@ -928,15 +942,17 @@ def canonical_article_patch(
             images.append(src)
         if alt:
             alts.setdefault(src, alt)
-    return {
+    canonical = {
         "title": title,
         "body": body,
         "meta_title": meta_title,
         "meta_description": meta_description,
         "images": images,
         "image_alts": alts,
-        "cover_image": cover_image,
     }
+    if cover_image is not None:
+        canonical["cover_image"] = cover_image
+    return canonical
 
 
 def _image_patch_supported(action: dict[str, Any]) -> bool:
@@ -1519,6 +1535,60 @@ async def _reconcile_confirmed_article_execution(
     article_id = str(action.get("article_id") or "")
     execution_id = str(action.get("execution_task_id") or "")
     publish_task_id = str(action.get("publish_task_id") or "")
+    if not article_id or not execution_id:
+        source_strategy_task_id = str(action.get("source_strategy_task_id") or "")
+        action_type = str(action.get("action_type") or "")
+        if not source_strategy_task_id or action_type not in ARTICLE_ACTIONS:
+            raise ValueError("confirmed remote write is missing its local article lineage")
+        lineage_rows = (
+            await session.execute(
+                text(
+                    """
+                    SELECT execution.id::text AS execution_task_id,
+                           article.id::text AS article_id,
+                           publish.id::text AS publish_task_id
+                      FROM seo_agent.tasks execution
+                      JOIN seo_agent.articles article
+                        ON article.task_id=execution.id
+                       AND article.site_id=execution.site_id
+                      LEFT JOIN LATERAL (
+                        SELECT candidate.id
+                          FROM seo_agent.tasks candidate
+                         WHERE candidate.task_type='publish'
+                           AND candidate.site_id=execution.site_id
+                           AND candidate.article_id=article.id
+                           AND candidate.payload->>'execution_task_id'=execution.id::text
+                         ORDER BY candidate.created_at DESC
+                         LIMIT 1
+                      ) publish ON TRUE
+                     WHERE execution.site_id=CAST(:site_id AS uuid)
+                       AND execution.task_type=:action_type
+                       AND execution.payload->>'strategy_task_id'=:source_strategy_task_id
+                       AND (:execution_task_id='' OR execution.id=CAST(:execution_task_id AS uuid))
+                       AND (:article_id='' OR article.id=CAST(:article_id AS uuid))
+                     ORDER BY execution.created_at DESC
+                     LIMIT 2
+                    """
+                ),
+                {
+                    "site_id": action["site_id"],
+                    "action_type": action_type,
+                    "source_strategy_task_id": source_strategy_task_id,
+                    "execution_task_id": execution_id,
+                    "article_id": article_id,
+                },
+            )
+        ).mappings().all()
+        if len(lineage_rows) != 1:
+            raise ValueError(
+                "confirmed remote write local article lineage is missing or ambiguous"
+            )
+        lineage = lineage_rows[0]
+        execution_id = str(lineage.get("execution_task_id") or "")
+        article_id = str(lineage.get("article_id") or "")
+        publish_task_id = str(
+            publish_task_id or lineage.get("publish_task_id") or ""
+        )
     if article_id and not execution_id:
         article = (
             await session.execute(
@@ -1814,56 +1884,6 @@ def _extract_images(body: str) -> dict[str, str]:
             alt_match.group(1) if alt_match else ""
         ).strip()
     return images
-
-
-def _semantic_value(field: str, value: Any) -> Any:
-    if field == "body":
-        plain = str(value or "")
-        # Publishers such as WordPress store the article title separately and
-        # omit the submitted Markdown H1 from the persisted body.
-        plain = re.sub(r"<h1\b[^>]*>.*?</h1>", " ", plain, flags=re.I | re.S)
-        plain = re.sub(r"^#\s+.*(?:\r?\n|$)", " ", plain, count=1, flags=re.M)
-        # Preserve semantic boundaries before stripping rendered HTML so table
-        # cells and list items do not collapse into different tokens.
-        plain = re.sub(
-            r"</(?:p|li|h[2-6]|td|th|tr|blockquote|figure|div|ul|ol|table)>",
-            " ",
-            plain,
-            flags=re.I,
-        )
-        plain = re.sub(r"<[^>]+>", " ", plain)
-        # Images and ALT are compared as independent approved fields. Keeping
-        # Markdown ALT text here creates a false body mismatch after OEMApps
-        # renders the same image as an HTML tag.
-        plain = re.sub(r"!\[[^\]]*\]\([^)]+\)", " ", plain)
-        plain = re.sub(r"\[([^\]]+)\]\([^)]+\)", r" \1 ", plain)
-        plain = re.sub(r"^#{1,6}\s*", "", plain, flags=re.M)
-        plain = re.sub(r"^\s*\d+[.)]\s+", "", plain, flags=re.M)
-        plain = re.sub(r"[*_`~>|-]+", " ", plain)
-        return re.sub(r"\s+", " ", unescape(plain)).strip()
-    if field == "images":
-        values = value if isinstance(value, list) else []
-        return sorted(_normalize_url(str(item)) for item in values)
-    if field == "image_alts":
-        values = value if isinstance(value, dict) else {}
-        return {
-            _normalize_url(str(src)): re.sub(r"\s+", " ", str(alt)).strip()
-            for src, alt in sorted(values.items())
-        }
-    if field == "cover_image":
-        cover = value if isinstance(value, dict) else {}
-        if not cover:
-            return None
-        return {
-            "image_id": str(cover.get("image_id") or "").strip(),
-            "src": _normalize_url(str(cover.get("src") or "")),
-            "alt": re.sub(
-                r"\s+",
-                " ",
-                unescape(str(cover.get("alt") or "")),
-            ).strip(),
-        }
-    return re.sub(r"\s+", " ", unescape(str(value or ""))).strip()
 
 
 def _normalize_url(value: str) -> str:

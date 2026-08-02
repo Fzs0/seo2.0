@@ -103,42 +103,6 @@ def test_update_strategy_resolves_the_existing_article_url_from_site_evidence() 
     }) == "https://example.com/original-article"
 
 
-@pytest.mark.asyncio
-async def test_backfill_missing_effect_url_uses_historical_execution_evidence() -> None:
-    writes: list[dict] = []
-
-    class Session:
-        committed = False
-
-        async def execute(self, statement, params=None):
-            sql = str(statement)
-            if "FROM seo_agent.tasks effect" in sql:
-                return Result([{
-                    "id": "effect-id",
-                    "target_url": None,
-                    "payload": {
-                        "action": "update_article",
-                        "baseline": {"metric_scope": {"gsc": "query", "ga4": "site"}},
-                    },
-                    "strategy": {"evidence": {"site_content": {"published_url": "https://example.com/original-article"}}},
-                    "article_url": None,
-                }])
-            if sql.lstrip().startswith("UPDATE seo_agent.tasks"):
-                writes.append(params or {})
-            return Result()
-
-        async def commit(self):
-            self.committed = True
-
-    repaired = await service.backfill_missing_effect_target_urls(Session(), business_id="business")  # type: ignore[arg-type]
-
-    assert repaired == 1
-    assert writes[0]["target_url"] == "https://example.com/original-article"
-    patch = json.loads(writes[0]["patch"])
-    assert "初始基线创建时未绑定目标 URL" in patch["baseline_note"]
-    assert patch["baseline_valid"] is False
-
-
 def test_outcome_waits_until_day_28_and_contamination_wins() -> None:
     snapshot = {"gsc": {"impressions": 300}}
     positive = {"clicks": 0.3, "avg_position": 0.2, "conversions": 0.4}
@@ -442,9 +406,122 @@ async def test_ensure_effect_reuses_execution_and_accepts_direct_target_url(monk
 
     assert created["id"] == "effect-id"
     insert = next(params for sql, params in calls if sql.lstrip().startswith("INSERT INTO seo_agent.tasks"))
+    insert_sql = next(sql for sql, _ in calls if sql.lstrip().startswith("INSERT INTO seo_agent.tasks"))
+    assert "('review', 'blocked'" in insert_sql
     inserted_payload = json.loads(insert["payload"])
     assert inserted_payload["target_url"] == "https://example.com/old"
     assert inserted_payload["baseline"]["target_url"] == "https://example.com/old"
+    assert inserted_payload["outcome"] == "pending_confirmation"
+
+
+@pytest.mark.asyncio
+async def test_ensure_effect_blocks_a_second_active_effect_for_the_same_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    class Session:
+        async def execute(self, statement, _params=None):
+            sql = str(statement)
+            calls.append(sql)
+            if "STRATEGY_EFFECT_ACTIVE_SCOPE" in sql:
+                return Result(
+                    [
+                        {
+                            "id": "existing-effect",
+                            "execution_task_id": "older-execution",
+                        }
+                    ]
+                )
+            if "payload->>'execution_task_id'" in sql and sql.lstrip().startswith(
+                "SELECT id"
+            ):
+                return Result()
+            if sql.lstrip().startswith("INSERT INTO seo_agent.tasks"):
+                raise AssertionError("a duplicate active effect must not be inserted")
+            return Result()
+
+    async def metrics(*_args, **_kwargs):
+        raise AssertionError("conflict must be rejected before metric capture")
+
+    monkeypatch.setattr(service, "capture_metrics", metrics)
+    identity = service.strategy_identity(
+        "business",
+        site_id="site",
+        post_id="post",
+        target_url="https://example.com/blogs/guide/",
+        site_url="https://example.com",
+        action="update_article",
+        objective="improve",
+    )
+
+    with pytest.raises(ValueError, match="STRATEGY_EFFECT_TARGET_ALREADY_ACTIVE"):
+        await service.ensure_effect(
+            Session(),  # type: ignore[arg-type]
+            execution_task_id="new-execution",
+            strategy_task_id="new-strategy",
+            site_id="site",
+            article_id=None,
+            strategy={
+                "business_id": "business",
+                "query": "query",
+                "strategy_type": "update_article",
+                "recommended_action": "improve",
+                "target_url": "https://example.com/blogs/guide/",
+                **identity,
+            },
+        )
+
+    assert any("STRATEGY_EFFECT_ACTIVE_SCOPE" in sql for sql in calls)
+
+
+@pytest.mark.asyncio
+async def test_validated_corrective_effect_may_prepare_while_prior_effect_is_active(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Session:
+        async def execute(self, statement, _params=None):
+            sql = str(statement)
+            if "STRATEGY_EFFECT_ACTIVE_SCOPE" in sql:
+                return Result([{"id": "prior-effect"}])
+            if "payload->>'execution_task_id'" in sql and sql.lstrip().startswith(
+                "SELECT id"
+            ):
+                return Result()
+            if sql.lstrip().startswith("INSERT INTO seo_agent.tasks"):
+                return Result(scalar="corrective-effect")
+            return Result()
+
+    async def metrics(*_args, **_kwargs):
+        return {"gsc": {}, "ga4": {}}
+
+    monkeypatch.setattr(service, "capture_metrics", metrics)
+    identity = service.strategy_identity(
+        "business",
+        site_id="site",
+        target_url="https://example.com/blogs/guide",
+        site_url="https://example.com",
+        action="update_article",
+        objective="repair",
+    )
+    result = await service.ensure_effect(
+        Session(),  # type: ignore[arg-type]
+        execution_task_id="corrective-execution",
+        strategy_task_id="corrective-strategy",
+        site_id="site",
+        article_id=None,
+        strategy={
+            "business_id": "business",
+            "query": "query",
+            "strategy_type": "update_article",
+            "recommended_action": "repair",
+            "target_url": "https://example.com/blogs/guide",
+            "corrective_action_validated": True,
+            **identity,
+        },
+    )
+
+    assert result["id"] == "corrective-effect"
 
 
 @pytest.mark.asyncio
@@ -521,10 +598,12 @@ async def test_ensure_effect_reactivates_canceled_retry_without_inserting(monkey
     assert "canceled_reason" not in result
     assert not any(sql.lstrip().startswith("INSERT INTO seo_agent.tasks") for sql, _ in writes)
     reactivation_sql, reactivation_params = next(
-        (sql, params) for sql, params in writes if "status = 'queued'" in sql
+        (sql, params) for sql, params in writes if "status = 'blocked'" in sql
     )
     assert "payload = (COALESCE(payload, '{}'::jsonb) - 'canceled_reason')" in reactivation_sql
-    assert json.loads(reactivation_params["payload"]) == {"outcome": "observing"}
+    assert json.loads(reactivation_params["payload"]) == {
+        "outcome": "pending_confirmation"
+    }
 
 
 @pytest.mark.asyncio
@@ -635,7 +714,7 @@ async def test_published_update_sets_7_day_check_and_28_day_cooldown() -> None:
     class Session:
         async def execute(self, statement, params=None):
             sql = str(statement)
-            if sql.lstrip().startswith("SELECT published_url"):
+            if sql.lstrip().startswith("SELECT site_id::text AS site_id"):
                 return Result([{"published_url": "/published", "published_at": published_at}])
             writes.append(params)
             return Result()
@@ -656,12 +735,59 @@ async def test_published_update_sets_7_day_check_and_28_day_cooldown() -> None:
 
 
 @pytest.mark.asyncio
+async def test_confirmed_publication_supersedes_older_effect_for_same_page() -> None:
+    published_at = datetime(2026, 8, 2, tzinfo=timezone.utc)
+    writes: list[tuple[str, dict]] = []
+
+    class Session:
+        async def execute(self, statement, params=None):
+            sql = str(statement)
+            if sql.lstrip().startswith("SELECT site_id::text AS site_id"):
+                return Result(
+                    [
+                        {
+                            "site_id": "site-id",
+                            "published_url": "https://example.com/blogs/guide/",
+                            "published_at": published_at,
+                            "effect_payload": {
+                                "target_url": "https://example.com/blogs/guide"
+                            },
+                        }
+                    ]
+                )
+            writes.append((sql, params or {}))
+            return Result()
+
+    await service.mark_effect_published(
+        Session(),  # type: ignore[arg-type]
+        execution_task_id="new-execution",
+        article_id="article",
+        target_url=None,
+        action="update_article",
+    )
+
+    supersede_sql, supersede_params = next(
+        (sql, params)
+        for sql, params in writes
+        if "SUPERSEDE_ACTIVE_EFFECT_AFTER_CONFIRMED_PUBLICATION" in sql
+    )
+    assert "status='canceled'" in supersede_sql
+    assert supersede_params["target_key"] == "https://example.com/blogs/guide"
+    assert json.loads(supersede_params["payload"]) == {
+        "outcome": "inconclusive",
+        "contaminated": True,
+        "canceled_reason": "superseded_by_confirmed_publication",
+        "superseded_by_execution_task_id": "new-execution",
+    }
+
+
+@pytest.mark.asyncio
 async def test_published_update_keeps_existing_page_url_when_connector_returns_placeholder() -> None:
     writes: list[dict] = []
 
     class Session:
         async def execute(self, statement, params=None):
-            if str(statement).lstrip().startswith("SELECT published_url"):
+            if str(statement).lstrip().startswith("SELECT site_id::text AS site_id"):
                 return Result([{
                     "published_url": "",
                     "published_at": datetime(2026, 7, 21, tzinfo=timezone.utc),
@@ -689,7 +815,7 @@ async def test_published_update_keeps_prepublication_url_when_connector_returns_
 
     class Session:
         async def execute(self, statement, params=None):
-            if str(statement).lstrip().startswith("SELECT published_url"):
+            if str(statement).lstrip().startswith("SELECT site_id::text AS site_id"):
                 return Result([{
                     "published_url": "https://example.com/blogs/guide",
                     "published_at": published_at,
@@ -724,7 +850,7 @@ async def test_published_update_invalidates_baseline_captured_after_publication(
 
     class Session:
         async def execute(self, statement, params=None):
-            if str(statement).lstrip().startswith("SELECT published_url"):
+            if str(statement).lstrip().startswith("SELECT site_id::text AS site_id"):
                 return Result([{
                     "published_url": "https://example.com/blogs/guide",
                     "published_at": published_at,
@@ -761,7 +887,7 @@ async def test_published_new_article_switches_ga4_baseline_to_new_landing_page()
     class Session:
         async def execute(self, statement, params=None):
             sql = str(statement)
-            if sql.lstrip().startswith("SELECT published_url"):
+            if sql.lstrip().startswith("SELECT site_id::text AS site_id"):
                 return Result([{
                     "published_url": "/new-page",
                     "published_at": published_at,
@@ -798,7 +924,7 @@ async def test_published_new_article_switches_ga4_baseline_to_new_landing_page()
 async def test_published_new_article_requires_public_url() -> None:
     class Session:
         async def execute(self, statement, _params=None):
-            if str(statement).lstrip().startswith("SELECT published_url"):
+            if str(statement).lstrip().startswith("SELECT site_id::text AS site_id"):
                 return Result([{
                     "published_url": "",
                     "published_at": datetime(2026, 7, 19, tzinfo=timezone.utc),

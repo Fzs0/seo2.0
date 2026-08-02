@@ -12,11 +12,11 @@ def test_strategy_service_is_read_only_history_module():
         for name, value in vars(strategy_service).items()
         if inspect.iscoroutinefunction(value) and not name.startswith("_")
     }
-    assert public_functions == {"list_strategy_candidates", "list_strategies"}
+    assert public_functions == {"list_strategies"}
     source = inspect.getsource(strategy_service)
     assert "generate_strategies" not in source
     assert "_replace_strategy_plan" not in source
-    assert "strategy_candidate" in source
+    assert "list_strategy_candidates" not in source
     assert "INSERT INTO" not in source
     assert "UPDATE seo_agent" not in source
 

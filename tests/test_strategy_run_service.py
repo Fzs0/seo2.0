@@ -196,6 +196,10 @@ def test_fixed_state_machine_rejects_illegal_or_terminal_transition():
     validate_run_transition(
         "zero_action_reviewing", "research_revision_required"
     )
+    validate_run_transition("refreshing_evidence", "research_revision_required")
+    validate_run_transition("replanning", "research_revision_required")
+    with pytest.raises(ValueError, match="illegal strategy run transition"):
+        validate_run_transition("planning", "refreshing_evidence")
     with pytest.raises(ValueError, match="illegal strategy run transition"):
         validate_run_transition("queued", "planning")
     with pytest.raises(ValueError, match="terminal"):
@@ -212,6 +216,43 @@ def test_child_idempotency_key_is_stable_and_exact_target_scoped():
     assert first != derive_child_idempotency_key(
         "run-a", "site-a", "product_seo", "product-2"
     )
+
+
+@pytest.mark.asyncio
+async def test_resume_retired_evidence_refresh_state_requires_new_ai_research(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = _run_state("refreshing_evidence")
+
+    async def get_run(_session, *, run_id):
+        assert run_id == state["run_id"]
+        return deepcopy(state)
+
+    async def complete(_session, *, run_id, current, next_status, updates):
+        assert run_id == state["run_id"]
+        assert current == "refreshing_evidence"
+        assert next_status == "research_revision_required"
+        state.update(updates)
+        state["status"] = next_status
+        state["current_stage"] = next_status
+        return deepcopy(state)
+
+    async def stage_started(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(service, "get_strategy_run", get_run)
+    monkeypatch.setattr(service, "_complete_stage", complete)
+    monkeypatch.setattr(service, "_stage_started", stage_started)
+
+    result = await run_strategy_run(object(), run_id=state["run_id"])
+
+    assert result["status"] == "research_revision_required"
+    assert result["legacy_state_recovered"] is True
+    assert result["next_action"] == "capture_research"
+    assert result["stage_outputs"]["refreshing_evidence"] == {
+        "legacy_state_retired": True,
+        "replacement": "ai_research_revision",
+    }
 
 
 @pytest.mark.asyncio

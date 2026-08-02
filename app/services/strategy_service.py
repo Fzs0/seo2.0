@@ -1,9 +1,10 @@
-"""Read-only access to strategy history and the retired candidate archive.
+"""Read-only access to strategy history.
 
 New editorial decisions are created only through
 ``autonomous_strategy_orchestrator``.  This module intentionally contains no
 candidate ranking, candidate-to-Strategy conversion, planning or Action
-creation logic.
+creation logic. Historical candidate lineage remains readable on strategy rows,
+but the retired candidate archive is no longer exposed as an application API.
 """
 from __future__ import annotations
 
@@ -11,107 +12,6 @@ from typing import Any
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
-
-
-async def list_strategy_candidates(
-    session: AsyncSession,
-    *,
-    business_id: str,
-    page: int = 1,
-    limit: int = 50,
-    status: str | None = None,
-) -> dict[str, Any]:
-    """Return historical candidate rows without changing or executing them."""
-    page = max(1, page)
-    limit = max(1, min(limit, 200))
-    status_filter = (
-        status
-        if status in {"available", "selected", "hold", "executed"}
-        else None
-    )
-    rows = await session.execute(
-        text(
-            """
-            WITH latest AS (
-                SELECT id::text AS id
-                  FROM seo_agent.tasks
-                 WHERE task_type='review'
-                   AND payload->>'kind'='strategy_analysis_batch'
-                   AND payload->>'business_id'=:business_id
-                   AND status='done'
-                 ORDER BY created_at DESC
-                 LIMIT 1
-            ), candidates AS (
-                SELECT t.id, t.status, t.priority, t.score, t.site_id,
-                       s.name AS site_name, t.keyword_id, t.post_id,
-                       t.article_id, t.title, t.decision,
-                       t.payload->>'analysis_batch_id' AS analysis_batch_id,
-                       t.created_at, t.updated_at,
-                       CASE
-                         WHEN EXISTS (
-                           SELECT 1
-                             FROM seo_agent.tasks strategy
-                            WHERE strategy.task_type='review'
-                              AND strategy.payload->>'kind'='seo_strategy'
-                              AND strategy.payload->>'candidate_id'=t.id::text
-                              AND (
-                                  strategy.status='done'
-                                  OR strategy.decision ? 'execution_task_id'
-                              )
-                         ) THEN 'executed'
-                         WHEN t.decision->>'strategy_type'='hold'
-                              OR t.priority='Hold' THEN 'hold'
-                         WHEN EXISTS (
-                           SELECT 1
-                             FROM seo_agent.tasks strategy
-                            WHERE strategy.task_type='review'
-                              AND strategy.status='queued'
-                              AND strategy.payload->>'kind'='seo_strategy'
-                              AND strategy.payload->>'candidate_id'=t.id::text
-                         ) THEN 'selected'
-                         ELSE 'available'
-                       END AS candidate_status
-                  FROM seo_agent.tasks t
-                  JOIN seo_agent.sites s ON s.id=t.site_id
-                 WHERE t.task_type='review'
-                   AND t.payload->>'kind'='strategy_candidate'
-                   AND t.payload->>'business_id'=:business_id
-                   AND t.payload->>'analysis_batch_id'=(SELECT id FROM latest)
-            )
-            SELECT *, count(*) OVER() AS total
-              FROM candidates
-             WHERE CAST(:candidate_status AS text) IS NULL
-                OR candidate_status=CAST(:candidate_status AS text)
-             ORDER BY score DESC NULLS LAST, created_at DESC
-             LIMIT :limit OFFSET :offset
-            """
-        ),
-        {
-            "business_id": business_id,
-            "candidate_status": status_filter,
-            "limit": limit,
-            "offset": (page - 1) * limit,
-        },
-    )
-    mapped = [dict(row) for row in rows.mappings().all()]
-    total = int(mapped[0].pop("total")) if mapped else 0
-    items = []
-    for row in mapped:
-        candidate_status = row["candidate_status"]
-        item = _strategy_row(row)
-        item["candidate_status"] = candidate_status
-        items.append(item)
-    return {
-        "items": items,
-        "total": total,
-        "page": page,
-        "limit": limit,
-        "analysis_batch_id": (
-            items[0].get("analysis_batch_id") if items else None
-        ),
-        "read_only": True,
-        "retired_source": True,
-    }
 
 
 async def list_strategies(

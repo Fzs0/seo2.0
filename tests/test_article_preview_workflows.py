@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from app.services import article_generation_service, brief_service
+from app.services import brief_service
 
 
 class _Store:
@@ -49,58 +49,3 @@ def test_prompt_preview_falls_back_to_local_brief(monkeypatch: pytest.MonkeyPatc
 
     assert result["brief"] == "local brief"
     assert "gl=not-set / hl=not-set" in result["prompt"]
-
-
-@pytest.mark.asyncio
-async def test_legacy_article_preview_maps_ai_result(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(article_generation_service, "is_stage_configured", lambda _stage: True)
-
-    async def generate(**kwargs):
-        assert kwargs["stage"] == "article_generation"
-        assert "Primary keyword: heat pump" in kwargs["prompt"]
-        return {"content": "# Draft", "provider": "proxy", "model": "model-x", "status": None}
-
-    monkeypatch.setattr(article_generation_service, "generate_ai_content", generate)
-
-    result = await article_generation_service.generate_legacy_article_preview(
-        keyword={"keyword": "heat pump"},
-        project={"domain": "example.com"},
-        brief="brief",
-        prompt="custom instruction",
-    )
-
-    assert result == {
-        "content": "# Draft",
-        "provider": "proxy",
-        "model": "model-x",
-        "status": None,
-        "generated": True,
-    }
-
-
-@pytest.mark.asyncio
-async def test_legacy_article_preview_preserves_local_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(article_generation_service, "is_stage_configured", lambda _stage: False)
-    monkeypatch.setattr(
-        article_generation_service,
-        "reference_plan",
-        lambda _item: {
-            "triggered": True,
-            "sources": [{"name": "Source", "label": "Evidence", "url": "https://example.com/evidence"}],
-        },
-    )
-    monkeypatch.setattr(
-        article_generation_service,
-        "image_plan_for",
-        lambda _item: [{"name": "hero", "position": "after intro"}],
-    )
-
-    result = await article_generation_service.generate_legacy_article_preview(
-        keyword={"keyword": "heat pump"},
-    )
-
-    assert result["generated"] is False
-    assert result["status"] == "ai-not-configured"
-    assert "# Heat Pump" in result["content"]
-    assert "- hero: after intro" in result["content"]
-    assert "[Evidence](https://example.com/evidence)" in result["content"]

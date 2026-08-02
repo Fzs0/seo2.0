@@ -98,7 +98,22 @@ def action() -> dict:
         "idempotency_key": "run-1:action-1",
         "risk_level": "medium",
         "approval_requirement": "approval_required",
-        "legacy_capability_compatibility": True,
+        "capability_snapshot": {
+            "capability_snapshot_hash": None,
+            "supported_actions": {"product_seo": "approval_required"},
+            "supported_fields": {
+                "product_seo": ["title", "description", "meta_title"]
+            },
+            "connectors": {
+                "products": {
+                    "status": "available",
+                    "write": True,
+                    "checked_at": datetime.now(UTC).isoformat(),
+                }
+            },
+            "configuration_issues": [],
+            "side_effects": {},
+        },
     }
 
 
@@ -296,7 +311,9 @@ async def test_readback_mismatch_is_failed_exception_without_observation() -> No
 
 @pytest.mark.asyncio
 async def test_platform_verifies_normalized_fields_and_creates_one_observation_plan() -> None:
-    store, adapter = MemoryStore(action()), Adapter()
+    item = action()
+    item["capability_snapshot"]["capability_snapshot_hash"] = "cap-v1"
+    store, adapter = MemoryStore(item), Adapter()
     preview = await service.preview_action(
         store,
         action_id="action-1",
@@ -368,7 +385,9 @@ async def test_platform_verifies_normalized_fields_and_creates_one_observation_p
 
 @pytest.mark.asyncio
 async def test_capability_change_invalidates_approval_before_remote_write() -> None:
-    store, adapter = MemoryStore(action()), Adapter()
+    item = action()
+    item["capability_snapshot"]["capability_snapshot_hash"] = "cap-v1"
+    store, adapter = MemoryStore(item), Adapter()
     preview = await service.preview_action(
         store,
         action_id="action-1",
@@ -474,7 +493,6 @@ async def test_persisted_capability_snapshot_blocks_undeclared_fields() -> None:
 @pytest.mark.asyncio
 async def test_side_effect_confirmation_is_bound_at_approval_not_preview() -> None:
     item = action()
-    item["legacy_capability_compatibility"] = False
     item["capability_snapshot"] = {
         "capability_snapshot_hash": "capability-hash-v1",
         "supported_actions": {"product_seo": "approval_required"},
@@ -530,7 +548,6 @@ async def test_side_effect_confirmation_is_bound_at_approval_not_preview() -> No
 @pytest.mark.asyncio
 async def test_adapter_identity_is_bound_to_capability_and_approval() -> None:
     item = action()
-    item["legacy_capability_compatibility"] = False
     item["adapter_identity"] = {
         "adapter_id": "oemapps_on_page",
         "adapter_version": "1",
@@ -617,7 +634,7 @@ async def test_target_identity_change_invalidates_approval_before_write() -> Non
 @pytest.mark.asyncio
 async def test_missing_capability_snapshot_is_blocked_by_default() -> None:
     item = action()
-    item.pop("legacy_capability_compatibility")
+    item.pop("capability_snapshot")
     store, adapter = MemoryStore(item), Adapter()
     result = await service.preview_action(
         store,
@@ -728,6 +745,60 @@ async def test_failed_action_can_be_reconciled_from_exact_readback_without_secon
     assert store.action["article_id"] == "article-1"
     assert store.action["publish_task_id"] == "publish-1"
     assert store.action["effect_id"] == "effect-1"
+
+
+@pytest.mark.asyncio
+async def test_success_activates_effect_only_after_action_and_observation_are_complete() -> None:
+    executing = action()
+    executing.update(
+        {
+            "status": "executing",
+            "execution_token": "execution-token",
+            "proposed_patch": {"title": "After"},
+            "approved_patch": {"title": "After"},
+            "effect_id": "effect-1",
+            "execution_task_id": "execution-1",
+        }
+    )
+
+    class OrderedStore(MemoryStore):
+        def __init__(self, current: dict):
+            super().__init__(current)
+            self.events: list[str] = []
+
+        async def save(self, current: dict) -> None:
+            self.events.append(f"save:{current['status']}")
+            await super().save(current)
+
+        async def create_observation(self, observation: dict) -> dict:
+            self.events.append("create_observation")
+            return await super().create_observation(observation)
+
+        async def activate_effect_observation(self, current: dict) -> None:
+            assert current["status"] == "completed"
+            assert current["observation_id"]
+            self.events.append("activate_effect")
+
+    store = OrderedStore(executing)
+    result = await service.complete_execution(
+        store,
+        action_id="action-1",
+        execution_token="execution-token",
+        result={
+            "result": "updated",
+            "submitted_patch": {"title": "After"},
+            "readback": {"title": "After"},
+            "effect_id": "effect-1",
+            "execution_task_id": "execution-1",
+        },
+    )
+
+    assert result["status"] == "completed"
+    assert store.events[-3:] == [
+        "create_observation",
+        "activate_effect",
+        "save:completed",
+    ]
 
 
 @pytest.mark.asyncio

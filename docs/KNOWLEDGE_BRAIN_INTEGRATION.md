@@ -258,14 +258,9 @@ Adapter 必须执行以下防御性检查，即使知识服务已经做过：
 
 ### 首期覆盖边界
 
-接入统一 pipeline 后，以下生产路径会自然覆盖：
+接入统一 pipeline 后，生产内容只从正式 Strategy Run 的已审核 Action 进入；
+独立 Mock 与旧 article-generate/article-pipeline HTTP 旁路均已删除。
 
-- `/workflow/article-pipeline`；
-- `/workflow/article-generate`；
-- 已审核策略的 `execute_strategy()`；
-- 通过 strategy execution 进入的自动化和内容排期。
-
-独立 `/workflow/brief`、`/workflow/prompt` 和 `/workflow/mock-article` 不会自动经过 pipeline。若它们继续承担生产用途，必须显式接收并复用调用方传入的 KnowledgePack；不要在各自函数里偷偷二次检索。Mock 路由在完成统一改造前不属于“知识大脑保障路径”。
 
 ## 8. Prompt 注入格式
 

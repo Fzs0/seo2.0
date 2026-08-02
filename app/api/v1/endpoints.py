@@ -8,7 +8,6 @@
 - POST /api/v1/workflow/import-file         文件导入
 - POST /api/v1/workflow/brief               Brief（含 AI 增强，回退本地）
 - POST /api/v1/workflow/prompt              Prompt
-- POST /api/v1/workflow/mock-article        Mock Article
 - POST /api/v1/workflow/project-package     项目包
 """
 from __future__ import annotations
@@ -41,12 +40,9 @@ from app.services.keyword_service import (
 from app.services.keyword_ai_service import cancel_keyword_analysis, get_keyword_analysis, get_latest_keyword_analysis, start_keyword_analysis
 from app.services.automation_service import get_execution_status
 from app.services.strategy_effect_service import list_effects
-from app.services.strategy_service import (
-    list_strategies,
-    list_strategy_candidates,
-)
+from app.services.strategy_service import list_strategies
 from app.services.content_audit_service import get_content_audit_batch, list_ai_reviews, start_content_audit
-from app.services.article_generation_service import generate_article_pipeline, generate_legacy_article_preview
+from app.services.article_generation_service import generate_article_pipeline
 
 router = APIRouter()
 logger = structlog.get_logger(__name__)
@@ -422,23 +418,6 @@ async def list_content_audit_reviews(
     return {"items": await list_ai_reviews(session, status=status, limit=limit, business_id=business_id)}
 
 
-@router.get("/workflow/strategies/candidates")
-async def get_strategy_candidates(
-    business_id: str,
-    page: int = 1,
-    limit: int = 50,
-    status: str | None = None,
-    session: AsyncSession = Depends(get_db),
-) -> dict[str, Any]:
-    return await list_strategy_candidates(
-        session,
-        business_id=business_id.strip(),
-        page=page,
-        limit=limit,
-        status=status,
-    )
-
-
 @router.get("/workflow/strategies/effects")
 async def get_strategy_effects(
     business_id: str,
@@ -512,17 +491,6 @@ async def prompt(body: PromptBody) -> dict[str, Any]:
     )
 
 
-class MockArticleBody(BaseModel):
-    keyword: dict[str, Any] | None = None
-    project: dict[str, Any] | None = None
-    brief: str | None = None
-    prompt: str | None = None
-
-
-class ArticleGenerateBody(BaseModel):
-    keywordId: str
-
-
 class ArticleTestBody(BaseModel):
     """A disposable article test: no strategy task, article row, publish or effect record."""
 
@@ -536,16 +504,6 @@ class ArticleTestBody(BaseModel):
     targetAssetUrl: str | None = None
     internalLinkPlan: list[dict[str, Any]] = Field(default_factory=list)
     serpContext: dict[str, Any] | None = None
-
-
-@router.post("/workflow/article-generate", deprecated=True)
-async def generate_article(body: ArticleGenerateBody, session: AsyncSession = Depends(get_db)) -> dict[str, Any]:
-    raise HTTPException(status_code=409, detail="该旧接口已关闭；正式生文必须从今日计划审核执行")
-
-
-@router.post("/workflow/article-pipeline", deprecated=True)
-async def article_pipeline(body: ArticleGenerateBody, session: AsyncSession = Depends(get_db)) -> dict[str, Any]:
-    raise HTTPException(status_code=409, detail="该旧接口已关闭；正式生文必须从今日计划审核执行")
 
 
 @router.post("/workflow/article-test")
@@ -576,16 +534,6 @@ async def article_test(body: ArticleTestBody, session: AsyncSession = Depends(ge
         serp_override=body.serpContext or {"id": None, "source": "article-test", "organic_results": [], "related_questions": [], "related_searches": []},
     )
     return {**result, "testMode": True, "persistence": "none"}
-
-
-@router.post("/workflow/mock-article")
-async def mock_article(body: MockArticleBody) -> dict[str, Any]:
-    return await generate_legacy_article_preview(
-        keyword=body.keyword,
-        project=body.project,
-        brief=body.brief or "",
-        prompt=body.prompt or "",
-    )
 
 
 # ---------- sync workspace (PG) ----------

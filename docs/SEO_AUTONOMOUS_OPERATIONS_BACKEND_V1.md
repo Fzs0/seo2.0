@@ -8,7 +8,7 @@
 - `strategy_action_service`：统一动作预览、精确审批、执行、回读和回滚门禁。
 - `strategy_exception_service`：按稳定根因指纹聚合异常。
 - `site_capability_service`：只读聚合站点、连接器、权限、健康和副作用。
-- `strategy_hold_service`：以业务 advisory lock 维护权威 Hold 状态和补证 token。
+- 旧 `strategy_hold_service` 已退役；重复 Hold 统一进入 `research_revision_required`，由 AI 在取得新证据后重新研究。历史数据库记录与迁移保留用于审计。
 - 现有 `strategy_service`、文章发布器、On-page 执行器及效果服务继续作为领域适配器。
 
 所有新增持久化记录均使用 `task_type=review`，实际类型位于
@@ -22,8 +22,9 @@ queued
   -> discovering_sites
   -> checking_capabilities
   -> gathering_evidence
+  -> ai_researching -> proposed_actions_submitted -> safety_reviewing
   -> planning
-  -> refreshing_evidence -> replanning
+  -> zero_action_reviewing -> research_revision_required -> ai_researching
   -> awaiting_approval | executing | observing
   -> verifying
   -> completed | partial | blocked | failed | canceled

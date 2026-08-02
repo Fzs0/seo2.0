@@ -281,8 +281,85 @@ class SQLActionStore:
                 "payload": json.dumps(payload, ensure_ascii=False, default=str),
             },
         )
-        await self.session.commit()
         return payload
+
+    async def activate_effect_observation(self, action: dict[str, Any]) -> None:
+        """Activate a prepared legacy Effect in the Action completion transaction."""
+        effect_id = str(action.get("effect_id") or "").strip()
+        if not effect_id:
+            return
+        execution_task_id = str(action.get("execution_task_id") or "").strip()
+        observation_id = str(action.get("observation_id") or "").strip()
+        activated = (
+            await self.session.execute(
+                text(
+                    """
+                    UPDATE seo_agent.tasks
+                       SET status=CASE WHEN status='running' THEN 'running' ELSE 'queued' END,
+                           finished_at=NULL, error_message=NULL,
+                           payload=(COALESCE(payload, '{}'::jsonb) - 'canceled_reason')
+                                   || CAST(:payload AS jsonb),
+                           decision=(COALESCE(decision, '{}'::jsonb) - 'canceled_reason')
+                                    || CAST(:decision AS jsonb),
+                           updated_at=now()
+                     WHERE id=CAST(:effect_id AS uuid)
+                       AND task_type='review'
+                       AND payload->>'kind'='strategy_effect'
+                       AND payload->>'execution_task_id'=:execution_task_id
+                       AND status IN ('blocked', 'queued', 'running')
+                       AND payload ? 'published_at'
+                    RETURNING id::text AS id
+                    """
+                ),
+                {
+                    "effect_id": effect_id,
+                    "execution_task_id": execution_task_id,
+                    "payload": json.dumps(
+                        {
+                            "outcome": "observing",
+                            "action_id": action["action_id"],
+                            "observation_id": observation_id,
+                        },
+                        ensure_ascii=False,
+                    ),
+                    "decision": json.dumps(
+                        {
+                            "outcome": "observing",
+                            "action_id": action["action_id"],
+                            "observation_id": observation_id,
+                        },
+                        ensure_ascii=False,
+                    ),
+                },
+            )
+        ).mappings().first()
+        if activated:
+            return
+        current = (
+            await self.session.execute(
+                text(
+                    """
+                    SELECT status, payload
+                      FROM seo_agent.tasks
+                     WHERE id=CAST(:effect_id AS uuid)
+                       AND task_type='review'
+                       AND payload->>'kind'='strategy_effect'
+                       AND payload->>'execution_task_id'=:execution_task_id
+                    """
+                ),
+                {
+                    "effect_id": effect_id,
+                    "execution_task_id": execution_task_id,
+                },
+            )
+        ).mappings().first()
+        if not current:
+            raise ValueError("completed Action effect lineage no longer matches")
+        payload = dict(current.get("payload") or {})
+        if not payload.get("published_at"):
+            raise ValueError("completed Action effect is missing publication evidence")
+        if current.get("status") not in {"queued", "running"}:
+            raise ValueError("completed Action effect is not active")
 
     async def resolve_corrective_parent(self, action: dict[str, Any]) -> None:
         """Close the original incident after its approved child passes readback."""
@@ -401,7 +478,6 @@ async def create_action(store: ActionStore, **values: Any) -> dict[str, Any]:
         "observation_id": None,
         "unexecuted_ttl_hours": ttl_hours,
         "unexecuted_expires_at": _expiry_after(ttl_hours),
-        "legacy_capability_compatibility": False,
         **values,
     }
     return await store.create(action)
@@ -885,6 +961,9 @@ async def complete_execution(
         action.update(
             {"status": "completed", "observation_id": observation.get("observation_id")}
         )
+        activate_effect = getattr(store, "activate_effect_observation", None)
+        if activate_effect is not None:
+            await activate_effect(action)
     elif semantic == "blocked":
         action["status"] = "blocked"
     else:
@@ -1328,6 +1407,11 @@ def compare_readback_fields(
     for field, expected in approved_patch.items():
         if field in ignored:
             continue
+        # Optional nulls are canonical no-ops when the adapter deliberately
+        # omits the field.  Treating them as a remote deletion requirement
+        # would incorrectly fail updates that preserve an existing cover.
+        if expected is None and field not in submitted_patch:
+            continue
         submitted = submitted_patch.get(field)
         actual = readback.get(field)
         approved_matches_submission = _normalize_value(expected, field=field) == _normalize_value(
@@ -1483,8 +1567,6 @@ def _capability_error(
 ) -> str | None:
     capability = action.get("capability_snapshot")
     if not isinstance(capability, dict):
-        if action.get("legacy_capability_compatibility") is True:
-            return None
         return "capability_snapshot_missing"
     if snapshot_hash != capability.get("capability_snapshot_hash"):
         return "capability_snapshot_changed"

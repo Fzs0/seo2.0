@@ -102,6 +102,19 @@ class IdentityConflictPublisher(Publisher):
         raise RuntimeError("SHOPIFY_ARTICLE_IDENTITY_CONFLICT: blog_gid_or_handle")
 
 
+class AcknowledgedUpdatePublisher(Publisher):
+    async def update(self, post_id: str, req: Any) -> PublishResult:
+        self.updated.append(post_id)
+        self.update_requests.append(req)
+        return PublishResult(
+            ok=True,
+            dry_run=False,
+            post_id=post_id,
+            remote_outcome="acknowledged",
+            raw={"data": True},
+        )
+
+
 def _use_publisher(monkeypatch: pytest.MonkeyPatch, publisher: Publisher) -> None:
     async def resolve(*_args: Any, **_kwargs: Any) -> Publisher:
         return publisher
@@ -302,6 +315,63 @@ async def test_unknown_remote_publish_is_persisted_as_blocked_p1(
     assert result["exception_id"] == "exception-id"
     assert session.inserts[0]["status"] == "blocked"
     assert json.loads(session.inserts[0]["payload"])["remote_outcome"] == "unknown_remote_state"
+    assert session.article_updates == []
+
+
+@pytest.mark.asyncio
+async def test_acknowledged_update_with_verified_readback_is_not_treated_as_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = Session(
+        approval=_approval(
+            execution_type="update_article",
+            approved_remote_id="42",
+        )
+    )
+    publisher = AcknowledgedUpdatePublisher()
+    _use_publisher(monkeypatch, publisher)
+
+    result = await publish_service.publish_article(
+        session,
+        article_id="article-id",
+        site_id=None,
+        dry_run=False,
+        update_post_id="42",
+    )
+
+    assert result["ok"] is True
+    assert result["remote_outcome"] == "acknowledged"
+    assert result["exception_id"] is None
+    assert session.inserts[0]["status"] == "done"
+    assert len(session.article_updates) == 1
+
+
+@pytest.mark.asyncio
+async def test_acknowledged_update_with_failed_readback_becomes_unknown_remote_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = Session(
+        approval=_approval(
+            execution_type="update_article",
+            approved_remote_id="42",
+        )
+    )
+    publisher = AcknowledgedUpdatePublisher()
+    publisher.remote = _remote(title={"rendered": "Unexpected old title"})
+    _use_publisher(monkeypatch, publisher)
+
+    result = await publish_service.publish_article(
+        session,
+        article_id="article-id",
+        site_id=None,
+        dry_run=False,
+        update_post_id="42",
+    )
+
+    assert result["ok"] is False
+    assert result["remote_outcome"] == "unknown_remote_state"
+    assert result["exception_id"] == "exception-id"
+    assert session.inserts[0]["status"] == "blocked"
     assert session.article_updates == []
 
 

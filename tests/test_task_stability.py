@@ -319,8 +319,11 @@ def test_failed_article_qa_does_not_mark_keyword_written() -> None:
 def test_legacy_strategy_write_routes_are_retired() -> None:
     routes = {(route.path, tuple(sorted(route.methods or []))) for route in endpoints.router.routes}
 
-    assert ("/workflow/strategies/candidates", ("GET",)) in routes
     retired = {
+        "/workflow/strategies/candidates",
+        "/workflow/article-generate",
+        "/workflow/article-pipeline",
+        "/workflow/mock-article",
         "/workflow/strategies/generate",
         "/workflow/strategies/plan",
         "/workflow/strategies/{task_id}/review",

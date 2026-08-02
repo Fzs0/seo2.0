@@ -49,7 +49,7 @@
 
 - `UNIFIED_ACTION_TYPES` 当前只允许 `new_article` 和 `update_article`。
 - AI 可以生成 `on_page_fix` 决策，但正式 Run 会把它安全转为 Hold。
-- 当前 `strategy_on_page_execution.py` 主要调用 OEMApps 写入器，不能作为所有平台的统一实现。
+- 旧 `strategy_on_page_execution.py` 已删除；On-page 统一由 `StrategyActionAdapterRouter` 与平台专属 Action Adapter 执行。
 - 能力契约使用 `product_seo`、`category_seo`、`homepage_seo` 等具体动作，而策略层仍可能只检查笼统的 `on_page_fix`。
 - Shopify 产品 SEO 能力存在于独立路径，尚未接入统一 Strategy Action Adapter。
 - Run-local option 尚未完整表达 On-page 目标身份。

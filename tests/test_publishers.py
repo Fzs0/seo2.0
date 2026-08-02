@@ -269,6 +269,7 @@ async def test_oemapps_sites_share_single_article_publish_adapter(monkeypatch):
         category_id='4275',
         image_cover_url='https://cdn.example.com/cover.jpg',
         image_cover_id='16756439',
+        image_cover_alt='SEO guide cover with titanium product',
         published_at='2026-07-29T05:42:51Z',
         status='publish',
     )
@@ -319,6 +320,7 @@ async def test_oemapps_sites_share_single_article_publish_adapter(monkeypatch):
         'published_at': '2026-07-29',
         'src': 'https://cdn.example.com/cover.jpg',
         'image_id': 16756439,
+        'image_alt': 'SEO guide cover with titanium product',
         'news_id': 4275,
     }
 
@@ -342,6 +344,24 @@ async def test_oemapps_article_update_uses_site_token(monkeypatch):
         dry_run=False,
     )
 
+    async def existing_article(_post_id: str):
+        return {
+            'id': 7,
+            'handle': 'updated',
+            'status': 'published',
+            'raw_status': 1,
+            'published_at': '2026-07-22',
+            'author_name': 'Editorial Team',
+            'meta_keywords': ['existing keyword'],
+            'related_product_ids': [123],
+            'is_top': 0,
+            'src': 'https://cdn.example.com/old-cover.jpg',
+            'image_id': 15931779,
+            'image_alt': 'Old cover alt',
+        }
+
+    monkeypatch.setattr(publisher, 'get_article', existing_article)
+
     result = await publisher.update(
         '7',
         PublishRequest(
@@ -350,6 +370,7 @@ async def test_oemapps_article_update_uses_site_token(monkeypatch):
             content_md='# Updated',
             image_cover_url='https://cdn.example.com/cover.jpg',
             image_cover_id='16756439',
+            image_cover_alt='Updated guide cover alt',
             published_at='2026-07-29T05:42:51Z',
             status='publish',
         ),
@@ -363,9 +384,82 @@ async def test_oemapps_article_update_uses_site_token(monkeypatch):
     assert called['json']['handle'] == 'updated'
     assert called['json']['status'] == 1
     assert called['json']['content'] == ''
-    assert called['json']['published_at'] == '2026-07-29'
+    assert called['json']['published_at'] == '2026-07-22'
     assert called['json']['src'] == 'https://cdn.example.com/cover.jpg'
     assert called['json']['image_id'] == 16756439
+    assert called['json']['image_alt'] == 'Updated guide cover alt'
+
+
+@pytest.mark.asyncio
+async def test_oemapps_article_update_preserves_unapproved_remote_fields(monkeypatch):
+    called: dict[str, object] = {}
+
+    async def fake_request_json(method: str, url: str, **kwargs):
+        called.update(method=method, url=url, headers=kwargs.get('headers'), json=kwargs.get('json'))
+        return {'code': 0, 'msg': 'success', 'data': True}
+
+    monkeypatch.setattr('app.clients.publishers.request_json', fake_request_json)
+    publisher = OpenAPIPublisher(
+        {
+            'site_type': 'main',
+            'base_url': 'https://avinoti.shop',
+            'api_base_url': 'https://openapi.oemapps.com',
+            'api_config': {'tokenB': 'site-token'},
+        },
+        dry_run=False,
+    )
+    remote_before = {
+        'id': 7,
+        'handle': 'existing-handle',
+        'status': 1,
+        'published_at': '2026-07-22',
+        'author_name': 'Avinoti Editorial Team',
+        'meta_keywords': ['titanium cutting board', 'cutting board guide'],
+        'related_product_ids': [123, 234],
+        'is_top': 1,
+        'src': 'https://cdn.example.com/existing-cover.jpg',
+        'image_id': 15931779,
+        'image_alt': 'Existing article cover',
+        'news_id': 4275,
+        'collect_content_images': '1',
+    }
+
+    async def fake_get_article(post_id: str):
+        assert post_id == '7'
+        return remote_before
+
+    monkeypatch.setattr(publisher, 'get_article', fake_get_article)
+
+    result = await publisher.update(
+        '7',
+        PublishRequest(
+            title='Approved title update',
+            slug='existing-handle',
+            content_md='# Approved title update\n\nApproved body.',
+            meta_title='Approved meta title',
+            meta_description='Approved meta description',
+            primary_keyword='new strategy keyword',
+            image_cover_alt='Updated article cover alt',
+            status='publish',
+        ),
+    )
+
+    assert result.ok is True
+    assert called['method'] == 'PUT'
+    assert called['json']['published_at'] == '2026-07-22'
+    assert called['json']['author_name'] == 'Avinoti Editorial Team'
+    assert called['json']['meta_keywords'] == [
+        'titanium cutting board',
+        'cutting board guide',
+    ]
+    assert called['json']['related_product_ids'] == [123, 234]
+    assert called['json']['is_top'] == 1
+    assert called['json']['status'] == 1
+    assert called['json']['src'] == 'https://cdn.example.com/existing-cover.jpg'
+    assert called['json']['image_id'] == 15931779
+    assert called['json']['image_alt'] == 'Updated article cover alt'
+    assert called['json']['news_id'] == 4275
+    assert called['json']['collect_content_images'] == '1'
 
 
 @pytest.mark.asyncio
@@ -392,6 +486,21 @@ async def test_oemapps_article_update_boolean_ack_preserves_approved_remote_id(m
         dry_run=False,
     )
 
+    async def existing_article(_post_id: str):
+        return {
+            'id': 2588676,
+            'handle': 'updated',
+            'status': 'published',
+            'raw_status': 1,
+            'published_at': '2026-07-22',
+            'author_name': 'Editorial Team',
+            'meta_keywords': ['existing keyword'],
+            'related_product_ids': [],
+            'is_top': 0,
+        }
+
+    monkeypatch.setattr(publisher, 'get_article', existing_article)
+
     result = await publisher.update(
         '2588676',
         PublishRequest(
@@ -407,6 +516,49 @@ async def test_oemapps_article_update_boolean_ack_preserves_approved_remote_id(m
     assert result.remote_outcome == 'acknowledged'
     assert result.raw['data'] is True
     assert [call['method'] for call in calls] == ['PUT']
+
+
+@pytest.mark.asyncio
+async def test_oemapps_article_update_stops_before_put_without_safe_baseline(monkeypatch):
+    called = False
+
+    async def fail_if_called(*_args, **_kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError('PUT must not run without a protected-field baseline')
+
+    monkeypatch.setattr('app.clients.publishers.request_json', fail_if_called)
+    publisher = OpenAPIPublisher(
+        {
+            'site_type': 'main',
+            'base_url': 'https://avinoti.shop',
+            'api_base_url': 'https://openapi.oemapps.com',
+            'api_config': {'tokenB': 'site-token'},
+        },
+        dry_run=False,
+    )
+
+    async def missing_article(_post_id: str):
+        return None
+
+    monkeypatch.setattr(publisher, 'get_article', missing_article)
+
+    result = await publisher.update(
+        '2588676',
+        PublishRequest(
+            title='Updated',
+            slug='updated',
+            content_md='# Updated',
+            status='publish',
+        ),
+    )
+
+    assert result.ok is False
+    assert result.raw == {
+        'error_code': 'OEMAPPS_SAFE_UPDATE_BASELINE_REQUIRED',
+        'remote_write_occurred': False,
+    }
+    assert called is False
 
 
 @pytest.mark.asyncio

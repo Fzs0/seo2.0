@@ -28,6 +28,7 @@ from app.core.time_values import require_aware_datetime
 from app.services.strategy_action_service import (
     SQLActionStore,
     approve_action,
+    complete_execution,
     create_action,
     execute_action,
     execute_action_and_reconcile,
@@ -211,6 +212,48 @@ def _pg17_normalized_article_option(
         "strategy_fingerprint": f"strategy-{scope_key}",
         "evidence_fingerprint": f"evidence-{scope_key}",
         "policy_version": "ai-led-strategy-v1",
+    }
+
+
+def _pg17_article_capability(*, site_id: str) -> dict:
+    article_adapter = {
+        "adapter_id": "strategy_article_action",
+        "adapter_version": "1",
+        "connector_type": "custom_openapi",
+        "read": True,
+        "write": True,
+        "readback": True,
+    }
+    return {
+        "site_id": site_id,
+        "supported_actions": {
+            "new_article": "approval_required",
+            "update_article": "approval_required",
+        },
+        "supported_fields": {
+            "articles": [
+                "title",
+                "body",
+                "meta_title",
+                "meta_description",
+                "images",
+                "image_alts",
+                "cover_image",
+            ]
+        },
+        "connectors": {
+            "images": {
+                "status": "available",
+                "write": True,
+                "upload": True,
+                "ingest": False,
+            }
+        },
+        "configuration_issues": [],
+        "action_adapters": {
+            "new_article": dict(article_adapter),
+            "update_article": dict(article_adapter),
+        },
     }
 
 
@@ -452,13 +495,7 @@ async def test_replanning_one_run_does_not_supersede_another_run_plan():
                     ],
                     "capability_snapshot": {
                         "sites": [
-                            {
-                                "site_id": str(site_id),
-                                "supported_actions": {
-                                    "new_article": "approval_required"
-                                },
-                                "configuration_issues": [],
-                            }
+                            _pg17_article_capability(site_id=str(site_id))
                         ]
                     },
                     "proposed_actions": [option(label)],
@@ -582,13 +619,7 @@ async def test_concurrent_formal_plans_allow_one_exact_target_on_pg17():
             ],
             "capability_snapshot": {
                 "sites": [
-                    {
-                        "site_id": str(site_id),
-                        "supported_actions": {
-                            "new_article": "approval_required"
-                        },
-                        "configuration_issues": [],
-                    }
+                    _pg17_article_capability(site_id=str(site_id))
                 ]
             },
             "proposed_actions": [
@@ -685,13 +716,7 @@ async def test_pg17_safety_ceiling_persists_all_deferred_without_candidates():
                 "discovered_sites": discovered,
                 "capability_snapshot": {
                     "sites": [
-                        {
-                            "site_id": str(site_id),
-                            "supported_actions": {
-                                "new_article": "approval_required"
-                            },
-                            "configuration_issues": [],
-                        }
+                        _pg17_article_capability(site_id=str(site_id))
                         for site_id in site_ids
                     ]
                 },
@@ -1627,6 +1652,127 @@ async def test_same_scoped_idempotency_key_concurrently_creates_one_action():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("prepared_effect_status", ["blocked", "queued"])
+async def test_action_completion_atomically_activates_prepared_effect_on_pg17(
+    prepared_effect_status: str,
+):
+    sqlalchemy_dsn = _dsn().replace("postgresql://", "postgresql+asyncpg://", 1)
+    engine = create_async_engine(sqlalchemy_dsn)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    ids = await _seed_pg17_action_lineage(engine, action_type="update_article")
+    execution_task_id = str(uuid4())
+    effect_id = str(uuid4())
+    target_url = f"https://{ids['site_id']}.test/blogs/exact-readback"
+
+    async with factory() as session:
+        store = SQLActionStore(session)
+        current = await create_action(
+            store,
+            run_id=str(ids["run_id"]),
+            run_mode="approval_execution",
+            plan_id=str(ids["plan_id"]),
+            source_strategy_task_id=str(ids["strategy_id"]),
+            business_id=ids["business_id"],
+            site_id=str(ids["site_id"]),
+            action_type="update_article",
+            target_url=target_url,
+            idempotency_key=f"effect-activation-{uuid4()}",
+            capability_snapshot={
+                "supported_actions": {"update_article": "approval_required"}
+            },
+        )
+        current.update(
+            {
+                "status": "executing",
+                "execution_token": "pg17-effect-execution-token",
+                "proposed_patch": {"title": "After"},
+                "approved_patch": {"title": "After"},
+                "execution_task_id": execution_task_id,
+                "effect_id": effect_id,
+            }
+        )
+        await store.save(current)
+        await session.execute(
+            text(
+                """
+                INSERT INTO seo_agent.tasks
+                  (id, task_type, status, priority, site_id, target_url, title,
+                   payload, decision)
+                VALUES
+                  (CAST(:effect_id AS uuid), 'review', :effect_status, 'P2',
+                   CAST(:site_id AS uuid), :target_url, 'prepared effect',
+                   CAST(:payload AS jsonb), CAST(:decision AS jsonb))
+                """
+            ),
+            {
+                "effect_id": effect_id,
+                "effect_status": prepared_effect_status,
+                "site_id": str(ids["site_id"]),
+                "target_url": target_url,
+                "payload": json.dumps(
+                    {
+                        "kind": "strategy_effect",
+                        "business_id": ids["business_id"],
+                        "execution_task_id": execution_task_id,
+                        "outcome": "pending_confirmation",
+                        "published_at": "2026-08-02T00:00:00+00:00",
+                    }
+                ),
+                "decision": json.dumps({"outcome": "pending_confirmation"}),
+            },
+        )
+        await session.commit()
+
+        completed = await complete_execution(
+            store,
+            action_id=current["action_id"],
+            execution_token="pg17-effect-execution-token",
+            result={
+                "result": "updated",
+                "submitted_patch": {"title": "After"},
+                "readback": {"title": "After"},
+                "target_url": target_url,
+                "execution_task_id": execution_task_id,
+                "effect_id": effect_id,
+            },
+        )
+
+    async with engine.begin() as connection:
+        action_payload = (
+            await connection.exec_driver_sql(
+                "SELECT payload FROM seo_agent.tasks WHERE id=$1::uuid",
+                (UUID(completed["action_id"]),),
+            )
+        ).scalar_one()
+        effect_row = (
+            await connection.exec_driver_sql(
+                "SELECT status, payload FROM seo_agent.tasks WHERE id=$1::uuid",
+                (UUID(effect_id),),
+            )
+        ).mappings().one()
+        observation_count = (
+            await connection.exec_driver_sql(
+                """
+                SELECT count(*) FROM seo_agent.tasks
+                 WHERE payload->>'kind'='strategy_action_observation'
+                   AND payload->>'action_id'=$1
+                """,
+                (completed["action_id"],),
+            )
+        ).scalar_one()
+
+    assert completed["status"] == "completed"
+    assert action_payload["status"] == "completed"
+    assert action_payload["observation_id"] == completed["observation_id"]
+    assert effect_row["status"] == "queued"
+    assert effect_row["payload"]["outcome"] == "observing"
+    assert effect_row["payload"]["action_id"] == completed["action_id"]
+    assert effect_row["payload"]["observation_id"] == completed["observation_id"]
+    assert observation_count == 1
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_strategy_run_start_control_idempotency_executes_on_pg17():
     sqlalchemy_dsn = _dsn().replace("postgresql://", "postgresql+asyncpg://", 1)
     engine = create_async_engine(sqlalchemy_dsn)
@@ -1848,6 +1994,16 @@ async def test_formal_run_action_readback_observation_chain_closes_on_pg17():
                 "capability_snapshot_hash": capability_hash,
                 "supported_actions": {"update_article": "approval_required"},
                 "supported_fields": {"articles": ["title"]},
+                "action_adapters": {
+                    "update_article": {
+                        "adapter_id": "strategy_article_action",
+                        "adapter_version": "1",
+                        "connector_type": "custom_openapi",
+                        "read": True,
+                        "write": True,
+                        "readback": True,
+                    }
+                },
                 "connectors": {
                     "articles": {
                         "status": "available",

@@ -291,10 +291,6 @@ def _resolve(value: str, base_url: str) -> str:
     return urljoin(f"{base_url.rstrip('/')}/", value)
 
 
-def _same_host(url: str, base_url: str) -> bool:
-    return _hostname(url) == _hostname(base_url)
-
-
 def _hostname(url: str) -> str:
     return str(urlsplit(url).hostname or "").casefold()
 

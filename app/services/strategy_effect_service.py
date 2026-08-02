@@ -91,6 +91,11 @@ def _effect_url_key(value: Any) -> tuple[str, str, str]:
     )
 
 
+def _effect_url_db_key(value: Any) -> str:
+    scheme, host, path = _effect_url_key(value)
+    return urlunsplit((scheme, host, path, "", ""))
+
+
 def _is_page_url(value: Any) -> bool:
     return isinstance(value, str) and str(value).strip().startswith(("https://", "http://", "/"))
 
@@ -557,19 +562,90 @@ async def ensure_effect(
             existing_payload.pop("canceled_reason", None)
             await session.execute(
                 text(
-                    "UPDATE seo_agent.tasks SET status = 'queued', finished_at = NULL, error_message = NULL, "
+                    "UPDATE seo_agent.tasks SET status = 'blocked', finished_at = NULL, error_message = NULL, "
                     "payload = (COALESCE(payload, '{}'::jsonb) - 'canceled_reason') || CAST(:payload AS jsonb), "
                     "decision = (COALESCE(decision, '{}'::jsonb) - 'canceled_reason') || CAST(:decision AS jsonb), "
                     "updated_at = now() WHERE id = CAST(:id AS uuid) AND status = 'canceled'"
                 ),
                 {
                     "id": existing["id"],
-                    "payload": json.dumps({"outcome": "observing"}),
-                    "decision": json.dumps({"outcome": "observing"}),
+                    "payload": json.dumps({"outcome": "pending_confirmation"}),
+                    "decision": json.dumps({"outcome": "pending_confirmation"}),
                 },
             )
-        return {"id": existing["id"], **existing_payload, "outcome": "observing"}
+            existing_payload["outcome"] = "pending_confirmation"
+        outcome = (
+            "pending_confirmation"
+            if existing["status"] in {"blocked", "canceled"}
+            else "observing"
+        )
+        return {"id": existing["id"], **existing_payload, "outcome": outcome}
     scope_key = strategy.get("scope_key")
+    scope_lock_scope = strategy.get("lock_scope") or (
+        "url"
+        if strategy.get("strategy_type") == "update_article"
+        else "topic_cluster"
+    )
+    scope_lock_key = strategy.get("lock_key") or scope_key
+    if scope_lock_key:
+        await session.execute(
+            text("SELECT pg_advisory_xact_lock(hashtext(:key))"),
+            {
+                "key": (
+                    "strategy-effect-scope:"
+                    f"{strategy.get('business_id')}:{site_id}:"
+                    f"{scope_lock_scope}:{scope_lock_key}"
+                )
+            },
+        )
+        active_conflict = (
+            await session.execute(
+                text(
+                    """
+                    SELECT id::text AS id,
+                           payload->>'execution_task_id' AS execution_task_id
+                      FROM seo_agent.tasks
+                     WHERE task_type='review'
+                       AND payload->>'kind'='strategy_effect'
+                       AND status IN ('queued', 'running', 'blocked')
+                       AND site_id::text=:site_id
+                       AND payload->>'business_id'=:business_id
+                       AND COALESCE(payload->>'execution_task_id', '')
+                           <> :execution_task_id
+                       AND (
+                         payload->>'lock_key'=:lock_key
+                         OR (
+                           :action='update_article'
+                           AND lower(regexp_replace(
+                             COALESCE(target_url, payload->>'target_url', ''),
+                             '/+$', ''
+                           ))=:target_key
+                         )
+                       )
+                     /* STRATEGY_EFFECT_ACTIVE_SCOPE */
+                     ORDER BY created_at DESC
+                     LIMIT 1
+                     FOR UPDATE
+                    """
+                ),
+                {
+                    "site_id": site_id,
+                    "business_id": str(strategy.get("business_id") or ""),
+                    "execution_task_id": execution_task_id,
+                    "lock_key": scope_lock_key,
+                    "action": str(strategy.get("strategy_type") or ""),
+                    "target_key": _effect_url_db_key(target_url),
+                },
+            )
+        ).mappings().first()
+        if (
+            active_conflict
+            and strategy.get("corrective_action_validated") is not True
+        ):
+            raise ValueError(
+                "STRATEGY_EFFECT_TARGET_ALREADY_ACTIVE: "
+                f"effect_id={active_conflict['id']}"
+            )
     identity = {
         "scope_key": scope_key,
         # Legacy approved decisions remain executable; newly generated
@@ -603,7 +679,7 @@ async def ensure_effect(
         "baseline": baseline,
         "baseline_valid": True,
         "checkpoints": [],
-        "outcome": "observing",
+        "outcome": "pending_confirmation",
         "cooldown_until": None,
         "topic_relation": strategy.get("topic_relation"),
         "cannibalization_detected": bool(strategy.get("cannibalization_detected")),
@@ -615,7 +691,7 @@ async def ensure_effect(
             INSERT INTO seo_agent.tasks
               (task_type, status, priority, site_id, article_id, target_url, title, payload, decision)
             VALUES
-              ('review', 'queued', 'P2', CAST(:site_id AS uuid), CAST(:article_id AS uuid), :target_url,
+              ('review', 'blocked', 'P2', CAST(:site_id AS uuid), CAST(:article_id AS uuid), :target_url,
                :title, CAST(:payload AS jsonb), CAST(:decision AS jsonb))
             RETURNING id
             """
@@ -626,7 +702,7 @@ async def ensure_effect(
             "target_url": target_url,
             "title": f"策略效果观察：{strategy.get('query') or strategy_task_id}",
             "payload": json.dumps(payload, ensure_ascii=False),
-            "decision": json.dumps({"outcome": "observing"}),
+            "decision": json.dumps({"outcome": "pending_confirmation"}),
         },
     )
     return {"id": str(inserted.scalar_one()), **payload}
@@ -639,7 +715,7 @@ async def cancel_unpublished_effect(session: AsyncSession, *, execution_task_id:
             "UPDATE seo_agent.tasks SET status = 'canceled', finished_at = now(), updated_at = now(), "
             "payload = payload || CAST(:payload AS jsonb), "
             "decision = decision || CAST(:decision AS jsonb) "
-            "WHERE task_type = 'review' AND status IN ('queued', 'running') "
+            "WHERE task_type = 'review' AND status IN ('queued', 'running', 'blocked') "
             "AND payload->>'kind' = 'strategy_effect' "
             "AND payload->>'execution_task_id' = :execution_task_id AND NOT (payload ? 'published_at')"
         ),
@@ -663,7 +739,7 @@ async def mark_effect_published(
     article = (
         await session.execute(
             text(
-                "SELECT published_url, published_at, "
+                "SELECT site_id::text AS site_id, published_url, published_at, "
                 "(SELECT payload FROM seo_agent.tasks WHERE task_type = 'review' "
                 "AND payload->>'kind' = 'strategy_effect' "
                 "AND payload->>'execution_task_id' = :execution_task_id LIMIT 1) AS effect_payload "
@@ -686,6 +762,42 @@ async def mark_effect_published(
     )
     if action == "new_article" and not url:
         raise ValueError("新文章发布后缺少正式公开地址，无法创建效果观察")
+    if article and article.get("site_id") and url:
+        superseded = {
+            "outcome": "inconclusive",
+            "contaminated": True,
+            "canceled_reason": "superseded_by_confirmed_publication",
+            "superseded_by_execution_task_id": execution_task_id,
+        }
+        await session.execute(
+            text(
+                """
+                UPDATE seo_agent.tasks
+                   SET status='canceled', run_after=NULL, finished_at=now(),
+                       updated_at=now(),
+                       payload=payload || CAST(:payload AS jsonb),
+                       decision=decision || CAST(:decision AS jsonb)
+                 WHERE task_type='review'
+                   AND payload->>'kind'='strategy_effect'
+                   AND status IN ('queued', 'running', 'blocked')
+                   AND site_id::text=:site_id
+                   AND COALESCE(payload->>'execution_task_id', '')
+                       <> :execution_task_id
+                   AND lower(regexp_replace(
+                         COALESCE(target_url, payload->>'target_url', ''),
+                         '/+$', ''
+                       ))=:target_key
+                 /* SUPERSEDE_ACTIVE_EFFECT_AFTER_CONFIRMED_PUBLICATION */
+                """
+            ),
+            {
+                "site_id": str(article["site_id"]),
+                "execution_task_id": execution_task_id,
+                "target_key": _effect_url_db_key(url),
+                "payload": json.dumps(superseded, ensure_ascii=False),
+                "decision": json.dumps(superseded, ensure_ascii=False),
+            },
+        )
     cooldown_until = (
         published_at + timedelta(days=28)
         if action == "update_article"
@@ -730,7 +842,7 @@ async def mark_effect_published(
                    payload = (COALESCE(payload, '{}'::jsonb) - 'canceled_reason') || CAST(:patch AS jsonb),
                    decision = COALESCE(decision, '{}'::jsonb) - 'canceled_reason',
                    updated_at = now()
-             WHERE task_type = 'review' AND status = 'queued' AND payload->>'kind' = 'strategy_effect'
+             WHERE task_type = 'review' AND status IN ('blocked', 'queued') AND payload->>'kind' = 'strategy_effect'
                AND payload->>'execution_task_id' = :execution_task_id
             """
         ),
@@ -742,65 +854,6 @@ async def mark_effect_published(
             "patch": json.dumps(patch, ensure_ascii=False),
         },
     )
-
-
-async def backfill_missing_effect_target_urls(session: AsyncSession, *, business_id: str) -> int:
-    """Repair legacy effect records when their completed execution retained a known page URL.
-
-    This is deliberately conservative: only a syntactically valid page URL from
-    the original strategy evidence or persisted article can repair a record.
-    Connector placeholders are never copied into effect measurement.
-    """
-    rows = await session.execute(
-        text(
-            """
-            SELECT effect.id::text AS id, effect.target_url, effect.payload,
-                   execution.payload->'strategy' AS strategy,
-                   article.published_url AS article_url
-              FROM seo_agent.tasks effect
-              LEFT JOIN seo_agent.tasks execution
-                ON execution.id::text = effect.payload->>'execution_task_id'
-              LEFT JOIN seo_agent.articles article ON article.id = effect.article_id
-             WHERE effect.task_type = 'review' AND effect.status <> 'canceled'
-               AND effect.payload->>'kind' = 'strategy_effect'
-               AND effect.payload->>'business_id' = :business_id
-               AND effect.payload ? 'published_at'
-               AND NULLIF(trim(COALESCE(effect.target_url, effect.payload->>'target_url', '')), '') IS NULL
-            """
-        ),
-        {"business_id": business_id},
-    )
-    repaired = 0
-    for row in rows.mappings().all():
-        strategy = dict(row["strategy"] or {})
-        target_url = resolve_strategy_target_url(strategy)
-        if not target_url and _is_page_url(row["article_url"]):
-            target_url = str(row["article_url"]).strip()
-        if not target_url:
-            continue
-        patch = {
-            "target_url": target_url,
-            "baseline_note": "初始基线创建时未绑定目标 URL；其中的 0 值不能作为可靠的更新前对比。",
-        }
-        if dict(row["payload"] or {}).get("action") == "update_article":
-            patch["baseline_valid"] = False
-        await session.execute(
-            text(
-                """
-                UPDATE seo_agent.tasks
-                   SET target_url = :target_url,
-                       payload = payload || CAST(:patch AS jsonb),
-                       updated_at = now()
-                 WHERE id = CAST(:id AS uuid)
-                   AND NULLIF(trim(COALESCE(target_url, payload->>'target_url', '')), '') IS NULL
-                """
-            ),
-            {"id": row["id"], "target_url": target_url, "patch": json.dumps(patch, ensure_ascii=False)},
-        )
-        repaired += 1
-    if repaired:
-        await session.commit()
-    return repaired
 
 
 async def _is_contaminated(session: AsyncSession, *, site_id: str, article_id: str | None, target_url: str | None, published_at: datetime) -> bool:
@@ -982,7 +1035,6 @@ __all__ = [
     "CHECKPOINT_DAYS",
     "POLICY_VERSION",
     "cancel_unpublished_effect",
-    "backfill_missing_effect_target_urls",
     "capture_metrics",
     "classify_outcome",
     "ensure_effect",

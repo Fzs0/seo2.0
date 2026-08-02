@@ -77,7 +77,6 @@
 | POST | `/api/v1/workflow/content-audit/scan` | `ContentAuditBody` | 按业务扫描站点文章、SERP 与竞争证据，保存不可变审计批次和条目。 |
 | GET | `/api/v1/workflow/content-audit/reviews` | 查询：`status=pending`、`limit=50`、`business_id?` | 返回符合状态和业务范围的内容审计 AI 复核记录。 |
 | POST | `/api/v1/workflow/strategies/generate` | `StrategyGenerateBody` | 基于当前业务最新内容审计生成完整候选池和今日计划。 |
-| GET | `/api/v1/workflow/strategies/candidates` | 查询：必填 `business_id`；`page=1`、`limit=50`、`status?` | 分页返回当前业务的策略候选池，包含可执行项和 Hold。 |
 | GET | `/api/v1/workflow/strategies/effects` | 查询：必填 `business_id`；`limit=200` | 返回 T+0 基线、观察检查点、冷却期和当前效果结论。 |
 | GET | `/api/v1/workflow/strategies/plan` | 查询：必填 `business_id` | 返回当前业务今日计划、预算、站点配额和候选选择。 |
 | PUT | `/api/v1/workflow/strategies/plan` | `StrategyPlanBody` | 保存今日动作预算、站点配额和人工勾选候选。 |
@@ -97,10 +96,7 @@
 | --- | --- | --- | --- |
 | POST | `/api/v1/workflow/brief` | `BriefBody` | 生成 Brief；AI 已配置时增强，失败或未配置时回退本地结果。 |
 | POST | `/api/v1/workflow/prompt` | `PromptBody` | 返回 `{brief, locale, articleBriefTemplate, prompt}`。 |
-| POST | `/api/v1/workflow/article-generate` | `ArticleGenerateBody` | 旧正式生文旁路，当前固定返回 409；正式生文必须从今日计划审核执行。 |
-| POST | `/api/v1/workflow/article-pipeline` | `ArticleGenerateBody` | 旧流水线旁路，当前固定返回 409。 |
 | POST | `/api/v1/workflow/article-test` | `ArticleTestBody` | 使用冻结 Generation Context 试生成可审核草稿；不写 articles/keywords/tasks/effects，也不发布。 |
-| POST | `/api/v1/workflow/mock-article` | `MockArticleBody` | AI 已配置时生成文章，否则返回本地 Markdown 模板和 `ai-not-configured`。 |
 | POST | `/api/v1/database/sync-workspace` | `SyncWorkspaceBody` | 将快照中的站点和关键词 upsert 到数据库，返回写入数量。 |
 
 ### 2.5 站点
@@ -282,9 +278,7 @@ GA4 数据源可在本地配置中提供 `ga4Hostnames: string[]`。未显式配
 | `AutomationSettingsBody` | `enabled: boolean = false`，`intervalSeconds: integer = 3600`（60..604800），`batchSize: integer = 1`（1..5），`minImpressions: integer = 20`（0..1000000） |
 | `BriefBody` | `keyword?: object`，`project?: object`，`aiStage?: object` |
 | `PromptBody` | `keyword?: object`，`project?: object`，`briefOverride?: string`，`brief?: string` |
-| `ArticleGenerateBody` | `keywordId: string` |
 | `ArticleTestBody` | `siteId: string`，`keyword: string`；可选 `market`、`languageCode`、`pageType`、`briefDirection`、`userQuestion`、`targetAssetUrl`、`internalLinkPlan`、`serpContext` |
-| `MockArticleBody` | `keyword?: object`，`project?: object`，`brief?: string`，`prompt?: string` |
 | `SyncWorkspaceBody` | `snapshot: object = {}` |
 | `SyncPostsBody` | `limit: integer = 100` |
 | `SiteSnapshotBody` | `apis: object[] = []` |

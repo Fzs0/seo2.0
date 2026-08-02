@@ -16,7 +16,6 @@ if (-not ($databaseName.Contains("test") -or $databaseName.Contains("temp") -or 
 $env:SEO_PG17_GATE_REQUIRED = "1"
 $env:SEO_PG17_TEST_DSN = $Dsn
 $env:SEO_MIGRATION_TEST_POSTGRES_DSN = $Dsn
-$env:SEO_HOLD_TEST_POSTGRES_DSN = $Dsn
 
 $python = Join-Path $PSScriptRoot "..\.venv\Scripts\python.exe"
 if (-not (Test-Path $python)) {
@@ -26,7 +25,6 @@ if (-not (Test-Path $python)) {
 & $python -m pytest `
     tests/test_pg17_release_gate.py `
     tests/test_strategy_effect_migrations_postgres.py `
-    tests/test_strategy_hold_concurrency_postgres.py `
     -q
 
 if ($LASTEXITCODE -ne 0) {

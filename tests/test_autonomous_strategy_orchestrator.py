@@ -5,6 +5,7 @@ from copy import deepcopy
 import pytest
 
 from app.services import autonomous_strategy_orchestrator as orchestrator
+from app.services import strategy_effect_service
 from app.services.autonomous_strategy_orchestrator import (
     ACTION_TYPES,
     FixedEvidenceAdapter,
@@ -216,6 +217,17 @@ def _capability(site: dict):
     return {
         "site_id": site["id"],
         "configuration_issues": [],
+        "supported_fields": {
+            "articles": [
+                "title",
+                "body",
+                "meta_title",
+                "meta_description",
+                "images",
+                "image_alts",
+                "cover_image",
+            ]
+        },
         "supported_actions": {
             "new_article": "approval_required",
             "update_article": "approval_required",
@@ -225,6 +237,18 @@ def _capability(site: dict):
             "product_image_alt": "approval_required",
         },
         "action_adapters": {
+            "new_article": {
+                "connector_type": "custom_openapi",
+                "read": True,
+                "write": True,
+                "readback": True,
+            },
+            "update_article": {
+                "connector_type": "custom_openapi",
+                "read": True,
+                "write": True,
+                "readback": True,
+            },
             "product_seo": {"connector_type": "shopify", "readback": True},
             "category_seo": {"connector_type": "shopify", "readback": True},
             "homepage_seo": {"connector_type": "shopify", "readback": True},
@@ -233,7 +257,154 @@ def _capability(site: dict):
                 "readback": True,
             },
         },
+        "connectors": {
+            "images": {
+                "status": "available",
+                "write": True,
+                "upload": True,
+                "ingest": False,
+            }
+        },
     }
+
+
+def test_article_plan_binds_connector_type_from_capability_snapshot() -> None:
+    site = _site()
+    research = normalize_research_portfolio(
+        [_research(site)],
+        discovered_sites=[site],
+        evidence_snapshot_id="snapshot-1",
+    )
+    actions = normalize_proposed_actions(
+        [_proposal(site, intent="titanium cup care")],
+        business_id="avinoti",
+        discovered_sites=[site],
+        research_portfolio=research,
+    )
+
+    reviewed = review_proposed_actions(
+        actions,
+        discovered_sites=[site],
+        capability_snapshot={"sites": [_capability(site)]},
+        scope_locks={},
+        safety_action_ceiling=10,
+    )
+
+    assert reviewed[0]["schedule_class"] == "execute_now"
+    assert reviewed[0]["connector_type"] == "custom_openapi"
+
+
+def test_article_plan_becomes_configuration_repair_when_media_preflight_cannot_pass() -> None:
+    site = _site()
+    capability = _capability(site)
+    capability["connectors"]["images"] = {
+        "status": "unavailable",
+        "write": False,
+        "upload": False,
+        "ingest": False,
+    }
+    research = normalize_research_portfolio(
+        [_research(site)],
+        discovered_sites=[site],
+        evidence_snapshot_id="snapshot-1",
+    )
+    proposal = _proposal(site, intent="titanium cup care")
+    proposal["expected_fields"] = ["images", "image_alts", "cover_image"]
+    actions = normalize_proposed_actions(
+        [proposal],
+        business_id="avinoti",
+        discovered_sites=[site],
+        research_portfolio=research,
+    )
+
+    reviewed = review_proposed_actions(
+        actions,
+        discovered_sites=[site],
+        capability_snapshot={"sites": [capability]},
+        scope_locks={},
+        safety_action_ceiling=10,
+    )
+
+    assert reviewed[0]["schedule_class"] == "configuration_repair"
+    assert reviewed[0]["reason_code"] == "CAPABILITY_MISSING"
+
+
+def test_article_plan_without_media_changes_does_not_require_media_connector() -> None:
+    site = _site()
+    capability = _capability(site)
+    capability["connectors"]["images"] = {
+        "status": "unavailable",
+        "write": False,
+        "upload": False,
+        "ingest": False,
+    }
+    research = normalize_research_portfolio(
+        [_research(site)],
+        discovered_sites=[site],
+        evidence_snapshot_id="snapshot-1",
+    )
+    proposal = _proposal(site, intent="existing article title correction")
+    proposal["action"] = "update_article"
+    proposal["expected_fields"] = ["title", "body"]
+    proposal["target_identity"] = {
+        "target_url": f"{site['base_url']}/blogs/existing-article",
+        "remote_object_id": "article-1",
+    }
+    actions = normalize_proposed_actions(
+        [proposal],
+        business_id="avinoti",
+        discovered_sites=[site],
+        research_portfolio=research,
+    )
+
+    reviewed = review_proposed_actions(
+        actions,
+        discovered_sites=[site],
+        capability_snapshot={"sites": [capability]},
+        scope_locks={},
+        safety_action_ceiling=10,
+    )
+
+    assert reviewed[0]["schedule_class"] == "execute_now"
+
+
+def test_update_scope_key_matches_effect_lock_with_local_id_and_trailing_slash() -> None:
+    site = _site()
+    research = normalize_research_portfolio(
+        [_research(site)],
+        discovered_sites=[site],
+        evidence_snapshot_id="snapshot-1",
+    )
+    raw = _proposal(site, intent="existing article refresh")
+    raw.update(
+        {
+            "action": "update_article",
+            "target_identity": {
+                "target_url": f"{site['base_url']}/blog/existing-article/",
+                "local_object_id": "local-post-1",
+                "remote_object_id": "42",
+            },
+        }
+    )
+    action = normalize_proposed_actions(
+        [raw],
+        business_id="avinoti",
+        discovered_sites=[site],
+        research_portfolio=research,
+    )[0]
+    effect_identity = strategy_effect_service.strategy_identity(
+        "avinoti",
+        site_id=site["id"],
+        market=site["market"],
+        language_code=site["language_code"],
+        target_url=f"{site['base_url']}/blog/existing-article",
+        site_url=site["base_url"],
+        site_domain=site["domain"],
+        action="update_article",
+    )
+
+    assert action["scope_key"] == effect_identity["scope_key"]
+    assert action["lock_scope"] == effect_identity["lock_scope"] == "url"
 
 
 def test_research_portfolio_requires_exact_site_coverage_including_disabled_site():
@@ -501,6 +672,80 @@ def test_one_site_only_schedules_one_remote_write_in_the_current_wave():
     assert reviewed[1]["reason_code"] == "SITE_SAFETY_CEILING_EXCEEDED"
 
 
+def test_unverified_ai_defer_requires_research_revision():
+    site = _site()
+    research = normalize_research_portfolio(
+        [_research(site)],
+        discovered_sites=[site],
+        evidence_snapshot_id="snapshot-1",
+    )
+    actions = normalize_proposed_actions(
+        [
+            _proposal(
+                site,
+                intent="qualified intent without an exact blocker",
+                schedule_request="deferred",
+            )
+        ],
+        business_id="portfolio",
+        discovered_sites=[site],
+        research_portfolio=research,
+    )
+
+    reviewed = review_proposed_actions(
+        actions,
+        discovered_sites=[site],
+        capability_snapshot={"sites": [_capability(site)]},
+        scope_locks={},
+        safety_action_ceiling=10,
+    )
+    result = review_zero_action(
+        research_portfolio=research,
+        reviewed_actions=reviewed,
+    )
+
+    assert reviewed[0]["schedule_class"] == "deferred"
+    assert reviewed[0]["reason_code"] == "DEFERRED_JUSTIFICATION_REQUIRED"
+    assert result["result"] == "research_revision_required"
+    assert result["reason_codes"] == ["DEFERRED_JUSTIFICATION_REQUIRED"]
+
+
+def test_ai_defer_uses_backend_safety_reason_when_ceiling_is_reached():
+    site = _site()
+    research = normalize_research_portfolio(
+        [_research(site)],
+        discovered_sites=[site],
+        evidence_snapshot_id="snapshot-1",
+    )
+    actions = normalize_proposed_actions(
+        [
+            _proposal(
+                site,
+                intent="qualified intent postponed by a zero safety ceiling",
+                schedule_request="deferred",
+            )
+        ],
+        business_id="portfolio",
+        discovered_sites=[site],
+        research_portfolio=research,
+    )
+
+    reviewed = review_proposed_actions(
+        actions,
+        discovered_sites=[site],
+        capability_snapshot={"sites": [_capability(site)]},
+        scope_locks={},
+        safety_action_ceiling=0,
+    )
+    result = review_zero_action(
+        research_portfolio=research,
+        reviewed_actions=reviewed,
+    )
+
+    assert reviewed[0]["reason_code"] == "SAFETY_CEILING_EXCEEDED"
+    assert result["result"] == "not_required"
+
+
 def test_caller_cannot_raise_one_site_current_wave_above_one_write():
     site = _site()
     research = normalize_research_portfolio(
@@ -763,6 +1008,37 @@ def test_zero_action_review_audits_each_held_site_when_another_site_executes():
     ]
 
 
+def test_zero_action_review_does_not_hide_unverified_defer_behind_execute_now():
+    site = _site()
+    research = normalize_research_portfolio(
+        [_research(site)],
+        discovered_sites=[site],
+        evidence_snapshot_id="snapshot-1",
+    )
+
+    result = review_zero_action(
+        research_portfolio=research,
+        reviewed_actions=[
+            {
+                "site_id": site["id"],
+                "option_id": "execute-option",
+                "schedule_class": "execute_now",
+                "strategy_type": "new_article",
+            },
+            {
+                "site_id": site["id"],
+                "option_id": "unverified-defer-option",
+                "schedule_class": "deferred",
+                "strategy_type": "update_article",
+                "reason_code": "DEFERRED_JUSTIFICATION_REQUIRED",
+            },
+        ],
+    )
+
+    assert result["result"] == "research_revision_required"
+    assert result["reason_codes"] == ["DEFERRED_JUSTIFICATION_REQUIRED"]
+
+
 def test_zero_action_review_skips_pure_configuration_repairs_without_blocking_run():
     site = _site(enabled=False)
     research = normalize_research_portfolio(
@@ -833,9 +1109,14 @@ def test_unresolved_evidence_conflict_defers_instead_of_silently_averaging():
         scope_locks={},
         safety_action_ceiling=10,
     )
+    zero_action = review_zero_action(
+        research_portfolio=research,
+        reviewed_actions=reviewed,
+    )
 
     assert reviewed[0]["schedule_class"] == "deferred"
     assert reviewed[0]["reason_code"] == "EVIDENCE_CONFLICT_UNRESOLVED"
+    assert zero_action["result"] == "not_required"
 
 
 @pytest.mark.asyncio

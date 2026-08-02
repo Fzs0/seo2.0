@@ -171,6 +171,11 @@ async def publish_article(
                 result.error = "remote verification failed: " + ", ".join(
                     key for key, ok in verification["checks"].items() if not ok
                 )
+                if result.remote_outcome == "acknowledged":
+                    # The mutation was accepted, but its final state could not
+                    # be confirmed.  This is uncertainty, not a successful
+                    # transport acknowledgement.
+                    result.remote_outcome = "unknown_remote_state"
         elif result.ok:
             result.ok = False
             result.error = "remote publish did not return a post ID"
@@ -364,6 +369,11 @@ async def _record_uncertain_publish_exception(
     site: dict[str, Any],
     target_url: str,
 ) -> str | None:
+    if result.ok:
+        # Connector-level acknowledgements are transport evidence.  Once the
+        # independent readback above has passed, they are a normal success and
+        # must not enter the uncertain-outcome policy map.
+        return None
     policy = policy_for_remote_outcome(result.remote_outcome)
     if not policy or policy.task_status != "blocked":
         return None

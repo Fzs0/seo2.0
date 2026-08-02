@@ -23,11 +23,14 @@ CapabilityLoader = Callable[..., Awaitable[dict[str, Any]]]
 ActionLoader = Callable[..., Awaitable[list[dict[str, Any]]]]
 ActionFactory = Callable[..., Awaitable[dict[str, Any]]]
 EvidenceGatherer = Callable[..., Awaitable[dict[str, Any]]]
-EvidenceRefresher = Callable[..., Awaitable[list[dict[str, Any]]]]
 
 
 RUN_KIND = "strategy_run"
 EVENT_KIND = "strategy_run_event"
+# Persisted V2 rows may still carry these retired automatic-refresh stages.
+# They remain readable only so an explicit resume can move them into the
+# current AI-led research revision path without deleting audit history.
+_LEGACY_EVIDENCE_REFRESH_STATUSES = frozenset({"refreshing_evidence", "replanning"})
 RUN_STATUSES = frozenset(
     {
         "queued",
@@ -100,7 +103,6 @@ _TRANSITIONS = {
     },
     "safety_reviewing": {"planning", "blocked", "failed", "canceled"},
     "planning": {
-        "refreshing_evidence",
         "zero_action_reviewing",
         "awaiting_approval",
         "executing",
@@ -111,14 +113,14 @@ _TRANSITIONS = {
         "failed",
         "canceled",
     },
-    "refreshing_evidence": {"replanning", "blocked", "failed", "canceled"},
+    "refreshing_evidence": {
+        "research_revision_required",
+        "blocked",
+        "failed",
+        "canceled",
+    },
     "replanning": {
-        "zero_action_reviewing",
-        "awaiting_approval",
-        "executing",
-        "observing",
-        "completed",
-        "partial",
+        "research_revision_required",
         "blocked",
         "failed",
         "canceled",
@@ -708,7 +710,6 @@ async def run_strategy_run(
     action_loader: ActionLoader | None = None,
     action_factory: ActionFactory | None = None,
     evidence_gatherer: EvidenceGatherer | None = None,
-    evidence_refresher: EvidenceRefresher | None = None,
     idempotency_key: str | None = None,
 ) -> dict[str, Any]:
     """Run or resume the safe pre-approval stages.
@@ -728,6 +729,31 @@ async def run_strategy_run(
     if run["status"] in TERMINAL_RUN_STATUSES:
         return {**run, "start_replayed": True}
     try:
+        if run["status"] in _LEGACY_EVIDENCE_REFRESH_STATUSES:
+            legacy_status = run["status"]
+            await _stage_started(session, run_id, legacy_status)
+            run = await _complete_stage(
+                session,
+                run_id=run_id,
+                current=legacy_status,
+                next_status="research_revision_required",
+                updates={
+                    "next_action": "capture_research",
+                    "stage_outputs": _merge_stage_output(
+                        run,
+                        legacy_status,
+                        {
+                            "legacy_state_retired": True,
+                            "replacement": "ai_research_revision",
+                        },
+                    ),
+                },
+            )
+            return {
+                **run,
+                "legacy_state_recovered": True,
+                "next_action": "capture_research",
+            }
         if run["status"] in {
             "awaiting_approval",
             "executing",
@@ -759,7 +785,6 @@ async def run_strategy_run(
             )
             capability_loader = get_business_site_capabilities
         evidence_gatherer = evidence_gatherer or _gather_run_evidence
-        evidence_refresher = evidence_refresher or _refresh_run_evidence
         action_factory = action_factory or _create_unified_action
         if run["status"] == "discovering_sites":
             await _stage_started(session, run_id, "discovering_sites")
@@ -897,7 +922,7 @@ async def run_strategy_run(
                 },
             )
 
-        if run["status"] not in {"planning", "replanning"}:
+        if run["status"] != "planning":
             return {**run, "start_replayed": True}
         stage = run["status"]
         await _stage_started(session, run_id, stage)
@@ -907,45 +932,6 @@ async def run_strategy_run(
             planned,
             run.get("discovered_sites") or [],
         )
-        if stage == "planning" and planned.get("replanned_after_hold_refresh"):
-            run = await _complete_stage(
-                session, run_id=run_id, current="planning",
-                next_status="refreshing_evidence",
-                updates={"stage_outputs": _merge_stage_output(
-                    run, "planning", {"refresh_required": True}
-                )},
-            )
-            await _stage_started(session, run_id, "refreshing_evidence")
-            try:
-                refresh_results = await evidence_refresher(
-                    session, business_id=run["business_id"],
-                    sites=run.get("discovered_sites") or [],
-                )
-            except Exception as refresh_error:
-                refresh_results = [{
-                    "status": "failed",
-                    "error": str(refresh_error)[:1000],
-                    "impact": "replanning uses previously gathered evidence",
-                }]
-            run = await _complete_stage(
-                session, run_id=run_id, current="refreshing_evidence",
-                next_status="replanning",
-                updates={
-                    "evidence_refreshes": refresh_results,
-                    "stage_outputs": _merge_stage_output(
-                        run, "refreshing_evidence",
-                        {"sources": refresh_results},
-                    ),
-                },
-            )
-            await _stage_started(session, run_id, "replanning")
-            stage = "replanning"
-            planned = await _plan_all_sites(session, run=run, planner=planner)
-            planned = _bind_planned_actions(planned)
-            planned = _restrict_plan_to_discovered_sites(
-                planned,
-                run.get("discovered_sites") or [],
-            )
         summary = _summarize_plan(planned)
         if summary["discovered_site_count"] != summary["decided_site_count"]:
             raise RuntimeError(
@@ -1312,17 +1298,6 @@ async def _gather_run_evidence(
         "site_ids": [str(site["id"]) for site in sites],
         "source": "content_audit_batch",
     }
-
-
-async def _refresh_run_evidence(
-    session: AsyncSession, *, business_id: str, sites: list[dict[str, Any]]
-) -> list[dict[str, Any]]:
-    from app.services.strategy_evidence_refresh_service import (
-        refresh_default_strategy_evidence,
-    )
-    return await refresh_default_strategy_evidence(
-        session, business_id=business_id, sites=sites
-    )
 
 
 async def _create_unified_action(
@@ -1807,31 +1782,6 @@ async def _refresh_terminal_run_summary(
         raise ValueError("strategy run changed concurrently or was not found")
     await session.commit()
     return {**_serialize_run(dict(row)), "reconcile_replayed": False}
-
-
-async def _advance_if_not_canceled(
-    session: AsyncSession, *, run_id: str, current: str, next_status: str
-) -> dict[str, Any]:
-    run = await get_strategy_run(session, run_id=run_id)
-    if not run:
-        raise ValueError("strategy run not found")
-    if run.get("cancel_requested") or run["status"] == "canceled":
-        if run["status"] == "canceled":
-            return run
-        return await transition_strategy_run(
-            session, run_id=run_id, current_status=run["status"], next_status="canceled"
-        )
-    advanced = await transition_strategy_run(
-        session, run_id=run_id, current_status=current, next_status=next_status
-    )
-    await append_strategy_run_event(
-        session,
-        run_id=run_id,
-        stage=current,
-        event_type="stage_completed",
-        message=f"Stage {current} completed",
-    )
-    return advanced
 
 
 def _summarize_plan(planned: dict[str, Any]) -> dict[str, Any]:

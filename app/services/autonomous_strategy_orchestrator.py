@@ -23,7 +23,10 @@ from uuid import UUID
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.services.strategy_effect_service import normalize_canonical_url
+from app.services.strategy_effect_service import (
+    normalize_canonical_url,
+    strategy_identity,
+)
 
 
 ACTION_TYPES = frozenset(
@@ -86,6 +89,14 @@ HARD_BLOCK_CODES = frozenset(
         "PROTECTED_FIELD_REQUESTED",
         "SITE_DISABLED",
         "SITE_CONFIGURATION_INCOMPLETE",
+    }
+)
+VERIFIED_DEFER_REASON_CODES = frozenset(
+    {
+        "TARGET_CONFLICT_ACTIVE",
+        "EVIDENCE_CONFLICT_UNRESOLVED",
+        "SAFETY_CEILING_EXCEEDED",
+        "SITE_SAFETY_CEILING_EXCEEDED",
     }
 )
 SECOND_CHANNEL_SOURCE_TYPES = frozenset(
@@ -351,6 +362,7 @@ def _normalize_material_option(
     intent_key = _intent_key(target_identity.get("intent_key") or user_intent)
     topic_cluster = _intent_key(target_identity.get("topic_cluster"))
     canonical_url: str | None = None
+    shared_identity: dict[str, str] | None = None
     if action in {"update_article", "on_page_fix"}:
         if target_url:
             try:
@@ -671,6 +683,7 @@ def _normalize_target_identity(
     ).strip()
     intent_key = _intent_key(raw_intent)
     canonical_url: str | None = None
+    shared_identity: dict[str, str] | None = None
     if action in {"update_article", "on_page_fix"}:
         if target_url:
             try:
@@ -689,33 +702,50 @@ def _normalize_target_identity(
                 "TARGET_IDENTITY_UNRESOLVED",
                 f"{action} requires a URL or stable object identity",
             )
-        lock_scope = "url_or_object"
-        lock_material = object_identity
+        if action == "update_article" and canonical_url:
+            shared_identity = strategy_identity(
+                business_id,
+                site_id=str(site["id"]),
+                market=site.get("market"),
+                language_code=site.get("language_code"),
+                target_url=canonical_url,
+                site_url=site.get("base_url"),
+                site_domain=site.get("domain"),
+                action="update_article",
+            )
+        else:
+            lock_scope = "url_or_object"
+            lock_material = object_identity
     elif action == "new_article":
         if not intent_key:
             raise StrategyContractError(
                 "TARGET_IDENTITY_UNRESOLVED",
                 "new_article requires a stable search intent",
             )
-        lock_scope = "intent"
-        lock_material = "|".join(
-            (
-                str(site.get("language_code") or ""),
-                str(site.get("market") or ""),
-                intent_key,
-            )
+        shared_identity = strategy_identity(
+            business_id,
+            site_id=str(site["id"]),
+            market=site.get("market"),
+            language_code=site.get("language_code"),
+            topic_cluster_id=intent_key,
+            query=intent_key,
+            action="new_article",
         )
     else:
         lock_scope = "site_result"
         lock_material = concrete_action
-    scope_key = _stable_hash(
-        {
-            "business_id": business_id,
-            "site_id": str(site["id"]),
-            "scope": lock_scope,
-            "target": lock_material,
-        }
-    )
+    if shared_identity is not None:
+        scope_key = shared_identity["scope_key"]
+        lock_scope = shared_identity["lock_scope"]
+    else:
+        scope_key = _stable_hash(
+            {
+                "business_id": business_id,
+                "site_id": str(site["id"]),
+                "scope": lock_scope,
+                "target": lock_material,
+            }
+        )
     return {
         "target_url": canonical_url or target_url,
         "canonical_url": canonical_url or "",
@@ -1020,8 +1050,44 @@ def _capability_gate(
     adapter_identity = (capability.get("action_adapters") or {}).get(
         concrete_action
     )
+    requested_connector = str(item.get("connector_type") or "").casefold()
+    declared_connector = (
+        str((adapter_identity or {}).get("connector_type") or "").casefold()
+        if isinstance(adapter_identity, dict)
+        else ""
+    )
+    article_action = concrete_action in {"new_article", "update_article"}
+    article_adapter_unavailable = article_action and (
+        not isinstance(adapter_identity, dict)
+        or adapter_identity.get("read") is not True
+        or adapter_identity.get("write") is not True
+        or adapter_identity.get("readback") is not True
+        or not declared_connector
+        or bool(requested_connector and requested_connector != declared_connector)
+    )
+    article_fields = set(
+        ((capability.get("supported_fields") or {}).get("articles") or ())
+    )
+    image_connector = (capability.get("connectors") or {}).get("images") or {}
+    requested_article_fields = {
+        str(field).casefold() for field in (item.get("expected_fields") or ())
+    }
+    media_requested = bool(
+        requested_article_fields & {"images", "image_alts", "cover_image"}
+    )
+    article_media_unavailable = article_action and media_requested and not (
+        {"images", "image_alts", "cover_image"} <= article_fields
+        and image_connector.get("status") == "available"
+        and image_connector.get("write") is True
+        and (
+            image_connector.get("upload") is True
+            or image_connector.get("ingest") is True
+        )
+    )
     adapter_unavailable = (
         concrete_action not in EXECUTABLE_ACTIONS
+        or article_adapter_unavailable
+        or article_media_unavailable
         or (
             concrete_action in CONCRETE_ON_PAGE_ACTIONS
             and (
@@ -1035,6 +1101,8 @@ def _capability_gate(
             )
         )
     )
+    if article_action and not adapter_unavailable and not requested_connector:
+        item["connector_type"] = str(adapter_identity["connector_type"])
     if item.get("editorial_action") in {"hold", "configuration_repair"}:
         return item
     if adapter_unavailable or permission not in {
@@ -1144,14 +1212,6 @@ def review_proposed_actions(
                     "wave_number": None,
                 }
             )
-        elif current_schedule == "deferred":
-            item.update(
-                {
-                    "schedule_class": "deferred",
-                    "schedule_reason": item.get("reason"),
-                    "wave_number": None,
-                }
-            )
         elif execute_count >= ceiling:
             item.update(
                 {
@@ -1180,6 +1240,23 @@ def review_proposed_actions(
                     "reevaluation_condition": (
                         item.get("reevaluation_condition")
                         or "Resume after the site's earlier Action passes readback."
+                    ),
+                    "wave_number": None,
+                }
+            )
+        elif current_schedule == "deferred":
+            item.update(
+                {
+                    "schedule_class": "deferred",
+                    "reason_code": "DEFERRED_JUSTIFICATION_REQUIRED",
+                    "schedule_reason": (
+                        "The AI requested Deferred, but no backend-verifiable "
+                        "target conflict, evidence conflict, or safety ceiling "
+                        "requires postponement."
+                    ),
+                    "reevaluation_condition": (
+                        "Revise the research and choose Execute Now, or supply "
+                        "evidence that activates a verifiable backend gate."
                     ),
                     "wave_number": None,
                 }
@@ -1271,10 +1348,14 @@ def review_zero_action(
     research_portfolio: list[dict[str, Any]],
     reviewed_actions: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    execute_or_deferred = [
+    executable_or_verified_deferred = [
         item
         for item in reviewed_actions
-        if item.get("schedule_class") in {"execute_now", "deferred"}
+        if item.get("schedule_class") == "execute_now"
+        or (
+            item.get("schedule_class") == "deferred"
+            and item.get("reason_code") in VERIFIED_DEFER_REASON_CODES
+        )
     ]
     if not research_portfolio:
         return {
@@ -1299,8 +1380,33 @@ def review_zero_action(
     hard_blocked_sites = 0
     for site_id, research in research_by_site.items():
         actions = actions_by_site.get(site_id) or []
+        unjustified_deferred = [
+            action
+            for action in actions
+            if action.get("schedule_class") == "deferred"
+            and action.get("reason_code") == "DEFERRED_JUSTIFICATION_REQUIRED"
+        ]
+        if unjustified_deferred:
+            missing.append(
+                {
+                    "site_id": site_id,
+                    "code": "DEFERRED_JUSTIFICATION_REQUIRED",
+                    "option_ids": sorted(
+                        str(action.get("option_id") or "")
+                        for action in unjustified_deferred
+                    ),
+                    "missing": (
+                        "backend-verifiable defer gate or Execute Now schedule"
+                    ),
+                }
+            )
+            continue
         if any(
-            action.get("schedule_class") in {"execute_now", "deferred"}
+            action.get("schedule_class") == "execute_now"
+            or (
+                action.get("schedule_class") == "deferred"
+                and action.get("reason_code") in VERIFIED_DEFER_REASON_CODES
+            )
             for action in actions
         ):
             continue
@@ -1461,7 +1567,7 @@ def review_zero_action(
             "reason_codes": sorted({item["code"] for item in missing}),
             "missing_evidence": missing,
         }
-    if execute_or_deferred:
+    if executable_or_verified_deferred:
         return {
             "required": False,
             "result": "not_required",

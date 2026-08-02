@@ -71,6 +71,37 @@ def test_article_patch_keeps_uploaded_cover_media_identity() -> None:
     }
 
 
+def test_article_patch_omits_cover_when_cover_was_not_approved() -> None:
+    patch = service.canonical_article_patch(_patch())
+
+    assert "cover_image" not in patch
+
+
+def test_readback_ignores_optional_null_field_not_sent_by_adapter() -> None:
+    differences = compare_readback_fields(
+        {"title": "Guide", "cover_image": None},
+        {"title": "Guide"},
+        {
+            "title": "Guide",
+            "cover_image": {
+                "image_id": "501",
+                "src": "https://example.com/existing-cover.png",
+                "alt": "Existing cover",
+            },
+        },
+    )
+
+    assert differences == [
+        {
+            "field": "title",
+            "expected": "Guide",
+            "submitted": "Guide",
+            "actual": "Guide",
+            "match": True,
+        }
+    ]
+
+
 @pytest.mark.asyncio
 async def test_content_openapi_preview_blocks_mixed_markdown_and_html(
     monkeypatch: pytest.MonkeyPatch,
@@ -502,9 +533,6 @@ def test_article_readback_accepts_wordpress_body_without_title_h1_and_with_table
     )
 
     assert differences[0]["match"] is True
-    assert service._semantic_value("body", markdown) == service._semantic_value(
-        "body", wordpress
-    )
 
 
 def test_article_readback_ignores_markdown_table_alignment_markers() -> None:
@@ -981,6 +1009,179 @@ async def test_article_adapter_recovery_reconciles_local_lineage_after_exact_rea
     assert reconciled["remote_id"] == "2588676"
     assert reconciled["readback"] == patch
     assert calls == ["load", "readback", "reconcile"]
+
+
+@pytest.mark.asyncio
+async def test_confirmed_recovery_restores_lineage_from_unique_strategy_execution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A post-write failure must not strand an Action before IDs are copied back."""
+
+    class Result:
+        def __init__(self, *, rows=None, first=None):
+            self._rows = rows or []
+            self._first = first
+
+        def mappings(self):
+            return self
+
+        def all(self):
+            return self._rows
+
+        def first(self):
+            return self._first
+
+    class Session:
+        def __init__(self):
+            self.results = [
+                Result(
+                    rows=[
+                        {
+                            "execution_task_id": "execution-1",
+                            "article_id": "article-1",
+                            "publish_task_id": "publish-1",
+                        }
+                    ]
+                ),
+                Result(first={"id": "article-1"}),
+                Result(first={"id": "publish-1"}),
+            ]
+            self.commits = 0
+
+        async def execute(self, *_args, **_kwargs):
+            return self.results.pop(0)
+
+        async def commit(self):
+            self.commits += 1
+
+    calls: list[tuple[str, dict]] = []
+
+    async def finish(*_args, **kwargs):
+        calls.append(("finish", kwargs))
+
+    async def effect(*_args, **kwargs):
+        calls.append(("effect", kwargs))
+        return {"id": "effect-1"}
+
+    async def mark(*_args, **kwargs):
+        calls.append(("mark", kwargs))
+
+    monkeypatch.setattr(service, "_finish_execution", finish)
+    monkeypatch.setattr(service, "ensure_effect", effect)
+    monkeypatch.setattr(service, "mark_effect_published", mark)
+
+    session = Session()
+    result = await service._reconcile_confirmed_article_execution(
+        session,  # type: ignore[arg-type]
+        action={
+            "action_id": "action-1",
+            "site_id": "site-1",
+            "source_strategy_task_id": "strategy-1",
+            "action_type": "update_article",
+            "target_url": "https://example.com/blogs/guide",
+        },
+        context={
+            "post_url": "https://example.com/blogs/guide",
+            "strategy_decision": {"query": "guide"},
+        },
+        remote_id="remote-1",
+        readback={"title": "Guide"},
+    )
+
+    assert result["article_id"] == "article-1"
+    assert result["execution_task_id"] == "execution-1"
+    assert result["publish_task_id"] == "publish-1"
+    assert session.commits == 1
+    assert calls[0][0] == "finish"
+
+
+@pytest.mark.asyncio
+async def test_confirmed_recovery_refuses_ambiguous_strategy_execution_lineage() -> None:
+    class Result:
+        def mappings(self):
+            return self
+
+        def all(self):
+            return [
+                {
+                    "execution_task_id": "execution-2",
+                    "article_id": "article-2",
+                    "publish_task_id": "publish-2",
+                },
+                {
+                    "execution_task_id": "execution-1",
+                    "article_id": "article-1",
+                    "publish_task_id": "publish-1",
+                },
+            ]
+
+    class Session:
+        async def execute(self, *_args, **_kwargs):
+            return Result()
+
+    with pytest.raises(ValueError, match="missing or ambiguous"):
+        await service._reconcile_confirmed_article_execution(
+            Session(),  # type: ignore[arg-type]
+            action={
+                "action_id": "action-1",
+                "site_id": "site-1",
+                "source_strategy_task_id": "strategy-1",
+                "action_type": "update_article",
+                "target_url": "https://example.com/blogs/guide",
+            },
+            context={
+                "post_url": "https://example.com/blogs/guide",
+                "strategy_decision": {"query": "guide"},
+            },
+            remote_id="remote-1",
+            readback={"title": "Guide"},
+        )
+
+
+@pytest.mark.asyncio
+async def test_article_adapter_recovery_does_not_hide_local_reconciliation_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    patch = service.canonical_article_patch(_patch())
+
+    async def load(*_args, **_kwargs):
+        return {
+            "post_external_id": "2588676",
+            "site": {"id": "site-1", "business_id": "avinoti"},
+        }
+
+    async def read(*_args, **_kwargs):
+        return {
+            "id": "2588676",
+            "title": patch["title"],
+            "content": patch["body"],
+            "meta_title": patch["meta_title"],
+            "meta_description": patch["meta_description"],
+        }
+
+    async def fail_reconciliation(*_args, **_kwargs):
+        raise RuntimeError("local lineage transaction failed")
+
+    monkeypatch.setattr(service, "_load_action_context", load)
+    monkeypatch.setattr(service, "_read_remote_article", read)
+    monkeypatch.setattr(
+        service,
+        "_reconcile_confirmed_article_execution",
+        fail_reconciliation,
+    )
+
+    adapter = service.StrategyArticleActionAdapter(object())  # type: ignore[arg-type]
+    with pytest.raises(RuntimeError, match="local lineage transaction failed"):
+        await adapter.recover(
+            {
+                "action_id": "action-1",
+                "business_id": "avinoti",
+                "site_id": "site-1",
+                "source_strategy_task_id": "strategy-1",
+                "action_type": "update_article",
+                "approved_patch": patch,
+            }
+        )
 
 
 @pytest.mark.asyncio
