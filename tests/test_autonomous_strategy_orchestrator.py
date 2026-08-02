@@ -150,6 +150,114 @@ def _proposal(
 
 
 @pytest.mark.asyncio
+async def test_research_idempotency_replays_after_run_has_completed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.services import strategy_run_service
+
+    site = _site()
+    portfolio = [_research(site)]
+    normalized = normalize_research_portfolio(
+        portfolio,
+        discovered_sites=[site],
+        evidence_snapshot_id="snapshot-1",
+    )
+    request_hash = orchestrator._stable_hash(
+        {
+            "requested_by": "codex",
+            "evidence_snapshot_id": "snapshot-1",
+            "portfolio": normalized,
+        }
+    )
+    run = {
+        "run_id": "run-1",
+        "status": "completed",
+        "evidence_snapshot_id": "snapshot-1",
+        "discovered_sites": [site],
+        "research_receipt": {
+            "idempotency_key": "research-key-1",
+            "request_hash": request_hash,
+        },
+    }
+
+    async def get_run(*_args, **_kwargs):
+        return run
+
+    class Session:
+        async def execute(self, *_args, **_kwargs):
+            return None
+
+    monkeypatch.setattr(strategy_run_service, "get_strategy_run", get_run)
+
+    result = await orchestrator.capture_research_portfolio(
+        Session(),  # type: ignore[arg-type]
+        run_id="run-1",
+        requested_by="codex",
+        idempotency_key="research-key-1",
+        evidence_snapshot_id="snapshot-1",
+        portfolio=portfolio,
+    )
+
+    assert result["status"] == "completed"
+    assert result["idempotency_replayed"] is True
+
+
+@pytest.mark.asyncio
+async def test_proposed_action_idempotency_replays_after_run_has_completed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.services import strategy_run_service
+
+    site = _site()
+    research = normalize_research_portfolio(
+        [_research(site)],
+        discovered_sites=[site],
+        evidence_snapshot_id="snapshot-1",
+    )
+    actions = [_proposal(site, intent="titanium cup care")]
+    normalized = normalize_proposed_actions(
+        actions,
+        business_id="avinoti",
+        discovered_sites=[site],
+        research_portfolio=research,
+    )
+    request_hash = orchestrator._stable_hash(
+        {"requested_by": "codex", "actions": normalized}
+    )
+    run = {
+        "run_id": "run-1",
+        "status": "completed",
+        "business_id": "avinoti",
+        "discovered_sites": [site],
+        "research_portfolio": research,
+        "proposed_action_receipt": {
+            "idempotency_key": "proposal-key-1",
+            "request_hash": request_hash,
+        },
+    }
+
+    async def get_run(*_args, **_kwargs):
+        return run
+
+    class Session:
+        async def execute(self, *_args, **_kwargs):
+            return None
+
+    monkeypatch.setattr(strategy_run_service, "get_strategy_run", get_run)
+
+    result = await orchestrator.submit_proposed_actions(
+        Session(),  # type: ignore[arg-type]
+        run_id="run-1",
+        requested_by="codex",
+        idempotency_key="proposal-key-1",
+        actions=actions,
+    )
+
+    assert result["status"] == "completed"
+    assert result["idempotency_replayed"] is True
+
+
+@pytest.mark.asyncio
 async def test_formal_plan_reconciles_stale_actions_before_loading_scope_locks(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -366,6 +474,39 @@ def test_article_plan_without_media_changes_does_not_require_media_connector() -
     )
 
     assert reviewed[0]["schedule_class"] == "execute_now"
+    assert actions[0]["expected_fields"] == [
+        "title",
+        "body",
+        "meta_title",
+        "meta_description",
+    ]
+
+
+def test_article_plan_pairs_inline_images_with_alt_fields() -> None:
+    site = _site()
+    research = normalize_research_portfolio(
+        [_research(site)],
+        discovered_sites=[site],
+        evidence_snapshot_id="snapshot-1",
+    )
+    proposal = _proposal(site, intent="illustrated titanium cup care")
+    proposal["expected_fields"] = ["images"]
+
+    actions = normalize_proposed_actions(
+        [proposal],
+        business_id="avinoti",
+        discovered_sites=[site],
+        research_portfolio=research,
+    )
+
+    assert actions[0]["expected_fields"] == [
+        "title",
+        "body",
+        "meta_title",
+        "meta_description",
+        "images",
+        "image_alts",
+    ]
 
 
 def test_update_scope_key_matches_effect_lock_with_local_id_and_trailing_slash() -> None:

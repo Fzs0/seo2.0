@@ -843,6 +843,24 @@ def normalize_proposed_actions(
                 "on_page_fix requires a supported concrete action_type",
             )
         expected_fields = list(raw.get("expected_fields") or [])
+        if action in {"new_article", "update_article"}:
+            article_required_fields = (
+                "title",
+                "body",
+                "meta_title",
+                "meta_description",
+            )
+            requested_article_fields = [str(field) for field in expected_fields]
+            if {field.casefold() for field in requested_article_fields} & {
+                "images",
+                "image_alts",
+            }:
+                requested_article_fields.extend(["images", "image_alts"])
+            expected_fields = list(
+                dict.fromkeys(
+                    [*article_required_fields, *requested_article_fields]
+                )
+            )
         if action == "on_page_fix":
             page_type_by_action = {
                 "homepage_seo": "homepage",
@@ -1072,16 +1090,31 @@ def _capability_gate(
     requested_article_fields = {
         str(field).casefold() for field in (item.get("expected_fields") or ())
     }
-    media_requested = bool(
-        requested_article_fields & {"images", "image_alts", "cover_image"}
+    inline_media_requested = bool(
+        requested_article_fields & {"images", "image_alts"}
     )
-    article_media_unavailable = article_action and media_requested and not (
-        {"images", "image_alts", "cover_image"} <= article_fields
-        and image_connector.get("status") == "available"
+    cover_media_requested = "cover_image" in requested_article_fields
+    media_connector_available = (
+        image_connector.get("status") == "available"
         and image_connector.get("write") is True
         and (
             image_connector.get("upload") is True
             or image_connector.get("ingest") is True
+        )
+    )
+    article_media_unavailable = article_action and (
+        (
+            inline_media_requested
+            and not (
+                {"images", "image_alts"} <= article_fields
+                and media_connector_available
+            )
+        )
+        or (
+            cover_media_requested
+            and not (
+                "cover_image" in article_fields and media_connector_available
+            )
         )
     )
     adapter_unavailable = (
@@ -1791,11 +1824,6 @@ async def capture_research_portfolio(
         raise StrategyContractError(
             "STRATEGY_RUN_NOT_FOUND", "strategy run not found"
         )
-    if run["status"] not in {"ai_researching", "research_revision_required"}:
-        raise StrategyContractError(
-            "STRATEGY_RUN_STAGE_INVALID",
-            "research can only be captured during ai_researching or revision",
-        )
     if str(run.get("evidence_snapshot_id") or "") != evidence_snapshot_id:
         raise StrategyContractError(
             "EVIDENCE_CONFLICT_UNRESOLVED",
@@ -1823,6 +1851,11 @@ async def capture_research_portfolio(
         raise StrategyContractError(
             "DECISION_INPUT_CHANGED",
             "idempotency key is bound to different research",
+        )
+    if run["status"] not in {"ai_researching", "research_revision_required"}:
+        raise StrategyContractError(
+            "STRATEGY_RUN_STAGE_INVALID",
+            "research can only be captured during ai_researching or revision",
         )
     revision = int(run.get("research_revision") or 0) + 1
     patch = {
@@ -1877,12 +1910,13 @@ async def submit_proposed_actions(
             "STRATEGY_RUN_NOT_FOUND", "strategy run not found"
         )
     receipt = dict(run.get("proposed_action_receipt") or {})
-    if run["status"] == "proposed_actions_submitted" and receipt:
+    research = list(run.get("research_portfolio") or [])
+    if receipt:
         normalized = normalize_proposed_actions(
             actions,
             business_id=str(run["business_id"]),
             discovered_sites=list(run.get("discovered_sites") or []),
-            research_portfolio=list(run.get("research_portfolio") or []),
+            research_portfolio=research,
         )
         request_hash = _stable_hash(
             {"requested_by": requested_by, "actions": normalized}
@@ -1892,16 +1926,21 @@ async def submit_proposed_actions(
             and receipt.get("request_hash") == request_hash
         ):
             return {**run, "idempotency_replayed": True}
-        raise StrategyContractError(
-            "DECISION_INPUT_CHANGED",
-            "proposed actions are immutable after submission; revise research first",
-        )
+        if receipt.get("idempotency_key") == idempotency_key:
+            raise StrategyContractError(
+                "DECISION_INPUT_CHANGED",
+                "idempotency key is bound to different proposed actions",
+            )
+        if run["status"] != "ai_researching":
+            raise StrategyContractError(
+                "DECISION_INPUT_CHANGED",
+                "proposed actions are immutable after submission; revise research first",
+            )
     if run["status"] != "ai_researching":
         raise StrategyContractError(
             "STRATEGY_RUN_STAGE_INVALID",
             "proposed actions require captured research in ai_researching",
         )
-    research = list(run.get("research_portfolio") or [])
     if not research:
         raise StrategyContractError(
             "RESEARCH_PORTFOLIO_INCOMPLETE",
@@ -1916,13 +1955,6 @@ async def submit_proposed_actions(
     request_hash = _stable_hash(
         {"requested_by": requested_by, "actions": normalized}
     )
-    if receipt.get("idempotency_key") == idempotency_key:
-        if receipt.get("request_hash") == request_hash:
-            return {**run, "idempotency_replayed": True}
-        raise StrategyContractError(
-            "DECISION_INPUT_CHANGED",
-            "idempotency key is bound to different proposed actions",
-        )
     result = await transition_strategy_run(
         session,
         run_id=run_id,

@@ -40,6 +40,13 @@ from app.services.site_media_service import resolve_site_media_uploader
 
 
 ARTICLE_ACTIONS = frozenset({"new_article", "update_article"})
+ARTICLE_REQUIRED_FIELDS = (
+    "title",
+    "body",
+    "meta_title",
+    "meta_description",
+)
+ARTICLE_MEDIA_FIELDS = frozenset({"images", "image_alts", "cover_image"})
 ARTICLE_FIELDS = frozenset(
     {
         "title",
@@ -130,6 +137,7 @@ class StrategyArticleActionAdapter:
             cover_image_id_required=cover_image_id_required,
             site=context.get("site") or {},
         )
+        patch = _capability_filtered_article_patch(action, patch)
 
         execution_id = await _ensure_approved_execution(
             self.session,
@@ -512,10 +520,9 @@ async def preflight_article_action(
         "post_external_id"
     ):
         raise ValueError("approved update target has no remote article ID")
-    if not _image_patch_supported(action) or not _cover_patch_supported(action):
-        raise ValueError(
-            "strategy article requires both content-image upload and cover-image capability"
-        )
+    media_error = _requested_media_capability_error(action)
+    if media_error:
+        raise ValueError(media_error)
     token = str(uuid4())
     expires_at = (datetime.now(UTC) + timedelta(minutes=30)).isoformat()
     receipts[idempotency_key] = token
@@ -563,8 +570,12 @@ async def upload_strategy_article_image(
     await _validate_current_preflight_capability(session, action)
     if action.get("run_mode") == "dry_run" and not dry_run:
         raise ValueError("dry-run Strategy Actions cannot upload remote media")
-    if not _image_patch_supported(action) or not _cover_patch_supported(action):
-        raise ValueError("strategy media upload capability is unavailable")
+    requested_media = _requested_article_media_fields(action)
+    if not requested_media:
+        raise ValueError("strategy media upload was not requested by the formal plan")
+    media_error = _requested_media_capability_error(action)
+    if media_error:
+        raise ValueError(media_error)
     request_hash = hashlib.sha256(
         json.dumps(
             {
@@ -701,13 +712,19 @@ async def _build_article_generation_context(
             {"site_id": action["site_id"]},
         )
     ).mappings().all()
+    requested_media = _requested_article_media_fields(action)
     image_patch_supported = _image_patch_supported(action)
     cover_patch_supported = _cover_patch_supported(action)
-    optional_patch_fields = (
-        ["images", "image_alts"] if image_patch_supported else []
-    )
-    if cover_patch_supported:
-        optional_patch_fields.append("cover_image")
+    optional_patch_fields = [
+        field
+        for field in ("images", "image_alts", "cover_image")
+        if field in requested_media
+        and (
+            (field in {"images", "image_alts"} and image_patch_supported)
+            or (field == "cover_image" and cover_patch_supported)
+        )
+    ]
+    media_requested_and_supported = bool(optional_patch_fields)
     return {
         "action_id": action_id,
         "run_id": action.get("run_id"),
@@ -719,12 +736,7 @@ async def _build_article_generation_context(
         "strategy_decision": context.get("strategy_decision") or {},
         "before_snapshot": _before_snapshot(context),
         "product_references": [dict(row) for row in products],
-        "required_patch_fields": [
-            "title",
-            "body",
-            "meta_title",
-            "meta_description",
-        ],
+        "required_patch_fields": list(ARTICLE_REQUIRED_FIELDS),
         "optional_patch_fields": optional_patch_fields,
         "forbidden_patch_fields": [
             "slug",
@@ -735,13 +747,17 @@ async def _build_article_generation_context(
         ],
         "image_upload_endpoint": (
             f"/api/v1/strategy-actions/{action_id}/images/upload"
-            if image_patch_supported or cover_patch_supported
+            if media_requested_and_supported
             else None
         ),
-        "media_transport": _article_media_transport(action),
+        "media_transport": (
+            _article_media_transport(action)
+            if media_requested_and_supported
+            else None
+        ),
         "accepted_media_inputs": (
             ["url", "file", "base64"]
-            if image_patch_supported or cover_patch_supported
+            if media_requested_and_supported
             else []
         ),
         "next_step": f"POST /api/v1/strategy-actions/{action_id}/preview",
@@ -987,6 +1003,27 @@ def _cover_patch_supported(action: dict[str, Any]) -> bool:
     )
 
 
+def _expected_article_fields(action: dict[str, Any]) -> set[str]:
+    return set(ARTICLE_REQUIRED_FIELDS) | {
+        str(field).strip().casefold()
+        for field in (action.get("expected_fields") or ())
+        if str(field).strip()
+    }
+
+
+def _requested_article_media_fields(action: dict[str, Any]) -> set[str]:
+    return _expected_article_fields(action) & ARTICLE_MEDIA_FIELDS
+
+
+def _requested_media_capability_error(action: dict[str, Any]) -> str | None:
+    requested = _requested_article_media_fields(action)
+    if requested & {"images", "image_alts"} and not _image_patch_supported(action):
+        return "formal plan requests content images but upload capability is unavailable"
+    if "cover_image" in requested and not _cover_patch_supported(action):
+        return "formal plan requests a cover image but upload capability is unavailable"
+    return None
+
+
 def _article_media_ingest_supported(action: dict[str, Any]) -> bool:
     capability = action.get("capability_snapshot")
     if not isinstance(capability, dict):
@@ -1021,25 +1058,37 @@ def _article_read_only_fields(site: dict[str, Any]) -> list[str]:
 async def _has_confirmed_prewrite_failure(
     session: AsyncSession, action: dict[str, Any]
 ) -> bool:
-    """Recognize persisted local guards that failed before a remote call."""
+    """Recognize persisted evidence proving the remote writer was not called."""
     row = (
         await session.execute(
             text(
                 """
-                SELECT payload->>'raw_error' AS raw_error
-                  FROM seo_agent.tasks
-                 WHERE task_type='review'
-                   AND payload->>'kind'='strategy_exception'
-                   AND payload->>'action_id'=:action_id
-                   AND payload->>'error_code'='ACTION_CONNECTOR_ERROR'
-                 ORDER BY updated_at DESC
-                 LIMIT 1
+                SELECT exception.raw_error,
+                       NOT EXISTS (
+                         SELECT 1
+                           FROM seo_agent.tasks execution
+                           JOIN seo_agent.articles article
+                             ON article.task_id=execution.id
+                          WHERE execution.task_type IN ('new_article','update_article')
+                            AND execution.payload->>'strategy_action_id'=:action_id
+                       ) AS article_absent
+                  FROM (
+                    SELECT payload->>'raw_error' AS raw_error
+                      FROM seo_agent.tasks
+                     WHERE task_type='review'
+                       AND payload->>'kind'='strategy_exception'
+                       AND payload->>'action_id'=:action_id
+                       AND payload->>'error_code'='ACTION_CONNECTOR_ERROR'
+                     ORDER BY updated_at DESC
+                     LIMIT 1
+                  ) exception
                 """
             ),
             {"action_id": str(action.get("action_id") or "")},
         )
     ).mappings().first()
-    return str((row or {}).get("raw_error") or "") in {
+    raw_error = str((row or {}).get("raw_error") or "")
+    return bool((row or {}).get("article_absent")) or raw_error in {
         "update publish must use the remote ID approved by the seo_strategy execution",
         "article published_post_id does not match the approved update target",
         "article is not linked to a human-approved seo_strategy execution",
@@ -1089,10 +1138,16 @@ def _capability_filtered_article_patch(
     patch: dict[str, Any],
 ) -> dict[str, Any]:
     filtered = dict(patch)
-    if not _image_patch_supported(action):
+    expected = _expected_article_fields(action)
+    if expected:
+        filtered = {key: value for key, value in filtered.items() if key in expected}
+    if (
+        not _image_patch_supported(action)
+        or not {"images", "image_alts"} & expected
+    ):
         filtered.pop("images", None)
         filtered.pop("image_alts", None)
-    if not _cover_patch_supported(action):
+    if not _cover_patch_supported(action) or "cover_image" not in expected:
         filtered.pop("cover_image", None)
     return filtered
 
@@ -1430,10 +1485,10 @@ async def _save_action_article(
     image_plan.extend(
         {
             "src": src,
-            "alt": patch["image_alts"].get(src),
+            "alt": (patch.get("image_alts") or {}).get(src),
             "role": "content",
         }
-        for src in patch["images"]
+        for src in (patch.get("images") or [])
     )
     saved = await save_article(
         session,

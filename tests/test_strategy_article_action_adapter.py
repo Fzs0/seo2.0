@@ -342,6 +342,15 @@ async def test_custom_blog_media_endpoint_uploads_to_same_business_oemapps_host(
         "preflight_plan_id": "plan-1",
         "preflight_strategy_task_id": "strategy-1",
         "preflight_capability_snapshot_hash": "snapshot-1",
+        "expected_fields": [
+            "title",
+            "body",
+            "meta_title",
+            "meta_description",
+            "images",
+            "image_alts",
+            "cover_image",
+        ],
         "capability_snapshot": {
             "supported_fields": {
                 "articles": [
@@ -456,6 +465,318 @@ async def test_custom_blog_media_endpoint_uploads_to_same_business_oemapps_host(
     assert response["raw"] == {"code": 0}
     assert uploaded["request"].type == "base64"
     assert action["media_upload_receipts"]["media-1"]["status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_no_media_plan_cannot_upload_orphan_media(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    action = {
+        "action_id": "action-1",
+        "site_id": "site-1",
+        "run_mode": "approval_execution",
+        "plan_id": "plan-1",
+        "source_strategy_task_id": "strategy-1",
+        "preflight_token": "preflight-1",
+        "preflight_expires_at": "2099-01-01T00:00:00+00:00",
+        "preflight_plan_id": "plan-1",
+        "preflight_strategy_task_id": "strategy-1",
+        "preflight_capability_snapshot_hash": "snapshot-1",
+        "expected_fields": [
+            "title",
+            "body",
+            "meta_title",
+            "meta_description",
+        ],
+        "capability_snapshot": {
+            "supported_fields": {
+                "articles": [
+                    "title",
+                    "body",
+                    "meta_title",
+                    "meta_description",
+                    "images",
+                    "image_alts",
+                    "cover_image",
+                ]
+            },
+            "connectors": {
+                "images": {
+                    "status": "available",
+                    "write": True,
+                    "upload": True,
+                }
+            },
+        },
+    }
+
+    class Store:
+        async def get(self, _action_id, lock=False):
+            return action
+
+        async def validate_lineage(self, _action):
+            return None
+
+    async def valid_capability(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(service, "SQLActionStore", lambda _session: Store())
+    monkeypatch.setattr(
+        service,
+        "_validate_current_preflight_capability",
+        valid_capability,
+    )
+
+    with pytest.raises(ValueError, match="not requested by the formal plan"):
+        await service.upload_strategy_article_image(
+            object(),  # type: ignore[arg-type]
+            action_id="action-1",
+            preflight_token="preflight-1",
+            idempotency_key="media-1",
+            request=service.ImageUploadRequest(
+                type="base64",
+                base64="data:image/png;base64,AAAA",
+            ),
+            dry_run=False,
+        )
+
+
+@pytest.mark.asyncio
+async def test_no_media_article_plan_passes_preflight_without_image_capability(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    action = {
+        "action_id": "action-1",
+        "action_type": "update_article",
+        "status": "planned",
+        "business_id": "business-1",
+        "site_id": "site-1",
+        "plan_id": "plan-1",
+        "source_strategy_task_id": "strategy-1",
+        "expected_fields": [
+            "title",
+            "body",
+            "meta_title",
+            "meta_description",
+        ],
+        "capability_snapshot": {"capability_snapshot_hash": "snapshot-1"},
+    }
+
+    class Store:
+        async def get(self, _action_id, lock=False):
+            return action
+
+        async def validate_lineage(self, _action, lock=False):
+            return None
+
+        async def save(self, updated):
+            action.update(updated)
+            return action
+
+    async def load_context(*_args, **_kwargs):
+        return {
+            "market": "US",
+            "language_code": "en",
+            "post_external_id": "remote-1",
+            "site": {"domain": "example.com"},
+        }
+
+    async def capabilities(*_args, **_kwargs):
+        return {
+            "capability_snapshot_hash": "snapshot-1",
+            "supported_actions": {"update_article": "approval_required"},
+        }
+
+    async def generation_context(*_args, **_kwargs):
+        return {"optional_patch_fields": [], "image_upload_endpoint": None}
+
+    monkeypatch.setattr(service, "SQLActionStore", lambda _session: Store())
+    monkeypatch.setattr(service, "_load_action_context", load_context)
+    monkeypatch.setattr(service, "get_site_capabilities", capabilities)
+    monkeypatch.setattr(service, "_build_article_generation_context", generation_context)
+
+    result = await service.preflight_article_action(
+        object(),  # type: ignore[arg-type]
+        action_id="action-1",
+        idempotency_key="preflight-1",
+    )
+
+    assert result["ready"] is True
+    assert result["generation_context"]["image_upload_endpoint"] is None
+
+
+@pytest.mark.asyncio
+async def test_generation_context_does_not_expose_unplanned_media(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    action = {
+        "action_type": "update_article",
+        "site_id": "site-1",
+        "expected_fields": [
+            "title",
+            "body",
+            "meta_title",
+            "meta_description",
+        ],
+        "capability_snapshot": {
+            "supported_fields": {
+                "articles": [
+                    "title",
+                    "body",
+                    "meta_title",
+                    "meta_description",
+                    "images",
+                    "image_alts",
+                    "cover_image",
+                ]
+            },
+            "connectors": {
+                "images": {
+                    "status": "available",
+                    "write": True,
+                    "upload": True,
+                    "transport": "wordpress_media",
+                }
+            },
+        },
+    }
+
+    class Rows:
+        def mappings(self):
+            return self
+
+        def all(self):
+            return []
+
+    class Session:
+        async def execute(self, *_args, **_kwargs):
+            return Rows()
+
+    async def load_context(*_args, **_kwargs):
+        return {
+            "site": {"domain": "example.com"},
+            "strategy_decision": {},
+        }
+
+    monkeypatch.setattr(service, "_load_action_context", load_context)
+
+    result = await service._build_article_generation_context(
+        Session(),  # type: ignore[arg-type]
+        action_id="action-1",
+        action=action,
+    )
+
+    assert result["optional_patch_fields"] == []
+    assert result["image_upload_endpoint"] is None
+    assert result["media_transport"] is None
+    assert result["accepted_media_inputs"] == []
+
+
+def test_article_patch_is_filtered_to_formal_plan_fields() -> None:
+    image_url = "https://cdn.example.com/editorial.png"
+    action = {
+        "expected_fields": [
+            "title",
+            "body",
+            "meta_title",
+            "meta_description",
+        ],
+        "capability_snapshot": {
+            "supported_fields": {
+                "articles": [
+                    "title",
+                    "body",
+                    "meta_title",
+                    "meta_description",
+                    "images",
+                    "image_alts",
+                    "cover_image",
+                ]
+            },
+            "connectors": {
+                "images": {
+                    "status": "available",
+                    "write": True,
+                    "upload": True,
+                }
+            },
+        },
+    }
+    canonical = service.canonical_article_patch(_patch(image_url=image_url))
+
+    filtered = service._capability_filtered_article_patch(action, canonical)
+
+    assert set(filtered) == {
+        "title",
+        "body",
+        "meta_title",
+        "meta_description",
+    }
+
+
+@pytest.mark.asyncio
+async def test_save_article_accepts_formal_plan_without_media_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict = {}
+
+    async def save(_session, article):
+        captured.update(article)
+        return {"id": "article-1"}
+
+    monkeypatch.setattr(service, "save_article", save)
+    patch = service._capability_filtered_article_patch(
+        {
+            "expected_fields": [
+                "title",
+                "body",
+                "meta_title",
+                "meta_description",
+            ]
+        },
+        service.canonical_article_patch(_patch()),
+    )
+
+    result = await service._save_action_article(
+        object(),  # type: ignore[arg-type]
+        action={
+            "action_id": "action-1",
+            "action_type": "update_article",
+            "site_id": "site-1",
+            "topic": "titanium cutting board",
+        },
+        context={
+            "post_slug": "titanium-cutting-board",
+            "strategy_decision": {
+                "query": "titanium cutting board",
+                "internal_link_plan": [],
+            },
+        },
+        execution_id="execution-1",
+        patch=patch,
+    )
+
+    assert result == {"id": "article-1"}
+    assert captured["image_plan"] == []
+
+
+@pytest.mark.asyncio
+async def test_recovery_proves_prewrite_failure_when_no_article_exists() -> None:
+    class Rows:
+        def mappings(self):
+            return self
+
+        def first(self):
+            return {"raw_error": "'images'", "article_absent": True}
+
+    class Session:
+        async def execute(self, *_args, **_kwargs):
+            return Rows()
+
+    assert await service._has_confirmed_prewrite_failure(
+        Session(),  # type: ignore[arg-type]
+        {"action_id": "action-1"},
+    ) is True
 
 
 def test_article_readback_compares_markdown_with_remote_html_semantically() -> None:

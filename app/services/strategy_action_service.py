@@ -1042,6 +1042,21 @@ async def recover_action(
                     "result": "blocked",
                     "last_heartbeat_at": _now(),
                     "recovery_status": status,
+                    "submitted_patch": dict(
+                        recovery.get("submitted_patch")
+                        or action.get("submitted_patch")
+                        or action.get("approved_patch")
+                        or action.get("proposed_patch")
+                        or {}
+                    ),
+                    "remote_response": dict(
+                        recovery.get("remote_response")
+                        or {
+                            "remote_outcome": status,
+                            "reconciled_without_remote_write": True,
+                        }
+                    ),
+                    "readback": dict(recovery.get("readback") or {}),
                     "recovery_token": None,
                     "recovery_claimed_at": None,
                     "recovery_lease_expires_at": None,
@@ -1585,6 +1600,15 @@ def _capability_error(
     allowed = set(fields.get(action_type) or fields.get("articles") or ())
     if any(field not in allowed for field in patch):
         return "field_not_allowed"
+    expected = {
+        str(field).strip().casefold()
+        for field in (action.get("expected_fields") or ())
+        if str(field).strip()
+    }
+    if action_type in {"new_article", "update_article"}:
+        expected.update({"title", "body", "meta_title", "meta_description"})
+    if expected and any(str(field).casefold() not in expected for field in patch):
+        return "field_not_in_formal_plan"
     connector_by_action = {
         "product_seo": "products",
         "product_image_alt": "products",

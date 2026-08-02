@@ -491,6 +491,38 @@ async def test_persisted_capability_snapshot_blocks_undeclared_fields() -> None:
 
 
 @pytest.mark.asyncio
+async def test_preview_cannot_expand_beyond_formal_plan_fields() -> None:
+    item = action()
+    item["expected_fields"] = ["meta_title"]
+    item["capability_snapshot"] = {
+        "capability_snapshot_hash": "capability-hash-v1",
+        "supported_actions": {"product_seo": "approval_required"},
+        "supported_fields": {"product_seo": ["title", "meta_title"]},
+        "connectors": {
+            "products": {
+                "status": "available",
+                "write": True,
+                "checked_at": datetime.now(UTC).isoformat(),
+            }
+        },
+        "configuration_issues": [],
+        "side_effects": {},
+    }
+    store = MemoryStore(item)
+
+    result = await service.preview_action(
+        store,
+        action_id="action-1",
+        patch={"title": "Unplanned title change"},
+        adapter=Adapter(),
+        capability_snapshot_hash="capability-hash-v1",
+    )
+
+    assert result["result"] == "blocked"
+    assert result["block_reason"] == "field_not_in_formal_plan"
+
+
+@pytest.mark.asyncio
 async def test_side_effect_confirmation_is_bound_at_approval_not_preview() -> None:
     item = action()
     item["capability_snapshot"] = {
@@ -869,13 +901,23 @@ async def test_adapter_failure_becomes_auditable_unknown_remote_state() -> None:
 
     class ReadOnlyRecovery(Adapter):
         async def recover(self, _action):
-            return {"recovery_status": "confirmed_not_applied"}
+            return {
+                "recovery_status": "confirmed_not_applied",
+                "submitted_patch": {"title": "After"},
+                "remote_response": {
+                    "remote_outcome": "confirmed_not_applied",
+                    "reconciled_without_remote_write": True,
+                },
+                "readback": {},
+            }
 
     recovered = await service.recover_action(
         store, action_id="action-1", adapter=ReadOnlyRecovery()
     )
     assert recovered["recovery_status"] == "confirmed_not_applied"
     assert recovered["status"] == "blocked"
+    assert recovered["remote_response"]["remote_outcome"] == "confirmed_not_applied"
+    assert recovered["remote_response"]["reconciled_without_remote_write"] is True
 
 
 @pytest.mark.asyncio
