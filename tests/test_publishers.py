@@ -1278,6 +1278,53 @@ async def test_shopify_publisher_updates_and_reads_an_existing_article(monkeypat
 
 
 @pytest.mark.asyncio
+async def test_shopify_article_inventory_reads_seo_and_publication_fields(monkeypatch):
+    queries: list[str] = []
+
+    async def fake_graphql(query: str, variables: dict | None = None, **_kwargs):
+        queries.append(query)
+        assert variables == {'first': 50}
+        return {
+            'articles': {
+                'nodes': [{
+                    'id': 'gid://shopify/Article/1',
+                    'title': 'Hello',
+                    'handle': 'hello',
+                    'body': '<p>Body</p>',
+                    'summary': 'Summary',
+                    'isPublished': True,
+                    'publishedAt': '2026-08-02T15:44:53Z',
+                    'updatedAt': '2026-08-02T15:45:00Z',
+                    'titleTag': {'key': 'title_tag', 'value': 'SEO Hello'},
+                    'descriptionTag': {
+                        'key': 'description_tag',
+                        'value': 'SEO description',
+                    },
+                }],
+            },
+        }
+
+    publisher = ShopifyPublisher(
+        {
+            'id': 'site-1',
+            'domain': 'example.myshopify.com',
+            'api_config': {'connector_type': 'shopify', 'blogHandle': 'news'},
+        },
+        dry_run=True,
+        credentials={'client_id': 'client-id', 'client_secret': 'client-secret'},
+    )
+    monkeypatch.setattr(publisher, '_graphql', fake_graphql)
+
+    items = await publisher.read_articles(limit=100)
+
+    assert items[0]['titleTag']['value'] == 'SEO Hello'
+    assert items[0]['descriptionTag']['value'] == 'SEO description'
+    assert items[0]['publishedAt'] == '2026-08-02T15:44:53Z'
+    assert 'metafield(namespace: "global", key: "title_tag")' in queries[0]
+    assert 'publishedAt' in queries[0]
+
+
+@pytest.mark.asyncio
 async def test_shopify_publisher_finds_an_existing_article_by_handle(monkeypatch):
     calls: list[dict] = []
 

@@ -1295,7 +1295,24 @@ class ShopifyPublisher(PublisherBase):
             """
             query Articles($first: Int!) {
               articles(first: $first) {
-                nodes { id title handle body summary }
+                nodes {
+                  id
+                  title
+                  handle
+                  body
+                  summary
+                  isPublished
+                  publishedAt
+                  updatedAt
+                  titleTag: metafield(namespace: "global", key: "title_tag") {
+                    key
+                    value
+                  }
+                  descriptionTag: metafield(namespace: "global", key: "description_tag") {
+                    key
+                    value
+                  }
+                }
               }
             }
             """,

@@ -158,6 +158,8 @@ async def publish_article(
                 require_slug_match=action in {"create", "slug_reuse"},
             )
             if verification["ok"]:
+                if not result.remote_outcome:
+                    result.remote_outcome = "confirmed_applied"
                 result.post_id = remote_id
                 result.url = resolve_article_public_url(
                     dict(s),

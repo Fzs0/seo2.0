@@ -46,12 +46,27 @@ def test_oemapps_main_article_sync_uses_canonical_slug_url(
 
 def test_shopify_body_is_normalized_to_article_content():
     post = _normalize_shopify(
-        {"id": "gid://shopify/Article/1", "title": "Hello", "handle": "hello", "body": "<p>Body</p>"},
+        {
+            "id": "gid://shopify/Article/1",
+            "title": "Hello",
+            "handle": "hello",
+            "body": "<p>Body</p>",
+            "isPublished": True,
+            "publishedAt": "2026-08-02T15:44:53Z",
+            "updatedAt": "2026-08-02T15:45:00Z",
+            "titleTag": {"value": "SEO Hello"},
+            "descriptionTag": {"value": "SEO description"},
+        },
         {"base_url": "https://shop.example.com", "api_config": {"blogHandle": "news"}},
     )
 
     assert post["content_html"] == "<p>Body</p>"
     assert post["url"] == "https://shop.example.com/blogs/news/hello"
+    assert post["status"] == "published"
+    assert post["meta_title"] == "SEO Hello"
+    assert post["meta_description"] == "SEO description"
+    assert post["published_at"] == "2026-08-02T15:44:53Z"
+    assert post["modified_at"] == "2026-08-02T15:45:00Z"
 
 
 def test_public_article_html_parser_extracts_body_and_tdk():

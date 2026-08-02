@@ -519,7 +519,8 @@ async def list_articles(
                    a.keyword_id, k.keyword, a.title, a.slug, a.target_url, a.status,
                    a.language_code, a.market, a.meta_title, a.meta_description,
                    a.primary_keyword, a.generation_provider, a.generation_model,
-                   a.created_at, a.updated_at, a.published_at, a.published_url
+                   a.created_at, a.updated_at, a.published_at, a.published_post_id,
+                   a.published_url
               FROM seo_agent.articles a
               LEFT JOIN seo_agent.sites s ON s.id = a.site_id
               LEFT JOIN seo_agent.keywords k ON k.id = a.keyword_id
@@ -545,7 +546,7 @@ async def get_article(session: AsyncSession, article_id: str) -> dict[str, Any] 
             "status, language_code, market, brief_md, prompt_text, content_md, content_html, "
             "article_parts, meta_title, meta_description, primary_keyword, secondary_keywords, "
             "internal_link_plan, image_plan, references_plan, qa_checklist, qa_summary, "
-            "generation_provider, generation_model, published_url, published_at, "
+            "generation_provider, generation_model, published_post_id, published_url, published_at, "
             "created_at, updated_at "
             "FROM seo_agent.articles WHERE id = :id"
         ),

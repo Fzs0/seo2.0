@@ -117,9 +117,11 @@ class _ArticleSession:
     def __init__(self, row: dict[str, Any]) -> None:
         self.row = row
         self.calls = 0
+        self.statements: list[str] = []
 
-    async def execute(self, *_args: Any, **_kwargs: Any) -> _Rows:
+    async def execute(self, statement: Any, *_args: Any, **_kwargs: Any) -> _Rows:
         self.calls += 1
+        self.statements.append(str(statement))
         return _Rows(self.row)
 
 
@@ -140,6 +142,7 @@ class _WriteSession:
 async def test_get_article_returns_stable_qa_contract_for_legacy_row() -> None:
     session = _ArticleSession({
         "id": "article-id",
+        "published_post_id": "remote-42",
         "qa_checklist": {
             "ok": True,
             "checks": {"word_count": True, "images_present": True},
@@ -153,6 +156,8 @@ async def test_get_article_returns_stable_qa_contract_for_legacy_row() -> None:
     assert article is not None
     assert article["qa_state"] == "legacy"
     assert article["qa_passed"] is True
+    assert article["published_post_id"] == "remote-42"
+    assert "published_post_id" in session.statements[0]
     assert article["qa_checklist"] == [
         {"key": "images_present", "ok": True},
         {"key": "word_count", "ok": True, "value": 1778},

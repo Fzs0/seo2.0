@@ -347,6 +347,37 @@ async def test_acknowledged_update_with_verified_readback_is_not_treated_as_unkn
 
 
 @pytest.mark.asyncio
+async def test_verified_update_without_connector_outcome_is_confirmed_applied(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = Session(
+        approval=_approval(
+            execution_type="update_article",
+            approved_remote_id="42",
+        )
+    )
+    publisher = Publisher()
+    _use_publisher(monkeypatch, publisher)
+
+    result = await publish_service.publish_article(
+        session,
+        article_id="article-id",
+        site_id=None,
+        dry_run=False,
+        update_post_id="42",
+    )
+
+    assert result["ok"] is True
+    assert result["remote_outcome"] == "confirmed_applied"
+    assert result["exception_id"] is None
+    assert session.inserts[0]["status"] == "done"
+    assert json.loads(session.inserts[0]["payload"])["remote_outcome"] == (
+        "confirmed_applied"
+    )
+    assert len(session.article_updates) == 1
+
+
+@pytest.mark.asyncio
 async def test_acknowledged_update_with_failed_readback_becomes_unknown_remote_state(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

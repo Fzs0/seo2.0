@@ -192,6 +192,12 @@ def _normalize_shopify(p: dict[str, Any], site: dict[str, Any] | None = None) ->
     site = site or {}
     handle = p.get("handle")
     article_id = p.get("id") or handle
+    title_tag = p.get("titleTag") if isinstance(p.get("titleTag"), dict) else {}
+    description_tag = (
+        p.get("descriptionTag")
+        if isinstance(p.get("descriptionTag"), dict)
+        else {}
+    )
     return {
         "external_id": str(article_id or ""),
         "title": p.get("title") or "untitled",
@@ -199,7 +205,11 @@ def _normalize_shopify(p: dict[str, Any], site: dict[str, Any] | None = None) ->
         "url": _shopify_article_url(site, handle),
         "content_html": p.get("body") or p.get("body_html"),
         "excerpt": p.get("summary") or p.get("excerpt"),
+        "meta_title": title_tag.get("value"),
+        "meta_description": description_tag.get("value"),
         "status": "published" if p.get("isPublished") else p.get("status"),
+        "published_at": p.get("publishedAt") or p.get("published_at"),
+        "modified_at": p.get("updatedAt") or p.get("updated_at"),
         "source": "shopify_api",
         "raw": p,
     }
