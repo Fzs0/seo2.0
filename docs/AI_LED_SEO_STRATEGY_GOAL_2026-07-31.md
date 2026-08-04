@@ -25,8 +25,8 @@
 > 同意图冷却、在途冲突、风险来源、幂等和执行容量；所有合格但未立即执行的动作必须
 > 保存为 Deferred。候选池必须退出所有新策略的研究、排名、授权、Plan、Action 和
 > 调度路径。整个调用范围为零可执行和零延后动作时，必须进入不可绕过的 Zero Action
-> Review；研究不足时要求 AI 通过第二证据通道补证，证据充分时允许合理全量 Hold，
-> 但不得强制制造文章。最终完成
+> Review；研究不足时要求 AI 通过第二证据通道补证；非硬阻塞站点必须继续寻找
+> 安全学习动作，但不得强制制造文章。最终完成
 > `Scope Discovery → Evidence Snapshot → AI Research Portfolio → Proposed Actions
 > → Backend Safety Review → Zero Action Review → Formal Plan → Unified Action
 > → Preview → Approval → Execute → Independent Readback → Observation
@@ -357,7 +357,7 @@ Interface 隐藏：
 - 说明被拒绝方案；
 - 决定现在执行或延后；
 - 在后端返回硬门禁时重新研究，而不是等待人工替 AI 选题；
-- 允许在证据充分时选择 Hold。
+- 仅在存在有效整站硬阻塞时选择站点级 Hold；目标级阻塞后继续研究其他动作。
 
 ### 6.3 生成和 QA
 
@@ -499,16 +499,16 @@ execute_now_count + deferred_count == 0
 
 ```text
 research_revision_required
-all_hold_review_passed
 hard_blocked
+configuration_skipped
 ```
 
 - `research_revision_required`：返回缺失证据，AI 自动补充研究并重新提交；
-- `all_hold_review_passed`：证据充分，允许全量 Hold；
-- `hard_blocked`：权限、能力、远端不确定性或高风险事实造成真实阻塞。
+- `hard_blocked`：经过验证的整站身份、能力或写入安全问题造成真实阻塞；
+- `configuration_skipped`：站点配置修复已被明确记录，本轮不执行远程内容动作。
 
-连续两次全量 Hold 且证据和理由没有实质变化时，创建
-`strategy_stagnation` 异常，禁止复制上次结论完成新 Run。
+2026-08-03 起，非硬阻塞站点不再允许通过 `all_hold_review_passed` 完成 Run。
+零动作复审返回 `SAFE_EXPERIMENT_REQUIRED`，要求继续研究不同 URL、主题或动作类型。
 
 ## 9. 正式状态和数据流
 
@@ -624,7 +624,8 @@ Run 完成前必须对比精确 site_id 集合，而不只比较数量。
 | `SAFETY_CEILING_EXCEEDED` | Deferred |
 | `PORTFOLIO_COVERAGE_INCOMPLETE` | 阻止 Run 收口 |
 | `CONFIGURATION_REPAIR_LOST` | P1/P2 合同异常 |
-| `STRATEGY_STAGNATION` | 要求新证据或人工检查 |
+| `SAFE_EXPERIMENT_REQUIRED` | 继续研究并提交安全学习动作，或提供有效整站硬阻塞 |
+| `SITE_HARD_BLOCKER_INVALID` | 修正整站硬阻塞的结构和原因码 |
 
 未知错误默认安全失败，不得降成普通 Hold。
 
@@ -651,7 +652,7 @@ Run 完成前必须对比精确 site_id 集合，而不只比较数量。
 11. 一次英文 SERP 查询不能支持多个不同站点全量 Hold。
 12. GSC 为空但产品和 SERP 有需求时，允许新写或更新。
 13. 外部搜索失败时，日志保存失败证据和降级路径。
-14. 真正无合格方向且证据完整时，允许全量 Hold。
+14. 无整站硬阻塞且已列方向均不合格时，返回 `SAFE_EXPERIMENT_REQUIRED` 继续研究。
 15. 地区化 SEMrush/搜索 GUI 真实采集已由用户暂缓，不计入本轮上线门禁；恢复后
     AI 必须保存 `source_type=semrush_ui`、市场、语言、设备、采集网络、时间、
     筛选条件和证据工件。

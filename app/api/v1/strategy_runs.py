@@ -126,6 +126,7 @@ class ResearchMaterialOptionBody(BaseModel):
     target_identity: ResearchTargetIdentityBody
     user_intent: str = Field(min_length=1, max_length=2000)
     evidence_refs: list[str] = Field(min_length=1, max_length=100)
+    evidence_level: Literal["high", "medium", "low", "unsafe"] = "medium"
     outcome: Literal["qualified", "rejected", "blocked"]
     reason: str = Field(min_length=1, max_length=3000)
     blocker_code: str | None = Field(default=None, max_length=200)
@@ -146,6 +147,18 @@ class ActionAssessmentBody(BaseModel):
     outcome: str = Field(min_length=1, max_length=100)
     reason: str = Field(min_length=1, max_length=3000)
     evidence_refs: list[str] = Field(min_length=1, max_length=100)
+
+
+class SiteHardBlockerBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    code: Literal[
+        "CAPABILITY_MISSING",
+        "SITE_DISABLED",
+        "SITE_CONFIGURATION_INCOMPLETE",
+    ]
+    message: str = Field(min_length=1, max_length=3000)
+    unlock_condition: str | None = Field(default=None, max_length=2000)
 
 
 class SiteResearchBody(BaseModel):
@@ -181,7 +194,9 @@ class SiteResearchBody(BaseModel):
         ],
         ActionAssessmentBody,
     ] = Field(default_factory=dict, max_length=5)
-    hard_blockers: list[dict[str, Any]] = Field(default_factory=list, max_length=50)
+    hard_blockers: list[SiteHardBlockerBody] = Field(
+        default_factory=list, max_length=50
+    )
     sources_attempted: list[str] = Field(default_factory=list, max_length=100)
     evidence_sources: list[EvidenceSourceBody] = Field(
         default_factory=list, max_length=200
@@ -236,6 +251,7 @@ class ProposedActionBody(BaseModel):
     user_intent: str = Field(min_length=1, max_length=2000)
     decision_reason: str = Field(min_length=1, max_length=4000)
     evidence_refs: list[str] = Field(min_length=1, max_length=100)
+    evidence_level: Literal["high", "medium", "low", "unsafe"] = "medium"
     alternatives_considered: list[dict[str, Any]] = Field(
         default_factory=list, max_length=100
     )

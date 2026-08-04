@@ -146,7 +146,13 @@ def test_research_portfolio_accepts_auditable_keywordless_sources(monkeypatch):
                             }
                         ],
                         "opportunity_exhaustion": {
-                            "surfaces_checked": ["existing_pages", "new_topics"],
+                            "surfaces_checked": [
+                                "existing_articles",
+                                "new_topics",
+                                "product_pages",
+                                "category_pages",
+                                "on_page",
+                            ],
                             "evaluated_option_ids": ["compare-materials"],
                             "conclusion": "Existing pages and new topics were evaluated.",
                         },

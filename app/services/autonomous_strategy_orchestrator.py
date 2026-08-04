@@ -43,7 +43,16 @@ CONCRETE_RESEARCH_ACTIONS = frozenset(
 )
 OPPORTUNITY_OUTCOMES = frozenset({"qualified", "rejected", "blocked"})
 TARGET_BLOCK_SCOPES = frozenset({"url", "topic"})
-REQUIRED_HOLD_RESEARCH_SURFACES = frozenset({"existing_pages", "new_topics"})
+REQUIRED_HOLD_RESEARCH_SURFACES = frozenset(
+    {
+        "existing_articles",
+        "new_topics",
+        "product_pages",
+        "category_pages",
+        "on_page",
+    }
+)
+EVIDENCE_LEVELS = frozenset({"high", "medium", "low", "unsafe"})
 TARGET_SCOPED_BLOCKERS = frozenset(
     {"TARGET_COOLDOWN", "TOPIC_COOLDOWN", "TARGET_ACTIVE", "TOPIC_ACTIVE"}
 )
@@ -82,11 +91,9 @@ FACT_SCOPES = frozenset(
         "other",
     }
 )
-HARD_BLOCK_CODES = frozenset(
+SITE_HARD_BLOCK_CODES = frozenset(
     {
         "CAPABILITY_MISSING",
-        "TARGET_REMOTE_UNCERTAIN",
-        "PROTECTED_FIELD_REQUESTED",
         "SITE_DISABLED",
         "SITE_CONFIGURATION_INCOMPLETE",
     }
@@ -315,6 +322,47 @@ def _intent_key(value: Any) -> str:
     return "-".join(tokens)
 
 
+def _evidence_level(value: Any, *, field: str) -> str:
+    level = str(value or "medium").strip().casefold()
+    if level not in EVIDENCE_LEVELS:
+        raise StrategyContractError(
+            "RESEARCH_EVIDENCE_INSUFFICIENT",
+            f"{field} must be high, medium, low, or unsafe",
+        )
+    return level
+
+
+def _normalize_site_hard_blocker(raw: Any) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        raise StrategyContractError(
+            "SITE_HARD_BLOCKER_INVALID",
+            "site hard blockers must be structured objects",
+        )
+    code = _required_text(
+        raw.get("code"),
+        field="hard_blockers.code",
+        code="SITE_HARD_BLOCKER_INVALID",
+    )
+    if code not in SITE_HARD_BLOCK_CODES:
+        raise StrategyContractError(
+            "SITE_HARD_BLOCKER_INVALID",
+            f"{code} is not a validated site-level hard blocker",
+        )
+    message = _required_text(
+        raw.get("message") or raw.get("reason"),
+        field="hard_blockers.message",
+        code="SITE_HARD_BLOCKER_INVALID",
+    )
+    return {
+        "code": code,
+        "scope": "site",
+        "message": message,
+        "unlock_condition": (
+            str(raw.get("unlock_condition") or "").strip() or None
+        ),
+    }
+
+
 def _normalize_material_option(
     raw: dict[str, Any],
     *,
@@ -398,6 +446,14 @@ def _normalize_material_option(
             "CONCRETE_OPPORTUNITY_REQUIRED",
             f"unsupported material option outcome: {outcome}",
         )
+    evidence_level = _evidence_level(
+        raw.get("evidence_level"), field="material_options.evidence_level"
+    )
+    if outcome == "qualified" and evidence_level == "unsafe":
+        raise StrategyContractError(
+            "UNSAFE_EXPERIMENT_REJECTED",
+            "an unsafe opportunity cannot be qualified for execution",
+        )
     reason = _required_text(
         raw.get("reason"),
         field="material_options.reason",
@@ -441,6 +497,7 @@ def _normalize_material_option(
         ),
         "user_intent": user_intent,
         "evidence_refs": evidence_refs,
+        "evidence_level": evidence_level,
         "outcome": outcome,
         "reason": reason,
         "blocker_code": blocker_code,
@@ -627,7 +684,10 @@ def normalize_research_portfolio(
             "material_options": material_options,
             "opportunity_exhaustion": opportunity_exhaustion,
             "action_assessments": normalized_assessments,
-            "hard_blockers": list(raw.get("hard_blockers") or []),
+            "hard_blockers": [
+                _normalize_site_hard_blocker(item)
+                for item in (raw.get("hard_blockers") or [])
+            ],
             "sources_attempted": _string_list(
                 raw.get("sources_attempted") or [],
                 field="sources_attempted",
@@ -954,6 +1014,14 @@ def normalize_proposed_actions(
         seen_ids.add(option_id)
         covered_sites.add(site_id)
         risk_level = str(raw.get("risk_level") or "medium").strip()
+        evidence_level = _evidence_level(
+            raw.get("evidence_level"), field="evidence_level"
+        )
+        if action in CONCRETE_RESEARCH_ACTIONS and evidence_level == "unsafe":
+            raise StrategyContractError(
+                "UNSAFE_EXPERIMENT_REJECTED",
+                "an unsafe proposed action cannot enter the executable plan",
+            )
         corrective_of_action_id = (
             str(raw.get("corrective_of_action_id") or "").strip() or None
         )
@@ -991,6 +1059,7 @@ def normalize_proposed_actions(
                 "recommended_action": decision_reason,
                 "decision_reason": decision_reason,
                 "evidence_refs": evidence_refs,
+                "evidence_level": evidence_level,
                 "evidence": {
                     "refs": evidence_refs,
                     "research_portfolio_hash": _stable_hash(research_portfolio),
@@ -1068,7 +1137,6 @@ def _capability_gate(
     adapter_identity = (capability.get("action_adapters") or {}).get(
         concrete_action
     )
-    requested_connector = str(item.get("connector_type") or "").casefold()
     declared_connector = (
         str((adapter_identity or {}).get("connector_type") or "").casefold()
         if isinstance(adapter_identity, dict)
@@ -1081,7 +1149,6 @@ def _capability_gate(
         or adapter_identity.get("write") is not True
         or adapter_identity.get("readback") is not True
         or not declared_connector
-        or bool(requested_connector and requested_connector != declared_connector)
     )
     article_fields = set(
         ((capability.get("supported_fields") or {}).get("articles") or ())
@@ -1134,7 +1201,11 @@ def _capability_gate(
             )
         )
     )
-    if article_action and not adapter_unavailable and not requested_connector:
+    if article_action and not adapter_unavailable:
+        # A proposal may describe the site's business role (for example
+        # ``main``), but connector identity is a verified capability fact. Bind
+        # every executable article plan to that fact so an AI/source label can
+        # neither select nor accidentally conflict with the runtime adapter.
         item["connector_type"] = str(adapter_identity["connector_type"])
     if item.get("editorial_action") in {"hold", "configuration_repair"}:
         return item
@@ -1449,7 +1520,7 @@ def review_zero_action(
             if action.get("reason_code")
         }
         has_hard_blocker = bool(research.get("hard_blockers")) or bool(
-            hard_codes & HARD_BLOCK_CODES
+            hard_codes & SITE_HARD_BLOCK_CODES
         )
         if has_hard_blocker:
             hard_blocked_sites += 1
@@ -1593,6 +1664,16 @@ def review_zero_action(
                     "missing": "second evidence channel",
                 }
             )
+        if not qualified_option_ids:
+            missing.append(
+                {
+                    "site_id": site_id,
+                    "code": "SAFE_EXPERIMENT_REQUIRED",
+                    "missing": (
+                        "a safe learning action or a validated site-level hard blocker"
+                    ),
+                }
+            )
     if missing:
         return {
             "required": True,
@@ -1628,56 +1709,23 @@ def review_zero_action(
             "reason_codes": ["HARD_BLOCKED"],
             "missing_evidence": [],
         }
+    # Every non-hard-blocked site without an executable or verified Deferred
+    # action has already received SAFE_EXPERIMENT_REQUIRED above. This fallback
+    # is defensive and must never silently restore the retired all-Hold path.
     return {
         "required": True,
-        "result": "all_hold_review_passed",
-        "reason_codes": ["CURRENT_EVIDENCE_SUPPORTS_HOLD"],
-        "missing_evidence": [],
+        "result": "research_revision_required",
+        "reason_codes": ["SAFE_EXPERIMENT_REQUIRED"],
+        "missing_evidence": [
+            {
+                "site_id": None,
+                "code": "SAFE_EXPERIMENT_REQUIRED",
+                "missing": (
+                    "a safe learning action or a validated site-level hard blocker"
+                ),
+            }
+        ],
     }
-
-
-def _zero_action_fingerprint(
-    *,
-    research_portfolio: list[dict[str, Any]],
-    reviewed_actions: list[dict[str, Any]],
-) -> str:
-    def material_source(source: dict[str, Any]) -> dict[str, Any]:
-        # Capture timestamps, storage locations and screenshot/export paths are
-        # audit metadata. Changing only those values must not make a repeated
-        # all-Hold decision look like materially new research.
-        return {
-            key: value
-            for key, value in source.items()
-            if key not in {"captured_at", "artifact_refs"}
-        }
-
-    return _stable_hash(
-        {
-            "research": [
-                {
-                    "site_id": item.get("site_id"),
-                    "research_conclusion": item.get("research_conclusion"),
-                    "evidence_sources": [
-                        material_source(source)
-                        for source in (item.get("evidence_sources") or [])
-                    ],
-                    "action_assessments": item.get("action_assessments")
-                    or {},
-                }
-                for item in research_portfolio
-            ],
-            "actions": [
-                {
-                    "site_id": item.get("site_id"),
-                    "action": item.get("strategy_type"),
-                    "reason": item.get("reason"),
-                    "reason_code": item.get("reason_code"),
-                    "evidence_refs": item.get("evidence_refs") or [],
-                }
-                for item in reviewed_actions
-            ],
-        }
-    )
 
 
 async def evaluate_zero_action_review(
@@ -1686,87 +1734,12 @@ async def evaluate_zero_action_review(
     run: dict[str, Any],
     reviewed_actions: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    """Apply the zero-action contract and detect repeated unchanged all-Hold."""
+    """Apply the zero-action contract without permitting soft site-wide Hold."""
     research_portfolio = list(run.get("research_portfolio") or [])
-    result = review_zero_action(
+    return review_zero_action(
         research_portfolio=research_portfolio,
         reviewed_actions=reviewed_actions,
     )
-    if result.get("result") != "all_hold_review_passed":
-        return result
-    fingerprint = _zero_action_fingerprint(
-        research_portfolio=research_portfolio,
-        reviewed_actions=reviewed_actions,
-    )
-    previous = (
-        await session.execute(
-            text(
-                """
-                SELECT id::text AS run_id,
-                       decision#>>'{zero_action_review,result}' AS result,
-                       decision#>>'{zero_action_review,stagnation_fingerprint}'
-                           AS stagnation_fingerprint
-                  FROM seo_agent.tasks
-                 WHERE task_type='review'
-                   AND payload->>'kind'='strategy_run'
-                   AND payload->>'business_id'=:business_id
-                   AND id<>CAST(:run_id AS uuid)
-                   AND decision->>'status' IN ('completed', 'partial', 'blocked')
-                 ORDER BY created_at DESC
-                 LIMIT 1
-                """
-            ),
-            {
-                "business_id": str(run["business_id"]),
-                "run_id": str(run["run_id"]),
-            },
-        )
-    ).mappings().first()
-    if (
-        previous
-        and previous.get("result") == "all_hold_review_passed"
-        and previous.get("stagnation_fingerprint") == fingerprint
-    ):
-        from app.services.strategy_exception_service import record_exception
-
-        exception = await record_exception(
-            session,
-            {
-                "business_id": str(run["business_id"]),
-                "site_id": None,
-                "run_id": str(run["run_id"]),
-                "type": "strategy_stagnation",
-                "stage": "zero_action_reviewing",
-                "error_code": "STRATEGY_STAGNATION",
-                "severity": "P2",
-                "raw_error": (
-                    "Two consecutive all-Hold Runs reused materially unchanged "
-                    "evidence and reasoning."
-                ),
-                "evidence": {
-                    "previous_run_id": previous.get("run_id"),
-                    "stagnation_fingerprint": fingerprint,
-                },
-                "unlock_condition": (
-                    "Collect materially new evidence or request human review."
-                ),
-            },
-        )
-        return {
-            "required": True,
-            "result": "research_revision_required",
-            "reason_codes": ["STRATEGY_STAGNATION"],
-            "missing_evidence": [
-                {
-                    "site_id": None,
-                    "code": "STRATEGY_STAGNATION",
-                    "missing": "materially new evidence or human review",
-                }
-            ],
-            "stagnation_fingerprint": fingerprint,
-            "exception_fingerprint": exception.get("fingerprint"),
-        }
-    return {**result, "stagnation_fingerprint": fingerprint}
 
 
 async def _patch_run(

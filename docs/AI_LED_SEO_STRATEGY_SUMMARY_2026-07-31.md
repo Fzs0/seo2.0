@@ -304,9 +304,10 @@ Run 不得直接收口，必须复核：
 8. 是否有合格动作被安全上限丢弃；
 9. `configuration_repair` 是否被错误降成普通 Hold。
 
-研究不足时返回 `research_revision_required`，由 AI 补充第二轮研究。证据完整且确实
-没有合格方向时，允许 `all_hold_review_passed`。Zero Action Review 不得强制制造
-文章，也不得放松权限、医疗、法规、远端不确定性等硬门禁。
+研究不足时返回 `research_revision_required`，由 AI 补充第二轮研究。2026-08-03
+起，非硬阻塞站点即使已列方向都被拒绝，也不能通过 `all_hold_review_passed` 完成；
+系统返回 `SAFE_EXPERIMENT_REQUIRED`，要求继续研究其他文章、新主题、产品页、分类页
+或 On-page。该规则不允许制造低质文章，也不放松权限、医疗、法规和远端状态门禁。
 
 ## 8. 动作容量和调度
 
@@ -326,11 +327,12 @@ Run 不得直接收口，必须复核：
 
 1. 动作枚举预先缩小：已由五类动作完整评估合同阻断。
 2. Research Portfolio 和 Proposed Actions：已建立正式、幂等、逐站覆盖接口。
-3. Zero Action Review：已接入正式 Run，支持补证、合理全量 Hold 和连续停滞异常。
+3. Zero Action Review：已接入正式 Run；非硬阻塞零动作返回
+   `SAFE_EXPERIMENT_REQUIRED`，不再通过普通全量 Hold 完成。
 4. Configuration Repair 丢型：已修复并有 PostgreSQL 17 回归。
 5. `strategy_enabled=false` 活动站点遗漏：已保留为 Configuration Repair。
 6. 候选池旧入口：新写和运行入口已退役，历史查询只读保留。
-7. 全量 Hold 研究质量：现在检查第二证据通道、五类动作评估和站点级证据。
+7. Hold 研究质量：现在检查第二证据通道、五类动作评估、五类研究表面和有效整站硬阻塞。
 8. 外部工具来源合同：通用 Evidence Adapter 已实现；地区化实时 GUI 采集按产品
    决定暂缓，恢复前必须先明确地区、语言、设备和采集网络。
 

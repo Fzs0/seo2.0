@@ -5,6 +5,38 @@ from typing import Any
 from urllib.parse import quote, unquote, urljoin, urlsplit, urlunsplit
 
 
+def canonical_article_connector_type(site: dict[str, Any]) -> str:
+    """Return the publisher protocol identity, never the site's business role.
+
+    ``site_type=main`` describes the site's role in a business.  OEMApps main
+    sites and custom content APIs are both served by ``OpenAPIPublisher``, whose
+    stable connector identity is ``custom_openapi``.  Keeping this normalization
+    in one place prevents capability snapshots and runtime routing from binding
+    different names to the same adapter.
+    """
+    config = site.get("api_config") or {}
+    raw = str(
+        site.get("connector_type")
+        or config.get("connector_type")
+        or site.get("site_type")
+        or ""
+    ).strip().casefold()
+    if raw in {"wp", "wordpress"}:
+        return "wordpress"
+    if raw in {"shopify", "shopify_admin"}:
+        return "shopify"
+    if raw in {
+        "main",
+        "blog",
+        "openapi",
+        "custom_blog",
+        "custom_saas",
+        "custom_openapi",
+    }:
+        return "custom_openapi"
+    return raw or "unsupported"
+
+
 def is_oemapps_site(site: dict[str, Any]) -> bool:
     """Return whether the site uses the shared OEMApps main-site backend."""
     raw = str(site.get("api_base_url") or "").strip()
@@ -159,6 +191,7 @@ def _absolute_public_url(base: str, path: str) -> str | None:
 
 
 __all__ = [
+    "canonical_article_connector_type",
     "is_content_openapi_site",
     "is_oemapps_site",
     "resolve_article_public_url",

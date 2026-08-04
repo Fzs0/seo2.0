@@ -539,14 +539,16 @@ curl -X POST http://127.0.0.1:8010/api/v1/knowledge/retrieve \
 - `POST /api/v1/strategy-runs`：创建幂等 `dry_run` 或 `approval_execution` Run。
 - `POST /api/v1/strategy-runs/{run_id}/research-portfolio`：提交与当前
   Evidence Snapshot 绑定、逐站完整的 AI Research Portfolio。每站必须记录五类
-  动作评估、证据来源、实质备选方向、冲突和研究结论。
+  动作评估、证据来源、实质备选方向、冲突和研究结论。具体机会可标记
+  `evidence_level=high|medium|low|unsafe`；低证据仍可作为安全探索执行。
 - `POST /api/v1/strategy-runs/{run_id}/proposed-actions`：提交 AI 的正式编辑决策。
   新 Interface 禁止 `candidate_id` 和 `keyword_id`；关键词仅能作为通用
   `evidence_refs` 引用。后端只做范围、目标、能力、冲突、风险和安全容量审查，
   不替换主题或重新排名。
 - `POST /api/v1/strategy-runs/{run_id}/zero-action-review`：读取已经持久化的零动作
-  复审。全量无 Execute/Deferred 时，研究不足返回补证；证据充分才允许全量 Hold；
-  连续两次证据和理由无实质变化的全量 Hold 返回 `STRATEGY_STAGNATION`。
+  复审。全量无 Execute/Deferred 时，必须覆盖文章、新主题、产品页、分类页和
+  On-page；不存在有效整站硬阻塞时返回 `SAFE_EXPERIMENT_REQUIRED`，要求继续研究
+  并提交安全学习动作。页面冷却、低流量和缺少关键词数据不能完成整站 Hold。
 - `GET /api/v1/strategy-runs/{run_id}`：查询统一运行状态。
 - `GET /api/v1/strategy-runs/{run_id}/events`：查询结构化事件。
 - `POST /api/v1/strategy-runs/{run_id}/start`：幂等启动或恢复人工审批运行。

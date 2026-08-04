@@ -51,6 +51,13 @@ from app.services.autonomous_strategy_orchestrator import (
 
 
 ROOT = Path(__file__).resolve().parents[1]
+HOLD_RESEARCH_SURFACES = [
+    "existing_articles",
+    "new_topics",
+    "product_pages",
+    "category_pages",
+    "on_page",
+]
 
 
 def _pg17_research_item(
@@ -120,7 +127,7 @@ def _pg17_research_item(
         "actions_considered": actions,
         "material_options": material_options,
         "opportunity_exhaustion": {
-            "surfaces_checked": ["existing_pages", "new_topics"],
+            "surfaces_checked": HOLD_RESEARCH_SURFACES,
             "evaluated_option_ids": [
                 option["option_id"] for option in material_options
             ],
@@ -1067,7 +1074,7 @@ async def test_pg17_keywordless_research_and_proposals_persist_and_replay():
 
 
 @pytest.mark.asyncio
-async def test_pg17_zero_action_review_requires_research_then_recovers():
+async def test_pg17_zero_action_review_requires_a_safe_experiment_after_research():
     sqlalchemy_dsn = _dsn().replace("postgresql://", "postgresql+asyncpg://", 1)
     engine = create_async_engine(sqlalchemy_dsn)
     factory = async_sessionmaker(engine, expire_on_commit=False)
@@ -1241,21 +1248,20 @@ async def test_pg17_zero_action_review_requires_research_then_recovers():
                 }
             ],
         )
-        completed = await run_strategy_run(
+        still_revising = await run_strategy_run(
             session,
             run_id=created["run_id"],
             idempotency_key=f"zero-complete-{uuid4()}",
         )
-    assert completed["status"] == "completed"
-    assert (
-        completed["zero_action_review"]["result"]
-        == "all_hold_review_passed"
-    )
+    assert still_revising["status"] == "research_revision_required"
+    assert still_revising["zero_action_review"]["reason_codes"] == [
+        "SAFE_EXPERIMENT_REQUIRED"
+    ]
     await engine.dispose()
 
 
 @pytest.mark.asyncio
-async def test_pg17_repeated_materially_unchanged_all_hold_creates_stagnation():
+async def test_pg17_repeated_all_hold_never_completes_without_a_hard_blocker():
     sqlalchemy_dsn = _dsn().replace("postgresql://", "postgresql+asyncpg://", 1)
     engine = create_async_engine(sqlalchemy_dsn)
     factory = async_sessionmaker(engine, expire_on_commit=False)
@@ -1403,10 +1409,10 @@ async def test_pg17_repeated_materially_unchanged_all_hold_creates_stagnation():
         first = await complete_hold_run(sequence=1)
         second = await complete_hold_run(sequence=2)
 
-        assert first["status"] == "completed"
+        assert first["status"] == "research_revision_required"
         assert second["status"] == "research_revision_required"
         assert second["zero_action_review"]["reason_codes"] == [
-            "STRATEGY_STAGNATION"
+            "SAFE_EXPERIMENT_REQUIRED"
         ]
         async with engine.begin() as connection:
             saved = await connection.exec_driver_sql(
@@ -1420,7 +1426,7 @@ async def test_pg17_repeated_materially_unchanged_all_hold_creates_stagnation():
                 """,
                 (business_id,),
             )
-            assert saved.scalar_one() == 1
+            assert saved.scalar_one() == 0
     finally:
         async with engine.begin() as connection:
             await connection.exec_driver_sql(

@@ -6,6 +6,8 @@ from typing import Any
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.article_urls import canonical_article_connector_type
+
 SUPPORTED_SITE_TYPES = ("main", "wp", "blog", "shopify", "other")
 
 
@@ -237,8 +239,9 @@ async def delete_site(session: AsyncSession, site_id: str) -> bool:
 def _attach_publish_state(site: dict[str, Any]) -> dict[str, Any]:
     api_config = site.pop("api_config", None) or {}
     site["knowledge_profile"] = site.pop("knowledge_profile", None) or None
-    site_type = (site.get("site_type") or "").lower()
-    connector_type = str(api_config.get("connector_type") or ("wordpress" if site_type == "wp" else "shopify" if site_type == "shopify" else "custom_openapi"))
+    connector_type = canonical_article_connector_type(
+        {**site, "api_config": api_config}
+    )
     site["connector_type"] = connector_type
     site["api_config_summary"] = {
         "configured_keys": [key for key, value in api_config.items() if value and key not in {"connector_type"}],

@@ -76,7 +76,7 @@ Scope Discovery / Evidence Snapshot
 ### 研究质量（10–18）
 
 - 每站 Research Portfolio 必须覆盖五类动作评估。
-- 非硬阻塞全量 Hold 要求第二证据通道和站点级证据。
+- 非硬阻塞站点必须继续研究安全学习动作；低数据和目标冷却不能完成整站 Hold。
 - 采集失败、empty、partial 和 limitations 均可保留。
 - 通用 Evidence Adapter 支持 API、数据库、固定快照和未来 GUI 来源。
 - 地区化真实 SERP/SEMrush GUI 真实采集按用户决定暂缓；当前禁止混用地区。
@@ -88,7 +88,7 @@ Scope Discovery / Evidence Snapshot
 - Hold、Deferred、Configuration Repair 不创建远程 Action。
 - 每个 Execute Now Strategy 最多一个 Action。
 - 相同幂等键同输入回放；不同输入返回稳定冲突。
-- 连续两次实质相同的全量 Hold 创建 `STRATEGY_STAGNATION` 并要求新证据。
+- 无有效整站硬阻塞的零动作 Run 返回 `SAFE_EXPERIMENT_REQUIRED`，不得完成为全量 Hold。
 
 ### 扩站（25–28）
 

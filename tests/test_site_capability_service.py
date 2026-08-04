@@ -63,7 +63,10 @@ def _site(**overrides: Any) -> dict[str, Any]:
 
 def test_build_oemapps_capability_is_safe_and_machine_readable() -> None:
     item = build_site_capability(
-        _site(api_base_url="https://openapi.oemapps.com"),
+        _site(
+            api_base_url="https://openapi.oemapps.com",
+            api_config={"tokenB": "configured"},
+        ),
         connectors=[
             {
                 "id": "connector",
@@ -90,6 +93,12 @@ def test_build_oemapps_capability_is_safe_and_machine_readable() -> None:
         "write": True,
         "readback": True,
     }
+    assert item["action_adapters"]["new_article"]["connector_type"] == (
+        "custom_openapi"
+    )
+    assert item["action_adapters"]["update_article"]["connector_type"] == (
+        "custom_openapi"
+    )
     assert item["supported_actions"]["delete_content"] == "forbidden"
     assert item["side_effects"]["product_seo"]["variant_recreation_possible"] is True
     assert item["side_effects"]["category_seo"]["membership_reset_possible"] is True

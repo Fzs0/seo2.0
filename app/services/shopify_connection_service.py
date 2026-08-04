@@ -18,7 +18,7 @@ from app.clients.publishers import (
     publisher_for_site,
 )
 from app.connectors.secrets import SecretCipher
-from app.core.article_urls import is_oemapps_site
+from app.core.article_urls import canonical_article_connector_type, is_oemapps_site
 from app.core.config import get_settings
 from app.services.site_config_service import (
     load_openapi_runtime_api_config,
@@ -327,15 +327,10 @@ async def publisher_for_site_runtime(
     dry_run: bool,
     require_active: bool = True,
 ) -> PublisherBase:
-    site_type = str(
-        site.get("connector_type")
-        or (site.get("api_config") or {}).get("connector_type")
-        or site.get("site_type")
-        or ""
-    ).casefold()
-    if site_type not in {"shopify", "shopify_admin"}:
+    connector_type = canonical_article_connector_type(site)
+    if connector_type != "shopify":
         runtime_site = site
-        if site_type in {"wp", "wordpress"}:
+        if connector_type == "wordpress":
             runtime_site = {
                 **site,
                 "api_config": load_wordpress_runtime_api_config(site),
@@ -354,7 +349,7 @@ async def publisher_for_site_runtime(
                         "tokenB": token,
                     },
                 }
-        elif site_type in {"blog", "custom_openapi", "openapi"}:
+        elif connector_type == "custom_openapi":
             runtime_site = {
                 **site,
                 "api_config": load_openapi_runtime_api_config(site),

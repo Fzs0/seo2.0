@@ -30,7 +30,8 @@
 
 每站还必须提交 `opportunity_exhaustion`：
 
-- `surfaces_checked` 至少覆盖 `existing_pages` 与 `new_topics`；
+- `surfaces_checked` 至少覆盖 `existing_articles`、`new_topics`、
+  `product_pages`、`category_pages` 与 `on_page`；
 - `evaluated_option_ids` 必须与该站全部具体机会 ID 完全一致；
 - `conclusion` 说明为何已经完成本轮机会穷尽。
 
@@ -42,13 +43,14 @@
 以下任一情况返回 `research_revision_required`：
 
 - 只有泛化动作类别，没有具体 URL 或主题；
-- 未同时研究现有页面与新主题；
+- 未研究现有文章、新主题、产品页、分类页和 On-page；
 - 有机会未被逐项评估；
 - 仍有 `qualified` 机会却提交整站 Hold；
 - 把 URL/主题冷却声明成站点级阻塞。
 
-仅当所有具体机会均为 `rejected` 或合法的目标级 `blocked`，且证据与第二通道
-完整时，才允许 `all_hold_review_passed`。
+即使所有已列机会均为 `rejected` 或合法的目标级 `blocked`，只要不存在有效的
+整站硬阻塞，也必须返回 `SAFE_EXPERIMENT_REQUIRED`，继续寻找安全学习动作。
+目标级阻塞不得升级为整站 Hold。
 
 ## 稳定错误码
 
@@ -56,6 +58,8 @@
 - `CONCRETE_OPPORTUNITY_EXHAUSTION_REQUIRED`
 - `QUALIFIED_OPPORTUNITY_NOT_SCHEDULED`
 - `COOLDOWN_SCOPE_OVERBROAD`
+- `SAFE_EXPERIMENT_REQUIRED`
+- `SITE_HARD_BLOCKER_INVALID`
 
 ## 兼容性
 

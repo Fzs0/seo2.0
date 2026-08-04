@@ -1,5 +1,18 @@
 # SEO Workbench 项目进度
 
+2026-08-03 AI 持续实验与 Hold 收敛已完成代码实现：非硬阻塞站点不再允许以普通
+全量 Hold 完成 Run，Zero Action Review 返回 `SAFE_EXPERIMENT_REQUIRED`，要求继续
+研究其他文章、新主题、产品页、分类页或 On-page。冷却仍只限制精确 URL/主题；
+GSC/GA4 数据少、关键词缺失和一般编辑不确定性不能作为整站硬阻塞。Research
+Portfolio 与 Proposed Action 新增兼容的 `evidence_level=high|medium|low|unsafe`，
+低证据安全动作可以执行，`unsafe` 不得进入正式计划。整站硬阻塞只接受
+`CAPABILITY_MISSING`、`SITE_DISABLED`、`SITE_CONFIGURATION_INCOMPLETE` 三类结构化
+原因；旧 `all_hold_review_passed` 和 `STRATEGY_STAGNATION` 路径已退役。验证结果：
+主项目全量 `624 passed, 32 skipped`，PG17 门禁 `30 passed`，Skill 合同、日志自检、
+官方快速验证、本地操作边界均通过；本地后端已加载当前源码，PID `30560`，
+`source_drift=false`。本轮未执行业务站远程写入。详细规则见
+`docs/AI_LED_SEO_CONTINUOUS_EXPERIMENT_POLICY_2026-08-03.md`。
+
 2026-08-01 AI Hold 判断已收紧为 URL/主题级：Research Portfolio 不再接受泛化
 动作类别冒充机会；每个机会必须绑定具体 URL/对象或 `intent_key + topic_cluster`，
 并记录逐项结果。即使组合中其他站点存在可执行动作，后端仍会独立审查每个 Hold
@@ -81,9 +94,9 @@ On-page 旁路保持退役，前端未修改，仍为只读看板。Custom OpenA
   每站当前波次最多一个远程写 Action，调用方不能通过更高站点配额扩大上限。
 - 精确 scope lock 同时覆盖 Formal Strategy、Unified Action 和 Observation；同站
   不同 URL/意图互不阻塞。越界 site_id 返回 `SITE_OUT_OF_SCOPE`，不再静默丢弃。
-- Zero Action Review 能要求第二证据通道、允许证据充分的全量 Hold，并在连续两次
-  证据和理由无实质变化时创建 `STRATEGY_STAGNATION`。
-- `execute-seo-strategy` 已升级为合同 1.8，运行日志改为 Research Portfolio/研究
+- Zero Action Review 最初支持证据充分的全量 Hold；该行为已被 2026-08-03 的
+  `SAFE_EXPERIMENT_REQUIRED` 规则替代，`STRATEGY_STAGNATION` 同步退役。
+- `execute-seo-strategy` 已升级为合同 1.9，运行日志改为 Research Portfolio/研究
   方向合同，候选池不再是新 Run 的研究来源。Skill 合同、日志自检和官方快速验证通过。
 - 产品决定暂缓地区化实时 SERP/SEMrush GUI 自动采集；在目标地区、语言、设备和
   采集网络明确前不混用不同地区结果。本轮继续支持统一 Evidence Adapter 和固定快照。

@@ -29,6 +29,7 @@ import structlog
 from app.clients.http_client import ExternalCallError, request_json
 from app.connectors.safe_http import ConnectorHttpError, SafeBinaryHttpClient
 from app.core.article_urls import (
+    canonical_article_connector_type,
     is_content_openapi_site,
     is_oemapps_site,
     resolve_article_public_url,
@@ -2203,13 +2204,12 @@ def _openapi_item(data: Any) -> dict[str, Any] | None:
 
 def publisher_for_site(site: dict[str, Any], dry_run: bool = True) -> PublisherBase:
     """按显式 connector_type/site_type 路由；未知类型不再隐式当作 OpenAPI。"""
-    cfg = site.get("api_config") or {}
-    st = str(site.get("connector_type") or cfg.get("connector_type") or site.get("site_type") or "").lower()
-    if st in {"wp", "wordpress"}:
+    st = canonical_article_connector_type(site)
+    if st == "wordpress":
         return WordPressPublisher(site, dry_run=dry_run)
-    if st in {"shopify", "shopify_admin"}:
+    if st == "shopify":
         return ShopifyPublisher(site, dry_run=dry_run)
-    if st in {"main", "blog", "openapi", "custom_blog", "custom_saas", "custom_openapi"}:
+    if st == "custom_openapi":
         return OpenAPIPublisher(site, dry_run=dry_run)
     return UnsupportedPublisher(site, dry_run=dry_run, connector_type=st or "unknown")
 

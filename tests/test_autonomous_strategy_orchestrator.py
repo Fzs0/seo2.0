@@ -20,6 +20,15 @@ from app.services.autonomous_strategy_orchestrator import (
 )
 
 
+HOLD_RESEARCH_SURFACES = [
+    "existing_articles",
+    "new_topics",
+    "product_pages",
+    "category_pages",
+    "on_page",
+]
+
+
 class _NoRows:
     pass
 
@@ -98,7 +107,7 @@ def _research(site: dict, *, sources=None):
             },
         ],
         "opportunity_exhaustion": {
-            "surfaces_checked": ["existing_pages", "new_topics"],
+            "surfaces_checked": HOLD_RESEARCH_SURFACES,
             "evaluated_option_ids": [
                 "new-distinct-use-case",
                 "existing-product-page",
@@ -977,7 +986,7 @@ def test_zero_action_review_requires_second_channel_and_full_action_space():
     assert "RESEARCH_EVIDENCE_INSUFFICIENT" in result["reason_codes"]
 
 
-def test_zero_action_review_allows_evidence_complete_hold_without_forcing_content():
+def test_zero_action_review_rejects_site_hold_without_a_hard_blocker():
     site = _site()
     exhausted = _research(site)
     for option in exhausted["material_options"]:
@@ -1000,7 +1009,17 @@ def test_zero_action_review_allows_evidence_complete_hold_without_forcing_conten
         research_portfolio=research, reviewed_actions=held
     )
 
-    assert result["result"] == "all_hold_review_passed"
+    assert result["result"] == "research_revision_required"
+    assert result["reason_codes"] == ["SAFE_EXPERIMENT_REQUIRED"]
+    assert result["missing_evidence"] == [
+        {
+            "site_id": site["id"],
+            "code": "SAFE_EXPERIMENT_REQUIRED",
+            "missing": (
+                "a safe learning action or a validated site-level hard blocker"
+            ),
+        }
+    ]
 
 
 def test_research_portfolio_rejects_generic_action_categories_as_opportunities():
@@ -1084,13 +1103,15 @@ def test_exact_target_cooldown_does_not_hide_a_qualified_distinct_topic():
     }
 
 
-def test_zero_action_review_requires_existing_page_and_new_topic_surfaces():
+def test_zero_action_review_requires_all_learning_surfaces_before_site_hold():
     site = _site()
     incomplete = _research(site)
     for option in incomplete["material_options"]:
         option["outcome"] = "rejected"
         option["reason"] = "This exact opportunity is not supported."
-    incomplete["opportunity_exhaustion"]["surfaces_checked"] = ["existing_pages"]
+    incomplete["opportunity_exhaustion"]["surfaces_checked"] = [
+        "existing_articles"
+    ]
     research = normalize_research_portfolio(
         [incomplete],
         discovered_sites=[site],
@@ -1109,7 +1130,114 @@ def test_zero_action_review_requires_existing_page_and_new_topic_surfaces():
     )
 
     assert result["result"] == "research_revision_required"
-    assert result["missing_evidence"][-1]["missing_surfaces"] == ["new_topics"]
+    assert result["missing_evidence"][-2]["missing_surfaces"] == [
+        "category_pages",
+        "new_topics",
+        "on_page",
+        "product_pages",
+    ]
+    assert result["missing_evidence"][-1]["code"] == "SAFE_EXPERIMENT_REQUIRED"
+
+
+def test_low_evidence_safe_experiment_is_not_converted_to_hold():
+    site = _site()
+    raw_research = _research(site)
+    raw_research["material_options"][0]["evidence_level"] = "low"
+    research = normalize_research_portfolio(
+        [raw_research],
+        discovered_sites=[site],
+        evidence_snapshot_id="snapshot-1",
+    )
+    proposal = _proposal(site, intent="exploratory product use case")
+    proposal["evidence_level"] = "low"
+    actions = normalize_proposed_actions(
+        [proposal],
+        business_id="business",
+        discovered_sites=[site],
+        research_portfolio=research,
+    )
+
+    reviewed = review_proposed_actions(
+        actions,
+        discovered_sites=[site],
+        capability_snapshot={"sites": [_capability(site)]},
+        scope_locks={},
+        safety_action_ceiling=3,
+    )
+
+    assert research[0]["material_options"][0]["evidence_level"] == "low"
+    assert reviewed[0]["evidence_level"] == "low"
+    assert reviewed[0]["schedule_class"] == "execute_now"
+
+
+def test_soft_reason_cannot_masquerade_as_a_site_hard_blocker():
+    site = _site()
+    raw_research = _research(site)
+    raw_research["hard_blockers"] = [
+        {
+            "code": "LOW_GSC_DATA",
+            "message": "Search Console has too few rows.",
+        }
+    ]
+
+    with pytest.raises(StrategyContractError) as error:
+        normalize_research_portfolio(
+            [raw_research],
+            discovered_sites=[site],
+            evidence_snapshot_id="snapshot-1",
+        )
+
+    assert error.value.code == "SITE_HARD_BLOCKER_INVALID"
+
+
+def test_valid_site_hard_blocker_can_stop_remote_actions():
+    site = _site()
+    raw_research = _research(site)
+    for option in raw_research["material_options"]:
+        option["outcome"] = "rejected"
+        option["reason"] = "The connector cannot safely write this opportunity."
+    raw_research["hard_blockers"] = [
+        {
+            "code": "CAPABILITY_MISSING",
+            "message": "The site has no verified write and readback adapter.",
+            "unlock_condition": "Repair and refresh Site Capabilities.",
+        }
+    ]
+    research = normalize_research_portfolio(
+        [raw_research],
+        discovered_sites=[site],
+        evidence_snapshot_id="snapshot-1",
+    )
+
+    result = review_zero_action(
+        research_portfolio=research,
+        reviewed_actions=[
+            {
+                "site_id": site["id"],
+                "schedule_class": "configuration_repair",
+                "strategy_type": "configuration_repair",
+                "reason_code": "CAPABILITY_MISSING",
+            }
+        ],
+    )
+
+    assert result["result"] == "configuration_skipped"
+    assert research[0]["hard_blockers"][0]["scope"] == "site"
+
+
+def test_unsafe_opportunity_cannot_be_qualified_for_execution():
+    site = _site()
+    raw_research = _research(site)
+    raw_research["material_options"][0]["evidence_level"] = "unsafe"
+
+    with pytest.raises(StrategyContractError) as error:
+        normalize_research_portfolio(
+            [raw_research],
+            discovered_sites=[site],
+            evidence_snapshot_id="snapshot-1",
+        )
+
+    assert error.value.code == "UNSAFE_EXPERIMENT_REJECTED"
 
 
 def test_zero_action_review_audits_each_held_site_when_another_site_executes():

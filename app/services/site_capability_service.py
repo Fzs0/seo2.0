@@ -11,7 +11,11 @@ from urllib.parse import urlsplit
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.article_urls import is_content_openapi_site, is_oemapps_site
+from app.core.article_urls import (
+    canonical_article_connector_type,
+    is_content_openapi_site,
+    is_oemapps_site,
+)
 from app.services.site_capability_registry import contract_for_site
 
 HEALTH_STATES = {"available", "degraded", "unavailable", "misconfigured", "forbidden"}
@@ -450,11 +454,7 @@ def _action_adapters(
             "readback": health.get("read") is True,
         }
     if actions.get("new_article") != "forbidden":
-        connector_type = str(
-            (_mapping(site.get("api_config")).get("connector_type"))
-            or site.get("site_type")
-            or "custom_openapi"
-        ).casefold()
+        connector_type = canonical_article_connector_type(site)
         for action in ("new_article", "update_article"):
             result[action] = {
                 "adapter_id": "strategy_article_action",
